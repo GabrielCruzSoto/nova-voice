@@ -9,37 +9,41 @@ from pathlib import Path
 
 from nova.domain.models import Layer1Decision
 
-_PRIV_PREFIX = r"(?:(?:sudo|doas|pkexec|env)(?:\s+-[^\s;&|]+)*\s+)*"
+_BIN_PREFIX = r"(?:(?:/usr(?:/local)?)?/s?bin/)?"
+_PRIV_PREFIX = (
+    rf"(?:{_BIN_PREFIX}(?:sudo|doas|pkexec|env)"
+    r"(?:\s+(?:-[ugUpC]\s+\S+|-[^\s;&|]+|[A-Za-z_][A-Za-z0-9_]*=\S+))*\s+)*"
+)
 
 _HARD_DENY_PATTERNS: tuple[tuple[str, re.Pattern[str], str], ...] = (
     (
         "CATASTROPHIC_RM_ROOT_OR_HOME",
         re.compile(
-            rf"(?:^|[;&|]\s*){_PRIV_PREFIX}\brm\b"
+            rf"(?:^|[;&|]\s*){_PRIV_PREFIX}{_BIN_PREFIX}\brm\b"
             r"(?=[^\n;&|]*(?:\s-(?:[A-Za-z]*[rf][A-Za-z]*)|--recursive|--force))"
-            r"[^\n;&|]*\s+['\"]?(?:/|/\*|~/?|\$HOME/?|\$\{HOME\}/?|\.\./?)['\"]?(?:\s|$|[;&|])"
+            r"[^\n;&|]*\s+['\"]?(?:/+|/+\*|~/?|\$HOME/?|\$\{HOME\}/?|\.\./*)['\"]?(?:\s|$|[;&|])"
         ),
         "Recursive or forced deletion targeting host root, home, or parent directory.",
     ),
     (
         "CATASTROPHIC_FILESYSTEM_FORMAT",
-        re.compile(rf"(?:^|[;&|]\s*){_PRIV_PREFIX}\bmkfs(?:\.[A-Za-z0-9_-]+)?\b"),
+        re.compile(rf"(?:^|[;&|]\s*){_PRIV_PREFIX}{_BIN_PREFIX}\bmkfs(?:\.[A-Za-z0-9_-]+)?\b"),
         "Filesystem formatting command targeting block storage.",
     ),
     (
         "CATASTROPHIC_RAW_BLOCK_WRITE",
         re.compile(
-            rf"(?:^|[;&|]\s*){_PRIV_PREFIX}"
-            r"(?:\bdd\b[^\n;&|]*\bof=/dev/|\bshred\b[^\n;&|]*/dev/)"
+            rf"(?:^|[;&|]\s*){_PRIV_PREFIX}{_BIN_PREFIX}"
+            r"(?:\bdd\b[^\n;&|]*\bof=['\"]?/dev/|\bshred\b[^\n;&|]*['\"]?/dev/)"
         ),
         "Direct destructive write or shred targeting a raw /dev device.",
     ),
     (
         "CATASTROPHIC_CHMOD_ROOT",
         re.compile(
-            rf"(?:^|[;&|]\s*){_PRIV_PREFIX}\b(?:chmod|chown)\b"
+            rf"(?:^|[;&|]\s*){_PRIV_PREFIX}{_BIN_PREFIX}\b(?:chmod|chown)\b"
             r"(?=[^\n;&|]*(?:-R|--recursive))(?=[^\n;&|]*\b777\b)"
-            r"[^\n;&|]*\s+['\"]?/(?:['\"]|\s|$|[;&|])"
+            r"[^\n;&|]*\s+['\"]?/+['\"]?(?:\s|$|[;&|])"
         ),
         "Recursive world-writable permission change targeting filesystem root.",
     ),
@@ -236,6 +240,10 @@ _UNSAFE_GIT_CONFIG_TOKENS: tuple[str, ...] = (
     "receivepack",
     "attributesfile",
     "excludesfile",
+    "[gpg",
+    "showsignature",
+    "defaultkeycommand",
+    "allowedsignersfile",
 )
 
 

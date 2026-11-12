@@ -7,6 +7,7 @@ import hashlib
 import os
 import random
 import re
+import threading
 import time
 import unicodedata
 from collections.abc import Callable, Sequence
@@ -58,24 +59,28 @@ class LocalWorkspaceResolver:
         self._timeout_seconds = timeout_seconds
         self._clock = clock
         self._rng = rng
+        self._lock = threading.Lock()
         self._cache: dict[str, _CatalogCacheEntry] = {}
         self._active_context: WorkspaceContext | None = None
 
     @property
     def active_context(self) -> WorkspaceContext | None:
         """Return currently selected workspace context, if any."""
-        return self._active_context
+        with self._lock:
+            return self._active_context
 
     def cache_keys(self) -> list[str]:
         """Expose active cache keys for deterministic diagnostics and contract tests."""
-        return list(self._cache.keys())
+        with self._lock:
+            return list(self._cache.keys())
 
     def cache_ttl_remaining(self, key: str) -> float:
         """Return remaining TTL in seconds for a cached catalog key."""
-        entry = self._cache.get(key)
-        if entry is None:
-            return 0.0
-        return max(0.0, entry.expires_at - self._clock())
+        with self._lock:
+            entry = self._cache.get(key)
+            if entry is None:
+                return 0.0
+            return max(0.0, entry.expires_at - self._clock())
 
     async def resolve(self, request: ResolveWorkspaceRequest) -> WorkspaceContext:
         """Resolve and activate a project directory under OP-1 rules without blocking the loop."""
@@ -97,18 +102,19 @@ class LocalWorkspaceResolver:
         )
 
         canonical_str = str(resolved_path)
-        if (
-            self._active_context is not None
-            and self._active_context.canonical_path == canonical_str
-        ):
-            return self._active_context
+        with self._lock:
+            if (
+                self._active_context is not None
+                and self._active_context.canonical_path == canonical_str
+            ):
+                return self._active_context
 
-        context = WorkspaceContext(
-            workspace_id=f"ws-{_normalize_slug(resolved_path.name) or 'root'}",
-            name=resolved_path.name,
-            canonical_path=canonical_str,
-        )
-        self._active_context = context
+            context = WorkspaceContext(
+                workspace_id=f"ws-{_normalize_slug(resolved_path.name) or 'root'}",
+                name=resolved_path.name,
+                canonical_path=canonical_str,
+            )
+            self._active_context = context
 
         if self._event_bus is not None:
             await self._event_bus.publish(
@@ -168,7 +174,8 @@ class LocalWorkspaceResolver:
 
         if not matches:
             # Invalidate cache once on miss to pick up newly created repositories
-            self._cache.pop(cache_key, None)
+            with self._lock:
+                self._cache.pop(cache_key, None)
             catalog = self._get_or_scan_catalog(cache_key, allowed_roots)
             matches = self._match_catalog(query_slug, catalog)
 
@@ -197,9 +204,10 @@ class LocalWorkspaceResolver:
         allowed_roots: Sequence[Path],
     ) -> dict[str, list[Path]]:
         now = self._clock()
-        cached = self._cache.get(cache_key)
-        if cached is not None and cached.expires_at > now:
-            return cached.catalog
+        with self._lock:
+            cached = self._cache.get(cache_key)
+            if cached is not None and cached.expires_at > now:
+                return {slug: list(paths) for slug, paths in cached.catalog.items()}
 
         catalog: dict[str, list[Path]] = {}
         scanned = 0
@@ -208,10 +216,11 @@ class LocalWorkspaceResolver:
             if scanned >= MAX_SCAN_ENTRIES:
                 break
 
-        jitter_factor = 1.0 + self._rng(-self._jitter_ratio, self._jitter_ratio)
-        ttl = self._ttl_seconds * jitter_factor
-        self._cache[cache_key] = _CatalogCacheEntry(catalog=catalog, expires_at=now + ttl)
-        return catalog
+        with self._lock:
+            jitter_factor = 1.0 + self._rng(-self._jitter_ratio, self._jitter_ratio)
+            ttl = self._ttl_seconds * jitter_factor
+            self._cache[cache_key] = _CatalogCacheEntry(catalog=catalog, expires_at=now + ttl)
+            return {slug: list(paths) for slug, paths in catalog.items()}
 
     def _scan_bounded(
         self,

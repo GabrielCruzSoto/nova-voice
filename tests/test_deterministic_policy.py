@@ -328,3 +328,58 @@ def test_ac6_redact_sensitive_text_masks_dynamic_ipc_secrets() -> None:
     redacted = redact_sensitive_text(raw, extra_secrets=(ephemeral_secret,))
     assert ephemeral_secret not in redacted
     assert "<REDACTED:secret>" in redacted
+
+
+@pytest.mark.parametrize(
+    "directive_line",
+    [
+        "[gpg]\n\tprogram = /tmp/evil.sh\n",
+        "[log]\n\tshowSignature = true\n",
+        "[gpg \"ssh\"]\n\tdefaultKeyCommand = /tmp/evil.sh\n",
+        "[gpg \"ssh\"]\n\tallowedSignersFile = /etc/passwd\n",
+    ],
+)
+def test_fu1_git_config_gpg_directives_escalate_in_layer1(
+    tmp_path: Path,
+    directive_line: str,
+) -> None:
+    repo = tmp_path / "Proyectos" / "gpg-repo"
+    (repo / ".git").mkdir(parents=True)
+    (repo / ".git" / "config").write_text(directive_line, encoding="utf-8")
+
+    policy = DeterministicCommandPolicy()
+    decision = policy.evaluate(
+        command="git log --oneline -n 5",
+        cwd=str(repo),
+        workspace_canonical_path=str(repo),
+    )
+    assert decision.verdict == "escalate"
+    assert decision.rule_id == "GIT_MUTATING_OR_UNSAFE_FLAG"
+
+
+@pytest.mark.parametrize(
+    "catastrophic_cmd",
+    [
+        "/bin/rm -rf /",
+        "/usr/bin/rm -rf //",
+        "sudo -u root rm -rf /",
+        "sudo -u root /bin/rm -rf //*",
+        "doas -u root /sbin/mkfs.ext4 /dev/nvme0n1",
+        'dd if=/dev/zero of="/dev/sda" bs=1M',
+        "sudo -g disk /bin/dd if=/dev/zero of='/dev/sdb'",
+        "/bin/chmod -R 777 //",
+    ],
+)
+def test_fu2_hard_deny_catches_path_prefixed_sudo_user_multi_slash_and_quoted_of(
+    workspace_dir: Path,
+    catastrophic_cmd: str,
+) -> None:
+    policy = DeterministicCommandPolicy()
+    decision = policy.evaluate(
+        command=catastrophic_cmd,
+        cwd=str(workspace_dir),
+        workspace_canonical_path=str(workspace_dir),
+    )
+    assert decision.verdict == "hard_deny", (
+        f"Expected hard_deny for {catastrophic_cmd!r}, got {decision}"
+    )

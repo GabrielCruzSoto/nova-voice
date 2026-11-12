@@ -41,6 +41,16 @@ DecisionVerdict = Literal[
     "unauthorized",
     "invalid_request",
 ]
+CallSessionState = Literal[
+    "standby",
+    "listening",
+    "thinking",
+    "executing",
+    "speaking",
+    "closed",
+]
+InferenceDevice = Literal["cuda", "cpu"]
+MAX_SYNTHESIZED_PCM_BYTES = 11_520_000
 
 
 class ResolveWorkspaceRequest(BaseModel):
@@ -163,3 +173,76 @@ class CommandExecutionDecision(BaseModel):
     verdict: DecisionVerdict
     audit_id: str | None = None
     reason: str = Field(min_length=1)
+
+
+class CallSession(BaseModel):
+    """Explicit state snapshot for a continuous hands-free Nova voice session (NOVA-003 OP-4)."""
+
+    model_config = ConfigDict(frozen=True, extra="ignore")
+
+    call_id: str = Field(min_length=1)
+    state: CallSessionState = "standby"
+    started_at: str = Field(default_factory=utc_now_iso)
+    last_activity_monotonic: float = Field(ge=0.0)
+    turn_count: int = Field(default=0, ge=0)
+    active_correlation_id: str | None = None
+
+
+class AudioFrame(BaseModel):
+    """Bounded mono 16-bit PCM frame captured in RAM from microphone input (NOVA-003 OP-1)."""
+
+    model_config = ConfigDict(frozen=True, extra="ignore")
+
+    pcm_s16le: bytes
+    sample_rate_hz: int = Field(default=16000, gt=0)
+    channels: Literal[1] = 1
+    monotonic_ts: float = Field(ge=0.0)
+
+    @field_validator("pcm_s16le")
+    @classmethod
+    def _validate_pcm_frame(cls, value: bytes) -> bytes:
+        if len(value) < 2 or len(value) % 2 != 0:
+            raise ValueError("VOICE_INVALID_PCM_FRAME: pcm_s16le must have even byte length >= 2")
+        return value
+
+
+class SynthesizedAudio(BaseModel):
+    """Bounded mono 16-bit PCM utterance synthesized locally in RAM (NOVA-003 OP-1 & OP-3)."""
+
+    model_config = ConfigDict(frozen=True, extra="ignore")
+
+    pcm_s16le: bytes
+    sample_rate_hz: int = Field(default=24000, ge=8000, le=48000)
+    channels: Literal[1] = 1
+
+    @field_validator("pcm_s16le")
+    @classmethod
+    def _validate_synthesized_pcm(cls, value: bytes) -> bytes:
+        if len(value) < 2 or len(value) > MAX_SYNTHESIZED_PCM_BYTES or len(value) % 2 != 0:
+            raise ValueError(
+                "VOICE_INVALID_PCM_FRAME: pcm_s16le must have even byte length "
+                f"between 2 and {MAX_SYNTHESIZED_PCM_BYTES}"
+            )
+        return value
+
+
+class WakeWordDetection(BaseModel):
+    """Detection score produced by WakeWordPort for a single audio frame (NOVA-003 OP-2)."""
+
+    model_config = ConfigDict(frozen=True, extra="ignore")
+
+    detected: bool
+    wake_word: str | None = None
+    score: float = Field(ge=0.0, le=1.0)
+
+
+class TranscriptionResult(BaseModel):
+    """Local Spanish speech-to-text output produced by SpeechToTextPort (NOVA-003 OP-3)."""
+
+    model_config = ConfigDict(frozen=True, extra="ignore")
+
+    text: str
+    language: str = Field(default="es", min_length=1)
+    confidence: float = Field(ge=0.0, le=1.0)
+    backend_device: InferenceDevice
+    duration_ms: float = Field(ge=0.0)
