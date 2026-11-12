@@ -78,3 +78,7 @@ class ApprovalNotFoundError(GatekeeperError):
 
 class VoicePipelineError(NovaDomainError):
     """Raised when an audio stream, wake-word, VAD, STT, or TTS operation fails (NOVA-003)."""
+
+
+class DesktopUiError(NovaDomainError):
+    """Raised when the loopback Desktop UI bridge or native picker encounters a domain failure."""

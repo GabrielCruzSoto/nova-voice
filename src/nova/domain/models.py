@@ -26,7 +26,7 @@ def validate_spoken_word_budget(value: str) -> str:
     return cleaned
 
 
-WorkspaceQueryMode = Literal["exact_path", "voice_fuzzy"]
+WorkspaceQueryMode = Literal["exact_path", "voice_fuzzy", "ui_picker"]
 CommandSource = Literal["tier1_pi", "tier2_agy"]
 ToolInterceptName = Literal["bash", "run_command"]
 RiskLevel = Literal["low", "medium", "high", "critical"]
@@ -71,6 +71,7 @@ class WorkspaceContext(BaseModel):
     workspace_id: str = Field(min_length=1)
     name: str = Field(min_length=1)
     canonical_path: str = Field(min_length=1)
+    selected_via: WorkspaceQueryMode = "exact_path"
     active_since: str = Field(default_factory=utc_now_iso)
 
 

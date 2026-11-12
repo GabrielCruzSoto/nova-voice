@@ -1,0 +1,13 @@
+{
+  "name": "nova-workspace-ui",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "typecheck": "tsc --noEmit --strict",
+    "build:ui": "tsc --project src/nova/ui/tsconfig.json",
+    "test:ui": "node --test src/nova/ui/tests/ui.test.mjs"
+  },
+  "devDependencies": {
+    "typescript": "^7.0.2"
+  }
+}

@@ -268,6 +268,12 @@ class VoiceCallCoordinator:
         corr_id = self._session.active_correlation_id or f"corr-{uuid.uuid4()}"
         await self._transition_state("standby", reason=reason, correlation_id=corr_id)
 
+    async def barge_in(self) -> None:
+        """Public idempotent manual/UI barge-in cutting TTS (<100 ms) and active turn."""
+        if self._session.state == "closed":
+            return
+        await self._execute_barge_in()
+
     async def shutdown(self) -> None:
         """Unsubscribe from bus, stop audio streams, cancel workers, and close CallSession."""
         self._event_bus.unsubscribe(self._on_event)
@@ -464,6 +470,21 @@ class VoiceCallCoordinator:
                 # Active call states: speaking, thinking, executing -> monitor for <100 ms barge-in
                 if state in ("speaking", "thinking", "executing"):
                     if state == "speaking" and not self._settings.allow_barge_in_during_tts:
+                        if (
+                            in_speech
+                            or utterance_buf
+                            or speech_run
+                            or silence_run
+                            or barge_in_run
+                            or pre_roll
+                        ):
+                            in_speech = False
+                            utterance_buf.clear()
+                            speech_run = 0
+                            silence_run = 0
+                            barge_in_run = 0
+                            pre_roll.clear()
+                            self._vad.reset()
                         continue
 
                     if in_speech:
@@ -707,10 +728,18 @@ class VoiceCallCoordinator:
                             approved=(intent.kind == "approve_command"),
                             resolved_by="user_voice",
                         )
+                    except asyncio.CancelledError:
+                        raise
                     except NovaDomainError as exc:
                         await self._publish_voice_failure(
                             exc.code,
                             exc.sanitized_message,
+                            correlation_id=corr_id,
+                        )
+                    except Exception as exc:
+                        await self._publish_voice_failure(
+                            "VOICE_APPROVAL_FAILED",
+                            str(exc),
                             correlation_id=corr_id,
                         )
                 continue
@@ -732,10 +761,18 @@ class VoiceCallCoordinator:
                         mode="voice_fuzzy",
                         correlation_id=corr_id,
                     )
+                except asyncio.CancelledError:
+                    raise
                 except NovaDomainError as exc:
                     await self._publish_voice_failure(
                         exc.code,
                         exc.sanitized_message,
+                        correlation_id=corr_id,
+                    )
+                except Exception as exc:
+                    await self._publish_voice_failure(
+                        "WORKSPACE_SELECTION_FAILED",
+                        str(exc),
                         correlation_id=corr_id,
                     )
                 continue
@@ -787,6 +824,12 @@ class VoiceCallCoordinator:
             await self._publish_voice_failure(
                 exc.code,
                 exc.sanitized_message,
+                correlation_id=corr_id,
+            )
+        except Exception as exc:
+            await self._publish_voice_failure(
+                "ORCHESTRATOR_UNEXPECTED_FAILURE",
+                str(exc),
                 correlation_id=corr_id,
             )
         finally:

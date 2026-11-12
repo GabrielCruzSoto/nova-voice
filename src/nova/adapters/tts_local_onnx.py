@@ -8,6 +8,7 @@ import importlib
 import os
 import shutil
 import struct
+import threading
 from collections.abc import Awaitable, Callable, Sequence
 from pathlib import Path
 from typing import Any, Literal, Protocol
@@ -149,6 +150,7 @@ class LocalOnnxTtsAdapter:
         self._which = which_resolver
         self._piper_spawner = piper_spawner
         self._load_lock = asyncio.Lock()
+        self._kokoro_infer_lock = threading.Lock()
         self._kokoro: KokoroBackendProtocol | None = None
 
     def _build_default_kokoro(self) -> KokoroBackendProtocol:
@@ -218,12 +220,13 @@ class LocalOnnxTtsAdapter:
         backend = await self._ensure_kokoro()
 
         def _run_sync() -> SynthesizedAudio:
-            samples, sample_rate = backend.create(
-                cleaned_text,
-                voice=self._settings.kokoro_voice,
-                speed=self._settings.speed,
-                lang=self._settings.kokoro_lang,
-            )
+            with self._kokoro_infer_lock:
+                samples, sample_rate = backend.create(
+                    cleaned_text,
+                    voice=self._settings.kokoro_voice,
+                    speed=self._settings.speed,
+                    lang=self._settings.kokoro_lang,
+                )
             pcm = _floats_to_pcm_s16le(samples)
             return SynthesizedAudio(
                 pcm_s16le=pcm,

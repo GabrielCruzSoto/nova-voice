@@ -16,7 +16,7 @@ from pathlib import Path
 
 from nova.domain.errors import WorkspaceResolutionError
 from nova.domain.events import OrchestratorEventBus, WorkspaceChangedEvent
-from nova.domain.models import ResolveWorkspaceRequest, WorkspaceContext
+from nova.domain.models import ResolveWorkspaceRequest, WorkspaceContext, WorkspaceQueryMode
 
 MAX_SCAN_ENTRIES = 500
 MAX_SCAN_DEPTH = 2
@@ -82,9 +82,43 @@ class LocalWorkspaceResolver:
                 return 0.0
             return max(0.0, entry.expires_at - self._clock())
 
+    async def list_available_workspaces(self) -> list[tuple[str, str]]:
+        """Return sorted (display_name, canonical_path) pairs from allowed_roots within timeout."""
+        try:
+            return await asyncio.wait_for(
+                asyncio.to_thread(self._list_available_sync),
+                timeout=self._timeout_seconds,
+            )
+        except TimeoutError as exc:
+            raise WorkspaceResolutionError(
+                code="WORKSPACE_RESOLUTION_TIMEOUT",
+                message=f"Workspace catalog listing timed out after {self._timeout_seconds}s.",
+            ) from exc
+
+    def _list_available_sync(self) -> list[tuple[str, str]]:
+        allowed_roots = self._canonical_allowed_roots()
+        if not allowed_roots:
+            return []
+        cache_key = self._catalog_cache_key(allowed_roots)
+        catalog = self._get_or_scan_catalog(cache_key, allowed_roots)
+        seen: dict[str, str] = {}
+        for paths in catalog.values():
+            for path in paths:
+                seen[str(path)] = path.name
+        return sorted(
+            ((name, canonical) for canonical, name in seen.items()),
+            key=lambda pair: (pair[0].lower(), pair[1]),
+        )
+
     async def resolve(self, request: ResolveWorkspaceRequest) -> WorkspaceContext:
         """Resolve and activate a project directory under OP-1 rules without blocking the loop."""
-        if request.mode not in ("exact_path", "voice_fuzzy"):
+        if request.mode == "exact_path":
+            checked_mode: WorkspaceQueryMode = "exact_path"
+        elif request.mode == "voice_fuzzy":
+            checked_mode = "voice_fuzzy"
+        elif request.mode == "ui_picker":
+            checked_mode = "ui_picker"
+        else:
             raise WorkspaceResolutionError(
                 code="WORKSPACE_INVALID_QUERY",
                 message=f"Unsupported workspace resolution mode: '{request.mode}'.",
@@ -96,10 +130,16 @@ class LocalWorkspaceResolver:
                 message="Workspace query cannot be empty.",
             )
 
-        resolved_path = await asyncio.wait_for(
-            asyncio.to_thread(self._resolve_sync, raw_query, request.mode),
-            timeout=self._timeout_seconds,
-        )
+        try:
+            resolved_path = await asyncio.wait_for(
+                asyncio.to_thread(self._resolve_sync, raw_query, checked_mode),
+                timeout=self._timeout_seconds,
+            )
+        except TimeoutError as exc:
+            raise WorkspaceResolutionError(
+                code="WORKSPACE_RESOLUTION_TIMEOUT",
+                message=f"Workspace resolution timed out after {self._timeout_seconds}s.",
+            ) from exc
 
         canonical_str = str(resolved_path)
         with self._lock:
@@ -113,6 +153,7 @@ class LocalWorkspaceResolver:
                 workspace_id=f"ws-{_normalize_slug(resolved_path.name) or 'root'}",
                 name=resolved_path.name,
                 canonical_path=canonical_str,
+                selected_via=checked_mode,
             )
             self._active_context = context
 
@@ -122,6 +163,7 @@ class LocalWorkspaceResolver:
                     correlation_id=request.correlation_id,
                     workspace_name=context.name,
                     canonical_path=context.canonical_path,
+                    selected_via=checked_mode,
                 )
             )
         return context
@@ -139,8 +181,9 @@ class LocalWorkspaceResolver:
 
     def _resolve_sync(self, raw_query: str, mode: str) -> Path:
         allowed_roots = self._canonical_allowed_roots()
+        is_path_like = raw_query.startswith(("/", "~", ".")) or (os.path.sep in raw_query)
 
-        if mode == "exact_path":
+        if mode == "exact_path" or (mode == "ui_picker" and is_path_like):
             expanded = Path(os.path.realpath(os.path.expanduser(raw_query)))
             if not expanded.exists() or not expanded.is_dir():
                 # Check if path outside roots existed or wouldn't be allowed anyway

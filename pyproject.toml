@@ -27,8 +27,19 @@ voice = [
     "piper-tts>=1.2.0",
 ]
 
+[project.scripts]
+nova-desktop = "nova.adapters.desktop_launcher:main"
+
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools.package-data]
+nova = [
+    "py.typed",
+    "ui/static/*",
+    "extensions/*.ts",
+    "plugins/agy_gatekeeper/*",
+]
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]
