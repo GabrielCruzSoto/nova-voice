@@ -1038,3 +1038,172 @@ async def test_f4_f5_cancels_inflight_tts_ignores_standby_and_preserves_buf() ->
     assert captured[0] == 11
     assert len(captured) >= 4 * 1024
     await coordinator.shutdown()
+
+
+async def test_t7_f3_end_call_purges_inflight_and_queued_segments_preventing_hot_mic() -> None:
+    bus = OrchestratorEventBus()
+    audio_in = _ScriptedAudioInput()
+    wake_word = _FakeWakeWord()
+    vad = _FakeVad()
+    orch = _FakeOrchestrator(event_bus=bus)
+
+    first_stt_started = asyncio.Event()
+    release_first_stt = asyncio.Event()
+
+    class _GatedStt(_FakeStt):
+        async def transcribe(
+            self,
+            pcm_s16le: bytes,
+            sample_rate_hz: int = 16000,
+        ) -> TranscriptionResult:
+            if not first_stt_started.is_set():
+                first_stt_started.set()
+                await release_first_stt.wait()
+            return await super().transcribe(pcm_s16le, sample_rate_hz=sample_rate_hz)
+
+    stt = _GatedStt(
+        transcripts=[
+            "terminar llamada",
+            "ejecuta accion no autorizada despues de colgar",
+        ]
+    )
+
+    coordinator = VoiceCallCoordinator(
+        audio_input=audio_in,
+        audio_output=_ControlledAudioOutput(hold_playback=False),
+        wake_word=wake_word,
+        vad=vad,
+        stt=stt,
+        tts=_FakeTts(),
+        orchestrator=orch,
+        event_bus=bus,
+        settings=VoiceCoordinatorSettings(min_speech_frames=2, end_silence_frames=2),
+    )
+    await coordinator.start()
+    await coordinator.start_call()
+
+    # Segment 1 ("terminar llamada") enters STT and blocks; Segment 2 is queued right behind it!
+    vad.probs = [0.9, 0.9, 0.05, 0.05, 0.9, 0.9, 0.05, 0.05]
+    for _ in range(8):
+        audio_in.push_frame(_frame())
+    await asyncio.wait_for(first_stt_started.wait(), timeout=1.0)
+    await asyncio.sleep(0.02)
+
+    # Release STT: Segment 1 triggers end_call(reason="voice_hangup_command");
+    # Segment 2 MUST be purged and NEVER dispatched to orchestrator or wedge CallSession!
+    release_first_stt.set()
+    await asyncio.sleep(0.06)
+
+    assert _state_of(coordinator) == "standby"
+    assert orch.utterances == []
+
+    # Verify wake-word in standby still works cleanly after hangup
+    wake_word.next_score = 0.92
+    audio_in.push_frame(_frame())
+    await asyncio.sleep(0.03)
+    wake_word.next_score = 0.05
+    assert _state_of(coordinator) == "listening"
+
+    # Also verify explicit end_call() while STT is mid-flight cancels STT without leaking
+    first_stt_started.clear()
+    release_first_stt.clear()
+    vad.probs = [0.9, 0.9, 0.05, 0.05]
+    for _ in range(4):
+        audio_in.push_frame(_frame())
+    await asyncio.wait_for(first_stt_started.wait(), timeout=1.0)
+    await coordinator.end_call()
+    release_first_stt.set()
+    await asyncio.sleep(0.05)
+
+    assert _state_of(coordinator) == "standby"
+    assert orch.utterances == []
+    await coordinator.shutdown()
+
+
+async def test_t7_f5_tts_synth_failure_recovers_listening_and_barge_in_keeps_reason() -> None:
+    bus = OrchestratorEventBus()
+    state_events: list[CallStateChangedEvent] = []
+
+    async def _record_state(ev: object) -> None:
+        if isinstance(ev, CallStateChangedEvent):
+            state_events.append(ev)
+
+    bus.subscribe(_record_state)
+
+    audio_in = _ScriptedAudioInput()
+    audio_out = _ControlledAudioOutput(hold_playback=True)
+    vad = _FakeVad()
+    stt = _FakeStt(transcripts=["Explica el estado actual"])
+
+    fail_next_synth = True
+
+    class _FlakyTts(_FakeTts):
+        async def synthesize(self, text: str) -> SynthesizedAudio:
+            nonlocal fail_next_synth
+            if fail_next_synth:
+                fail_next_synth = False
+                await asyncio.sleep(0.03)
+                raise VoicePipelineError(code="VOICE_TTS_FAILED", message="ONNX synth failed")
+            return await super().synthesize(text)
+
+    class _MilestoneOrchestrator(_FakeOrchestrator):
+        async def handle_user_utterance(
+            self,
+            utterance: str,
+            correlation_id: str | None = None,
+        ) -> None:
+            await super().handle_user_utterance(utterance, correlation_id=correlation_id)
+            await self.event_bus.publish(
+                VoiceMilestoneEvent(
+                    correlation_id=correlation_id or "c-turn",
+                    summary_text="Respuesta final lista.",
+                    priority="normal",
+                )
+            )
+
+    orch = _MilestoneOrchestrator(event_bus=bus, hold_utterance=False)
+    coordinator = VoiceCallCoordinator(
+        audio_input=audio_in,
+        audio_output=audio_out,
+        wake_word=_FakeWakeWord(),
+        vad=vad,
+        stt=stt,
+        tts=_FlakyTts(),
+        orchestrator=orch,
+        event_bus=bus,
+        settings=VoiceCoordinatorSettings(min_speech_frames=2, end_silence_frames=2),
+    )
+    await coordinator.start()
+    await coordinator.start_call()
+
+    # 1. F5(a): Turn finishes with milestone queued; tts.synthesize() raises before speaking
+    vad.probs = [0.9, 0.9, 0.05, 0.05]
+    for _ in range(4):
+        audio_in.push_frame(_frame())
+    await asyncio.sleep(0.08)
+
+    # Session MUST recover to "listening" rather than staying wedged in "executing"!
+    assert _state_of(coordinator) == "listening"
+
+    # 2. F5(b): Play valid TTS in "speaking", then barge-in -> reason MUST be "user_barge_in"!
+    state_events.clear()
+    await bus.publish(
+        VoiceMilestoneEvent(
+            correlation_id="c-speak",
+            summary_text="Reproduciendo audio que sera interrumpido.",
+            priority="normal",
+        )
+    )
+    await asyncio.wait_for(audio_out.started_ev.wait(), timeout=1.0)
+    assert _state_of(coordinator) == "speaking"
+
+    vad.probs = [0.9, 0.9]
+    audio_in.push_frame(_frame())
+    audio_in.push_frame(_frame())
+    await asyncio.sleep(0.04)
+
+    assert _state_of(coordinator) == "listening"
+    listening_reasons = [ev.reason for ev in state_events if ev.state == "listening"]
+    assert listening_reasons == ["user_barge_in"]
+    await coordinator.shutdown()
+

@@ -30,6 +30,7 @@ from nova.domain.events import (
 from nova.domain.models import (
     CallSession,
     CallSessionState,
+    TranscriptionResult,
     WorkspaceContext,
     WorkspaceQueryMode,
 )
@@ -140,6 +141,7 @@ class VoiceCallCoordinator:
             turn_count=0,
         )
         self._call_open = False
+        self._call_epoch = 0
         self._capture_reset_epoch = 0
 
         self._tts_queue: deque[VoiceMilestoneEvent] = deque()
@@ -148,9 +150,10 @@ class VoiceCallCoordinator:
         self._current_tts_priority: Literal["normal", "interrupt"] | None = None
         self._current_tts_item_task: asyncio.Task[None] | None = None
 
-        self._segment_queue: asyncio.Queue[tuple[bytes, int, float] | None] = asyncio.Queue(
+        self._segment_queue: asyncio.Queue[tuple[bytes, int, float, int] | None] = asyncio.Queue(
             maxsize=8
         )
+        self._current_stt_task: asyncio.Task[TranscriptionResult] | None = None
         self._capture_task: asyncio.Task[None] | None = None
         self._segment_worker_task: asyncio.Task[None] | None = None
         self._tts_worker_task: asyncio.Task[None] | None = None
@@ -215,12 +218,19 @@ class VoiceCallCoordinator:
         self._segment_worker_task = asyncio.create_task(self._segment_worker())
         self._tts_worker_task = asyncio.create_task(self._tts_worker())
 
+    def _purge_segment_queue(self) -> None:
+        while not self._segment_queue.empty():
+            with contextlib.suppress(asyncio.QueueEmpty):
+                _ = self._segment_queue.get_nowait()
+
     async def start_call(self, reason: str = "manual_call_start") -> None:
         """Explicitly open a continuous CallSession in 'listening' state."""
         if self._session.state == "closed":
             return
         self._call_open = True
+        self._call_epoch += 1
         self._capture_reset_epoch += 1
+        self._purge_segment_queue()
         self._vad.reset()
         corr_id = f"corr-{uuid.uuid4()}"
         self._session = self._session.model_copy(
@@ -238,7 +248,19 @@ class VoiceCallCoordinator:
         if self._session.state in ("standby", "closed"):
             return
         self._call_open = False
+        self._call_epoch += 1
         self._capture_reset_epoch += 1
+        self._purge_segment_queue()
+
+        stt_task = self._current_stt_task
+        if stt_task is not None and not stt_task.done():
+            stt_task.cancel()
+
+        if self._active_turn_tasks and not self._has_active_pending_approval():
+            for turn_t in list(self._active_turn_tasks):
+                turn_t.cancel()
+            await self._orchestrator.barge_in()
+
         self._tts_queue.clear()
         await self._cancel_active_tts_playback()
         self._vad.reset()
@@ -250,9 +272,15 @@ class VoiceCallCoordinator:
         """Unsubscribe from bus, stop audio streams, cancel workers, and close CallSession."""
         self._event_bus.unsubscribe(self._on_event)
         self._call_open = False
+        self._call_epoch += 1
         self._capture_reset_epoch += 1
+        self._purge_segment_queue()
         self._tts_queue.clear()
         self._started = False
+
+        stt_task = self._current_stt_task
+        if stt_task is not None and not stt_task.done():
+            stt_task.cancel()
 
         await self._audio_input.stop_capture()
         await self._cancel_active_tts_playback()
@@ -286,6 +314,8 @@ class VoiceCallCoordinator:
     ) -> None:
         prev = self._session.state
         if prev == "closed":
+            return
+        if not self._call_open and new_state not in ("standby", "closed"):
             return
         now = self._clock()
         if prev == new_state:
@@ -557,12 +587,14 @@ class VoiceCallCoordinator:
         sample_rate_hz: int,
         speech_started_at: float,
     ) -> None:
-        if len(segment) < 2:
+        if not self._call_open or len(segment) < 2:
             return
         if self._segment_queue.full():
             with contextlib.suppress(asyncio.QueueEmpty):
                 _ = self._segment_queue.get_nowait()
-        self._segment_queue.put_nowait((segment, sample_rate_hz, speech_started_at))
+        self._segment_queue.put_nowait(
+            (segment, sample_rate_hz, speech_started_at, self._call_epoch)
+        )
 
     async def _execute_barge_in(self) -> None:
         """Stop TTS playback (<100 ms), clear queued speech, and abort active turn unless held."""
@@ -587,10 +619,21 @@ class VoiceCallCoordinator:
             item = await self._segment_queue.get()
             if item is None:
                 break
-            segment_bytes, sample_rate_hz, speech_started_at = item
+            segment_bytes, sample_rate_hz, speech_started_at, segment_epoch = item
+            if not self._call_open or segment_epoch != self._call_epoch:
+                continue
+
             corr_id = f"corr-{uuid.uuid4()}"
+            stt_task = asyncio.create_task(
+                self._stt.transcribe(segment_bytes, sample_rate_hz=sample_rate_hz)
+            )
+            self._current_stt_task = stt_task
             try:
-                tx = await self._stt.transcribe(segment_bytes, sample_rate_hz=sample_rate_hz)
+                tx = await stt_task
+            except asyncio.CancelledError:
+                if not self._started:
+                    raise
+                continue
             except VoicePipelineError as exc:
                 await self._publish_voice_failure(
                     exc.code,
@@ -604,6 +647,12 @@ class VoiceCallCoordinator:
                     str(exc),
                     correlation_id=corr_id,
                 )
+                continue
+            finally:
+                if self._current_stt_task is stt_task:
+                    self._current_stt_task = None
+
+            if not self._call_open or segment_epoch != self._call_epoch:
                 continue
 
             raw_text = tx.text.strip()
@@ -695,7 +744,12 @@ class VoiceCallCoordinator:
                 await self.end_call(reason="voice_hangup_command")
                 continue
 
-            if intent.kind == "user_utterance" and intent.utterance_text:
+            if (
+                intent.kind == "user_utterance"
+                and intent.utterance_text
+                and self._call_open
+                and segment_epoch == self._call_epoch
+            ):
                 await self._transition_state(
                     "thinking",
                     reason="utterance_dispatched",
@@ -705,14 +759,21 @@ class VoiceCallCoordinator:
                     update={"turn_count": self._session.turn_count + 1}
                 )
                 turn_task = asyncio.create_task(
-                    self._run_orchestrator_turn(intent.utterance_text, corr_id)
+                    self._run_orchestrator_turn(intent.utterance_text, corr_id, segment_epoch)
                 )
                 self._active_turn_tasks.add(turn_task)
                 turn_task.add_done_callback(self._active_turn_tasks.discard)
 
-    async def _run_orchestrator_turn(self, utterance: str, corr_id: str) -> None:
+    async def _run_orchestrator_turn(
+        self,
+        utterance: str,
+        corr_id: str,
+        expected_call_epoch: int,
+    ) -> None:
         this_task = asyncio.current_task()
         try:
+            if not self._call_open or expected_call_epoch != self._call_epoch:
+                return
             if self._session.state == "thinking":
                 await self._transition_state(
                     "executing",
@@ -733,6 +794,7 @@ class VoiceCallCoordinator:
                 self._active_turn_tasks.discard(this_task)
             if (
                 self._call_open
+                and expected_call_epoch == self._call_epoch
                 and self._session.state in ("thinking", "executing")
                 and not self._active_turn_tasks
                 and not self._audio_output.is_playing
@@ -782,12 +844,13 @@ class VoiceCallCoordinator:
                 self._synthesize_and_play_item(milestone, item_epoch)
             )
             self._current_tts_item_task = item_task
+            preempted = False
             try:
                 await item_task
             except asyncio.CancelledError:
                 if not self._started:
                     raise
-                # Preempted during synthesis/playback by interrupt, end_call, or barge-in
+                preempted = True
             except VoicePipelineError as exc:
                 await self._publish_voice_failure(
                     exc.code,
@@ -805,10 +868,25 @@ class VoiceCallCoordinator:
                     self._current_tts_item_task = None
                 self._current_tts_priority = None
 
-            if not self._tts_queue and self._session.state == "speaking":
-                target = self._post_speech_target_state()
-                await self._transition_state(
-                    target,
-                    reason="tts_playback_completed",
-                    correlation_id=milestone.correlation_id,
-                )
+            if (
+                not preempted
+                and item_epoch == self._tts_epoch
+                and not self._tts_queue
+                and self._call_open
+            ):
+                if self._session.state == "speaking":
+                    target = self._post_speech_target_state()
+                    await self._transition_state(
+                        target,
+                        reason="tts_playback_completed",
+                        correlation_id=milestone.correlation_id,
+                    )
+                elif (
+                    self._session.state in ("thinking", "executing")
+                    and not self._active_turn_tasks
+                ):
+                    await self._transition_state(
+                        "listening",
+                        reason="turn_completed",
+                        correlation_id=milestone.correlation_id,
+                    )

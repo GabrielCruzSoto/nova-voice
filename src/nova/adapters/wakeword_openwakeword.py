@@ -6,6 +6,7 @@ import asyncio
 import importlib
 import math
 import struct
+import threading
 import time
 from collections.abc import Callable
 from pathlib import Path
@@ -78,6 +79,7 @@ class OpenWakeWordSettings(BaseModel):
     threshold: float = Field(default=0.60, gt=0.0, le=1.0)
     cooldown_seconds: float = Field(default=1.5, ge=0.0, le=30.0)
     inference_timeout_seconds: float = Field(default=1.0, gt=0.0, le=5.0)
+    model_load_timeout_seconds: float = Field(default=15.0, gt=0.0, le=120.0)
     model_paths: tuple[str, ...] = ()
 
 
@@ -95,6 +97,7 @@ class OpenWakeWordAdapter:
         self._predictor_factory = predictor_factory
         self._clock = clock
         self._load_lock = asyncio.Lock()
+        self._infer_lock = threading.Lock()
         self._backend: WakeWordBackendProtocol | None = None
         self._last_detected_at: float | None = None
         self._pending_reset = False
@@ -110,7 +113,7 @@ class OpenWakeWordAdapter:
                 try:
                     self._backend = await asyncio.wait_for(
                         asyncio.to_thread(factory),
-                        timeout=self._settings.inference_timeout_seconds,
+                        timeout=self._settings.model_load_timeout_seconds,
                     )
                 except TimeoutError as exc:
                     raise VoicePipelineError(
@@ -136,12 +139,17 @@ class OpenWakeWordAdapter:
         backend = await self._ensure_backend()
 
         def _run_sync() -> dict[str, float]:
-            if self._pending_reset:
-                backend.reset()
-                self._pending_reset = False
-            # Verify buffer unpackability cleanly
-            _ = struct.unpack_from("<h", frame.pcm_s16le, 0)
-            return backend.predict_scores(frame.pcm_s16le)
+            with self._infer_lock:
+                if self._pending_reset:
+                    self._pending_reset = False
+                    backend.reset()
+                # Verify buffer unpackability cleanly
+                _ = struct.unpack_from("<h", frame.pcm_s16le, 0)
+                result = backend.predict_scores(frame.pcm_s16le)
+                if self._pending_reset:
+                    self._pending_reset = False
+                    backend.reset()
+                return result
 
         try:
             scores = await asyncio.wait_for(
@@ -181,7 +189,15 @@ class OpenWakeWordAdapter:
         detected = best_score >= self._settings.threshold and not in_cooldown
         if detected:
             self._last_detected_at = now
-            await asyncio.to_thread(backend.reset)
+            self.reset()
+            if self._pending_reset:
+                def _reset_sync() -> None:
+                    with self._infer_lock:
+                        if self._pending_reset:
+                            self._pending_reset = False
+                            backend.reset()
+
+                await asyncio.to_thread(_reset_sync)
 
         return WakeWordDetection(
             detected=detected,
@@ -190,9 +206,17 @@ class OpenWakeWordAdapter:
         )
 
     def reset(self) -> None:
-        """Idempotently reset wake-word state."""
-        if self._backend is not None:
-            self._backend.reset()
+        """Idempotently reset wake-word state without racing in-flight worker inference."""
+        backend = self._backend
+        if backend is None:
+            self._pending_reset = True
+            return
+        if self._infer_lock.acquire(blocking=False):
+            try:
+                self._pending_reset = False
+                backend.reset()
+            finally:
+                self._infer_lock.release()
         else:
             self._pending_reset = True
 

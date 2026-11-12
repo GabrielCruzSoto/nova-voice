@@ -6,6 +6,7 @@ import asyncio
 import importlib
 import math
 import struct
+import threading
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any, Protocol
@@ -86,6 +87,7 @@ class SileroVadSettings(BaseModel):
     model_path: str | None = None
     sample_rate_hz: int = Field(default=16000, ge=8000, le=16000)
     inference_timeout_seconds: float = Field(default=1.0, gt=0.0, le=5.0)
+    model_load_timeout_seconds: float = Field(default=15.0, gt=0.0, le=120.0)
 
 
 class SileroVadAdapter:
@@ -100,7 +102,9 @@ class SileroVadAdapter:
         self._settings = settings or SileroVadSettings()
         self._scorer_factory = scorer_factory
         self._load_lock = asyncio.Lock()
+        self._infer_lock = threading.Lock()
         self._backend: VadBackendProtocol | None = None
+        self._pending_reset = False
 
     async def _ensure_backend(self) -> VadBackendProtocol:
         if self._backend is not None:
@@ -113,7 +117,7 @@ class SileroVadAdapter:
                 try:
                     self._backend = await asyncio.wait_for(
                         asyncio.to_thread(factory),
-                        timeout=self._settings.inference_timeout_seconds,
+                        timeout=self._settings.model_load_timeout_seconds,
                     )
                 except TimeoutError as exc:
                     raise VoicePipelineError(
@@ -136,8 +140,16 @@ class SileroVadAdapter:
         backend = await self._ensure_backend()
 
         def _score_sync() -> float:
-            samples = pcm_s16le_to_float_list(frame.pcm_s16le)
-            return backend.score_samples(samples, frame.sample_rate_hz)
+            with self._infer_lock:
+                if self._pending_reset:
+                    self._pending_reset = False
+                    backend.reset()
+                samples = pcm_s16le_to_float_list(frame.pcm_s16le)
+                score = backend.score_samples(samples, frame.sample_rate_hz)
+                if self._pending_reset:
+                    self._pending_reset = False
+                    backend.reset()
+                return score
 
         try:
             raw_prob = await asyncio.wait_for(
@@ -162,9 +174,19 @@ class SileroVadAdapter:
         return min(1.0, max(0.0, float(raw_prob)))
 
     def reset(self) -> None:
-        """Idempotently clear internal recurrent VAD state."""
-        if self._backend is not None:
-            self._backend.reset()
+        """Idempotently clear internal recurrent VAD state without racing worker threads."""
+        backend = self._backend
+        if backend is None:
+            self._pending_reset = True
+            return
+        if self._infer_lock.acquire(blocking=False):
+            try:
+                self._pending_reset = False
+                backend.reset()
+            finally:
+                self._infer_lock.release()
+        else:
+            self._pending_reset = True
 
     async def close(self) -> None:
         """Release loaded ONNX session reference."""

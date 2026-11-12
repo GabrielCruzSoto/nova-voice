@@ -290,9 +290,54 @@ async def test_f8_lazy_model_loading_enforces_explicit_timeout() -> None:
         raise AssertionError("unreachable")
 
     vad = SileroVadAdapter(
-        settings=SileroVadSettings(inference_timeout_seconds=0.03),
+        settings=SileroVadSettings(
+            inference_timeout_seconds=0.03,
+            model_load_timeout_seconds=0.03,
+        ),
         scorer_factory=hung_loader,  # type: ignore[arg-type]
     )
     with pytest.raises(VoicePipelineError) as exc_info:
         await vad.speech_probability(_make_frame())
     assert exc_info.value.code == "VOICE_MODEL_UNAVAILABLE"
+
+    # Cold model load slower than per-frame inference_timeout_seconds still succeeds
+    # within dedicated model_load_timeout_seconds, for both SileroVad and OpenWakeWord
+    class _ColdVadBackend:
+        def __init__(self) -> None:
+            time_mod.sleep(0.06)
+
+        def score_samples(self, samples: list[float], sample_rate_hz: int) -> float:
+            return 0.5
+
+        def reset(self) -> None:
+            return None
+
+    cold_vad = SileroVadAdapter(
+        settings=SileroVadSettings(
+            inference_timeout_seconds=0.02,
+            model_load_timeout_seconds=0.5,
+        ),
+        scorer_factory=_ColdVadBackend,
+    )
+    assert await cold_vad.speech_probability(_make_frame()) == pytest.approx(0.5)
+
+    class _ColdWakeBackend:
+        def __init__(self) -> None:
+            time_mod.sleep(0.06)
+
+        def predict_scores(self, pcm_s16le: bytes) -> dict[str, float]:
+            return {"oye_nova": 0.1}
+
+        def reset(self) -> None:
+            return None
+
+    cold_wake = OpenWakeWordAdapter(
+        settings=OpenWakeWordSettings(
+            inference_timeout_seconds=0.02,
+            model_load_timeout_seconds=0.5,
+        ),
+        predictor_factory=_ColdWakeBackend,
+    )
+    det = await cold_wake.detect(_make_frame())
+    assert det.detected is False
+
