@@ -13,9 +13,15 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from nova.domain.errors import NovaDomainError, WorkspaceResolutionError, redact_sensitive_text
+from nova.domain.errors import (
+    GatekeeperError,
+    NovaDomainError,
+    WorkspaceResolutionError,
+    redact_sensitive_text,
+)
 from nova.domain.events import (
     ChatStreamEvent,
+    CommandApprovalResolvedEvent,
     OrchestratorEventBus,
     RunnerFailureEvent,
     VoiceMilestoneEvent,
@@ -28,6 +34,7 @@ from nova.domain.models import (
 )
 from nova.domain.ports import (
     CodingRunnerPort,
+    SecurityGatekeeperPort,
     Tier1ConversationPort,
     WorkspaceResolverPort,
 )
@@ -67,11 +74,20 @@ async def _closing_async_iter[T](stream: AsyncIterator[T]) -> AsyncIterator[Asyn
                 await res
 
 
-def _log_structured(event_name: str, **fields: str | bool) -> None:
+def _log_structured(
+    event_name: str,
+    *,
+    extra_secrets: tuple[str, ...] = (),
+    **fields: str | bool,
+) -> None:
     """Emit structured JSON log record with sensitive values masked (NFR-3)."""
     safe_payload: dict[str, str | bool] = {"event": event_name}
     for key, val in fields.items():
-        safe_payload[key] = redact_sensitive_text(val) if isinstance(val, str) else val
+        safe_payload[key] = (
+            redact_sensitive_text(val, extra_secrets=extra_secrets)
+            if isinstance(val, str)
+            else val
+        )
     logger.info(json.dumps(safe_payload, ensure_ascii=False, sort_keys=True))
 
 
@@ -95,11 +111,17 @@ def classify_complexity(utterance: str) -> Literal["low", "high"]:
     return "low"
 
 
-def sanitize_for_voice(raw_text: str, fallback: str, max_words: int = 20) -> str:
+def sanitize_for_voice(
+    raw_text: str,
+    fallback: str,
+    max_words: int = 20,
+    extra_secrets: tuple[str, ...] = (),
+) -> str:
     """Strip code blocks and filesystem paths, returning a <=25-word spoken summary."""
     without_code = _CODE_BLOCK_RE.sub(" ", raw_text)
     without_paths = _PATH_TOKEN_RE.sub("archivo del proyecto", without_code)
-    cleaned = re.sub(r"[`*_#>]+", " ", redact_sensitive_text(without_paths))
+    redacted = redact_sensitive_text(without_paths, extra_secrets=extra_secrets)
+    cleaned = re.sub(r"[`*_#>]+", " ", redacted)
     words = [w for w in cleaned.split() if w]
     if not words:
         words = fallback.split()
@@ -117,13 +139,26 @@ class NovaOrchestrator:
         tier2_runner: CodingRunnerPort,
         event_bus: OrchestratorEventBus,
         settings: OrchestratorSettings | None = None,
+        security_gatekeeper: SecurityGatekeeperPort | None = None,
     ) -> None:
         self._workspace_resolver = workspace_resolver
         self._tier1_client = tier1_client
         self._tier2_runner = tier2_runner
         self._event_bus = event_bus
         self._settings = settings or OrchestratorSettings()
+        self._security_gatekeeper = security_gatekeeper
         self._tier2_conversations: dict[str, str] = {}
+
+    def _extra_secrets(self) -> tuple[str, ...]:
+        if self._security_gatekeeper is None:
+            return ()
+        return self._security_gatekeeper.extra_secrets
+
+    def _redact(self, text: str) -> str:
+        return redact_sensitive_text(text, extra_secrets=self._extra_secrets())
+
+    def _log(self, event_name: str, **fields: str | bool) -> None:
+        _log_structured(event_name, extra_secrets=self._extra_secrets(), **fields)
 
     async def select_workspace(
         self,
@@ -132,7 +167,7 @@ class NovaOrchestrator:
         correlation_id: str | None = None,
     ) -> WorkspaceContext:
         """Resolve, activate, and announce a target project directory."""
-        corr_id = correlation_id or f"corr-{uuid.uuid4().hex[:12]}"
+        corr_id = correlation_id or f"corr-{uuid.uuid4()}"
         context = await self._workspace_resolver.resolve(
             ResolveWorkspaceRequest(
                 correlation_id=corr_id,
@@ -141,7 +176,7 @@ class NovaOrchestrator:
             )
         )
         await self._tier1_client.switch_workspace(context.canonical_path)
-        _log_structured(
+        self._log(
             "workspace_selected",
             correlation_id=corr_id,
             workspace_id=context.workspace_id,
@@ -153,6 +188,7 @@ class NovaOrchestrator:
                 summary_text=sanitize_for_voice(
                     f"Proyecto activo cambiado a {context.name}.",
                     fallback="Proyecto activo actualizado.",
+                    extra_secrets=self._extra_secrets(),
                 ),
                 priority="normal",
             )
@@ -165,7 +201,7 @@ class NovaOrchestrator:
         correlation_id: str | None = None,
     ) -> None:
         """Route a user utterance by complexity and emit synchronized Chat + Voice events."""
-        corr_id = correlation_id or f"corr-{uuid.uuid4().hex[:12]}"
+        corr_id = correlation_id or f"corr-{uuid.uuid4()}"
         active_ws = self._workspace_resolver.active_context
         if active_ws is None:
             raise WorkspaceResolutionError(
@@ -174,7 +210,7 @@ class NovaOrchestrator:
             )
 
         tier = classify_complexity(utterance)
-        _log_structured(
+        self._log(
             "utterance_routed",
             correlation_id=corr_id,
             tier=tier,
@@ -186,17 +222,18 @@ class NovaOrchestrator:
             else:
                 await self._run_tier2(utterance, active_ws.canonical_path, corr_id)
         except NovaDomainError as exc:
-            _log_structured(
+            redacted_err = self._redact(exc.sanitized_message)
+            self._log(
                 "runner_failure",
                 correlation_id=corr_id,
                 error_code=exc.code,
-                message=exc.sanitized_message,
+                message=redacted_err,
             )
             await self._event_bus.publish(
                 RunnerFailureEvent(
                     correlation_id=corr_id,
                     error_code=exc.code,
-                    sanitized_message=exc.sanitized_message,
+                    sanitized_message=redacted_err,
                     recoverable=True,
                 )
             )
@@ -212,18 +249,38 @@ class NovaOrchestrator:
 
     async def barge_in(self) -> None:
         """Interrupt active speech/agent turn immediately on user voice activity."""
-        _log_structured("barge_in_triggered")
+        self._log("barge_in_triggered")
         await self._tier1_client.barge_in_abort()
+
+    async def resolve_command_approval(
+        self,
+        audit_id: str,
+        *,
+        approved: bool,
+        resolved_by: str = "user_voice_or_ui",
+    ) -> CommandApprovalResolvedEvent:
+        """Delegate human command approval/rejection to the configured SecurityGatekeeper."""
+        if self._security_gatekeeper is None:
+            raise GatekeeperError(
+                code="GATEKEEPER_NOT_CONFIGURED",
+                message="SecurityGatekeeper is not attached to NovaOrchestrator.",
+            )
+        return await self._security_gatekeeper.resolve_command_approval(
+            audit_id,
+            approved=approved,
+            resolved_by=resolved_by,
+        )
 
     async def _run_tier1(self, utterance: str, correlation_id: str) -> None:
         collected: list[str] = []
         async with _closing_async_iter(self._tier1_client.stream_prompt(utterance)) as stream:
             async for delta in stream:
-                collected.append(delta)
+                redacted_delta = self._redact(delta)
+                collected.append(redacted_delta)
                 await self._event_bus.publish(
                     ChatStreamEvent(
                         correlation_id=correlation_id,
-                        delta=delta,
+                        delta=redacted_delta,
                         source="tier1_pi",
                         step_type="agent_response",
                     )
@@ -236,6 +293,7 @@ class NovaOrchestrator:
                 summary_text=sanitize_for_voice(
                     joined,
                     fallback="Listo, complete la consulta en el proyecto.",
+                    extra_secrets=self._extra_secrets(),
                 ),
                 priority="normal",
             )
@@ -276,10 +334,11 @@ class NovaOrchestrator:
                     self._tier2_conversations[workspace_path] = progress.conversation_id
 
                 if progress.kind == "delta" and progress.text_delta:
+                    redacted_delta = self._redact(progress.text_delta)
                     await self._event_bus.publish(
                         ChatStreamEvent(
                             correlation_id=correlation_id,
-                            delta=progress.text_delta,
+                            delta=redacted_delta,
                             source="tier2_runner",
                             step_type=progress.step_type,
                         )
@@ -290,8 +349,9 @@ class NovaOrchestrator:
                             VoiceMilestoneEvent(
                                 correlation_id=correlation_id,
                                 summary_text=sanitize_for_voice(
-                                    progress.text_delta,
+                                    redacted_delta,
                                     fallback=f"Avanzando en etapa {progress.step_type}.",
+                                    extra_secrets=self._extra_secrets(),
                                 ),
                                 priority="normal",
                             )
@@ -307,23 +367,26 @@ class NovaOrchestrator:
                             summary_text=sanitize_for_voice(
                                 f"Entrando en etapa {progress.step_type}.",
                                 fallback="Avanzando en el proyecto.",
+                                extra_secrets=self._extra_secrets(),
                             ),
                             priority="normal",
                         )
                     )
                 elif progress.kind == "completed":
                     if progress.final_response:
+                        redacted_final = self._redact(progress.final_response)
                         await self._event_bus.publish(
                             ChatStreamEvent(
                                 correlation_id=correlation_id,
-                                delta=progress.final_response,
+                                delta=redacted_final,
                                 source="tier2_runner",
                                 step_type="result",
                             )
                         )
                         final_summary = sanitize_for_voice(
-                            progress.final_response,
+                            redacted_final,
                             fallback=final_summary,
+                            extra_secrets=self._extra_secrets(),
                         )
 
         await self._event_bus.publish(

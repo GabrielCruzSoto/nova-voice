@@ -1,0 +1,16 @@
+{
+  "nova-security-gatekeeper": {
+    "PreToolUse": [
+      {
+        "matcher": "run_command",
+        "hooks": [
+          {
+            "type": "command",
+            "command": "python3 ./pre_tool_hook.py",
+            "timeout": 300
+          }
+        ]
+      }
+    ]
+  }
+}

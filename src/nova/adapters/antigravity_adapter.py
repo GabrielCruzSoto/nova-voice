@@ -5,6 +5,8 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import os
+import time
 from collections.abc import AsyncIterator
 from typing import Any
 
@@ -35,6 +37,10 @@ class AntigravityRunnerConfig(BaseModel):
     allowed_models: frozenset[str] = ALLOWED_TIER2_MODELS
     timeout_seconds: float = Field(default=300.0, gt=0.0)
     max_line_bytes: int = Field(default=DEFAULT_MAX_LINE_BYTES, gt=0)
+    gatekeeper_ipc_env: dict[str, str] | None = None
+    require_gatekeeper_plugin: bool = True
+    gatekeeper_plugin_name: str = Field(default="nova-agy-gatekeeper", min_length=1)
+    plugin_check_ttl_seconds: float = Field(default=60.0, gt=0.0)
 
 
 class _AgyStepUpdate(BaseModel):
@@ -61,6 +67,7 @@ class AntigravityCLIAdapter:
 
     def __init__(self, config: AntigravityRunnerConfig | None = None) -> None:
         self._config = config or AntigravityRunnerConfig()
+        self._plugin_verified_until_monotonic: float = 0.0
 
     async def execute(self, request: CodingTaskRequest) -> AsyncIterator[RunnerProgressEvent]:
         """Run a heavy coding turn and yield structured RunnerProgressEvent records."""
@@ -74,6 +81,16 @@ class AntigravityCLIAdapter:
             raise CodingRunnerError(
                 code="RUNNER_INVALID_REQUEST",
                 message=f"Model '{request.model}' is not in the approved Tier 2 allowlist.",
+            )
+
+        if (
+            self._config.gatekeeper_ipc_env
+            and self._config.require_gatekeeper_plugin
+            and time.monotonic() >= self._plugin_verified_until_monotonic
+        ):
+            await self._verify_gatekeeper_plugin_installed(request.workspace_path)
+            self._plugin_verified_until_monotonic = (
+                time.monotonic() + self._config.plugin_check_ttl_seconds
             )
 
         cmd: list[str] = [
@@ -92,10 +109,17 @@ class AntigravityCLIAdapter:
         if request.conversation_id:
             cmd.extend(["--conversation", request.conversation_id])
 
+        child_env = (
+            {**os.environ, **self._config.gatekeeper_ipc_env}
+            if self._config.gatekeeper_ipc_env
+            else None
+        )
+
         try:
             proc = await asyncio.create_subprocess_exec(
                 *cmd,
                 cwd=request.workspace_path,
+                env=child_env,
                 stdin=asyncio.subprocess.DEVNULL,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
@@ -223,6 +247,95 @@ class AntigravityCLIAdapter:
                 stderr_task.cancel()
                 with contextlib.suppress(asyncio.CancelledError):
                     await stderr_task
+
+    async def _verify_gatekeeper_plugin_installed(self, cwd: str) -> None:
+        """Fail-closed preflight ensuring nova-agy-gatekeeper is installed and enabled."""
+        check_cmd = [
+            self._config.executable,
+            *self._config.extra_leading_args,
+            "plugin",
+            "list",
+            "--json",
+        ]
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *check_cmd,
+                cwd=cwd,
+                stdin=asyncio.subprocess.DEVNULL,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+        except OSError as exc:
+            raise CodingRunnerError(
+                code="GATEKEEPER_PLUGIN_MISSING",
+                message=f"Failed to verify Antigravity gatekeeper plugin: {exc}",
+            ) from exc
+
+        try:
+            stdout_b, _ = await asyncio.wait_for(
+                proc.communicate(),
+                timeout=min(10.0, self._config.timeout_seconds),
+            )
+        except TimeoutError as exc:
+            await self._terminate_process(proc)
+            raise CodingRunnerError(
+                code="GATEKEEPER_PLUGIN_MISSING",
+                message="Timed out verifying Antigravity gatekeeper plugin installation.",
+            ) from exc
+
+        await self._terminate_process(proc)
+        if proc.returncode != 0:
+            raise CodingRunnerError(
+                code="GATEKEEPER_PLUGIN_MISSING",
+                message=(
+                    f"Antigravity plugin check exited with code {proc.returncode}; "
+                    f"refusing unguarded '--mode accept-edits'."
+                ),
+            )
+
+        try:
+            plugins_raw: Any = json.loads(stdout_b.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+            raise CodingRunnerError(
+                code="GATEKEEPER_PLUGIN_MISSING",
+                message="Malformed JSON from 'agy plugin list --json' (fail-closed).",
+            ) from exc
+
+        if not isinstance(plugins_raw, list):
+            raise CodingRunnerError(
+                code="GATEKEEPER_PLUGIN_MISSING",
+                message="Unexpected payload from 'agy plugin list --json' (fail-closed).",
+            )
+
+        matched_entry = next(
+            (
+                item
+                for item in plugins_raw
+                if isinstance(item, dict)
+                and item.get("name") == self._config.gatekeeper_plugin_name
+                and item.get("enabled") is True
+            ),
+            None,
+        )
+        if matched_entry is None:
+            raise CodingRunnerError(
+                code="GATEKEEPER_PLUGIN_MISSING",
+                message=(
+                    f"Required plugin '{self._config.gatekeeper_plugin_name}' is not installed "
+                    "or enabled in Antigravity CLI; refusing '--mode accept-edits'."
+                ),
+            )
+
+        plugin_path = matched_entry.get("path")
+        if isinstance(plugin_path, str) and plugin_path.strip():
+            hooks_manifest = os.path.join(plugin_path.strip(), "hooks.json")
+            if not await asyncio.to_thread(os.path.isfile, hooks_manifest):
+                raise CodingRunnerError(
+                    code="GATEKEEPER_PLUGIN_MISSING",
+                    message=(
+                        f"Plugin '{self._config.gatekeeper_plugin_name}' is missing hooks.json."
+                    ),
+                )
 
     @staticmethod
     def _parse_ndjson_line(trimmed: bytes) -> dict[str, Any]:

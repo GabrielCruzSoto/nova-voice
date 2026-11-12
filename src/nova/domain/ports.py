@@ -5,8 +5,13 @@ from __future__ import annotations
 from collections.abc import AsyncIterator
 from typing import Protocol
 
+from nova.domain.events import CommandApprovalResolvedEvent
 from nova.domain.models import (
     CodingTaskRequest,
+    CommandAuditInput,
+    CommandAuditResult,
+    CommandExecutionDecision,
+    CommandInterceptRequest,
     ResolveWorkspaceRequest,
     RunnerProgressEvent,
     WorkspaceContext,
@@ -47,4 +52,38 @@ class CodingRunnerPort(Protocol):
 
     def execute(self, request: CodingTaskRequest) -> AsyncIterator[RunnerProgressEvent]:
         """Stream structured progress events for a heavy coding task."""
+        ...
+
+
+class CommandAuditorPort(Protocol):
+    """Abstract port for Layer 2 isolated command security auditor (NOVA-002 OP-3)."""
+
+    async def audit(self, request: CommandAuditInput) -> CommandAuditResult:
+        """Analyze a dubious shell command and return a structured explanation."""
+        ...
+
+
+class SecurityGatekeeperPort(Protocol):
+    """Abstract port for pre-execution command authorization and human approval."""
+
+    @property
+    def extra_secrets(self) -> tuple[str, ...]:
+        """Dynamic session secrets registered for universal stream redaction."""
+        ...
+
+    async def evaluate_and_authorize(
+        self,
+        request: CommandInterceptRequest,
+    ) -> CommandExecutionDecision:
+        """Run Layer 1 + Layer 2 and return final allow/deny decision."""
+        ...
+
+    async def resolve_command_approval(
+        self,
+        audit_id: str,
+        *,
+        approved: bool,
+        resolved_by: str = "user_voice_or_ui",
+    ) -> CommandApprovalResolvedEvent:
+        """Resolve a held command approval request explicitly."""
         ...

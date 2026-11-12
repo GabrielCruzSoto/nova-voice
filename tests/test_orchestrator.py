@@ -315,3 +315,148 @@ async def test_f4_f6_f8_redacts_secrets_tracks_stage_changes_and_strips_lowercas
     assert "nvapi-" not in failures[0].sanitized_message
     assert "dummy_tok" not in failures[0].sanitized_message
     assert "<REDACTED:secret>" in failures[0].sanitized_message
+
+
+async def test_fu2_fu3_chat_stream_secret_redaction_and_full_uuid4_correlation_id(
+    tmp_path: Path,
+) -> None:
+    import uuid as uuid_mod
+
+    root = tmp_path / "Proyectos"
+    repo = root / "sec-app"
+    repo.mkdir(parents=True)
+
+    bus = OrchestratorEventBus()
+    events: list[OrchestratorEvent] = []
+
+    async def collect(ev: OrchestratorEvent) -> None:
+        events.append(ev)
+
+    bus.subscribe(collect)
+    resolver = LocalWorkspaceResolver(allowed_roots=[root], event_bus=bus)
+    tier1 = _FakeTier1Client(
+        chunks=["Usando token sk-synt9988776655 y Bearer my_secret_bearer_token en respuesta."]
+    )
+    tier2 = _FakeTier2Runner()
+
+    orchestrator = NovaOrchestrator(
+        workspace_resolver=resolver,
+        tier1_client=tier1,
+        tier2_runner=tier2,
+        event_bus=bus,
+    )
+    await orchestrator.select_workspace(str(repo), mode="exact_path")
+    events.clear()
+
+    await orchestrator.handle_user_utterance("Revisa estado rapido")
+    chat_events = [e for e in events if isinstance(e, ChatStreamEvent)]
+    assert len(chat_events) == 1
+    assert "sk-synt9988776655" not in chat_events[0].delta
+    assert "my_secret_bearer_token" not in chat_events[0].delta
+    assert "<REDACTED:secret>" in chat_events[0].delta
+
+    corr_id = chat_events[0].correlation_id
+    assert corr_id.startswith("corr-")
+    parsed_uuid = uuid_mod.UUID(corr_id.removeprefix("corr-"))
+    assert parsed_uuid.version == 4
+
+
+async def test_f7_orchestrator_redacts_gatekeeper_ephemeral_secrets_in_chat_stream(
+    tmp_path: Path,
+) -> None:
+    from nova.application.security_gatekeeper import SecurityGatekeeper
+    from nova.domain.models import CommandAuditInput, CommandAuditResult
+
+    class _NoopAuditor:
+        async def audit(self, request: CommandAuditInput) -> CommandAuditResult:
+            return CommandAuditResult(
+                risk_level="medium",
+                spoken_summary="Necesito aprobacion para este comando.",
+                technical_explanation=request.rule_id,
+                audited_by="deterministic_fallback",
+            )
+
+    root = tmp_path / "Proyectos"
+    repo = root / "f7-app"
+    repo.mkdir(parents=True)
+
+    bus = OrchestratorEventBus()
+    events: list[OrchestratorEvent] = []
+
+    async def collect(ev: OrchestratorEvent) -> None:
+        events.append(ev)
+
+    bus.subscribe(collect)
+    resolver = LocalWorkspaceResolver(allowed_roots=[root], event_bus=bus)
+    gatekeeper = SecurityGatekeeper(
+        workspace_resolver=resolver,
+        auditor=_NoopAuditor(),
+        event_bus=bus,
+    )
+    bare_ephemeral = "ephemeralSecret99887766"
+    gatekeeper.register_ephemeral_secret(bare_ephemeral)
+
+    tier1 = _FakeTier1Client(chunks=[f"Salida accidental filtrando {bare_ephemeral} en texto."])
+    orchestrator = NovaOrchestrator(
+        workspace_resolver=resolver,
+        tier1_client=tier1,
+        tier2_runner=_FakeTier2Runner(),
+        event_bus=bus,
+        security_gatekeeper=gatekeeper,
+    )
+    await orchestrator.select_workspace(str(repo), mode="exact_path")
+    events.clear()
+
+    await orchestrator.handle_user_utterance("Consulta simple")
+    chat_events = [e for e in events if isinstance(e, ChatStreamEvent)]
+    assert len(chat_events) == 1
+    assert bare_ephemeral not in chat_events[0].delta
+    assert "<REDACTED:secret>" in chat_events[0].delta
+
+    class _LeakingFailRunner:
+        async def execute(self, request: CodingTaskRequest) -> AsyncIterator[RunnerProgressEvent]:
+            raise CodingRunnerError(
+                code="RUNNER_EXECUTION_FAILED",
+                message=f"Subprocess failed with {bare_ephemeral} in stderr",
+            )
+            yield  # pragma: no cover
+
+    events.clear()
+    fail_orchestrator = NovaOrchestrator(
+        workspace_resolver=resolver,
+        tier1_client=tier1,
+        tier2_runner=_LeakingFailRunner(),
+        event_bus=bus,
+        security_gatekeeper=gatekeeper,
+    )
+    await fail_orchestrator.handle_user_utterance("[delegate_tier2] Forzar fallo con secreto")
+    failures = [e for e in events if isinstance(e, RunnerFailureEvent)]
+    assert len(failures) == 1
+    assert bare_ephemeral not in failures[0].sanitized_message
+    assert "<REDACTED:secret>" in failures[0].sanitized_message
+
+    class _MilestoneSecretRunner:
+        async def execute(self, request: CodingTaskRequest) -> AsyncIterator[RunnerProgressEvent]:
+            yield RunnerProgressEvent(
+                kind="milestone",
+                conversation_id="c-ms-sec",
+                step_type=f"stage_{bare_ephemeral}",
+            )
+            yield RunnerProgressEvent(
+                kind="completed",
+                conversation_id="c-ms-sec",
+                step_type="result",
+                final_response="ok",
+            )
+
+    events.clear()
+    ms_orchestrator = NovaOrchestrator(
+        workspace_resolver=resolver,
+        tier1_client=tier1,
+        tier2_runner=_MilestoneSecretRunner(),
+        event_bus=bus,
+        security_gatekeeper=gatekeeper,
+    )
+    await ms_orchestrator.handle_user_utterance("[delegate_tier2] Probar hito con secreto")
+    voice_evs = [e for e in events if isinstance(e, VoiceMilestoneEvent)]
+    assert all(bare_ephemeral not in v.summary_text for v in voice_evs)
