@@ -17,6 +17,7 @@ from nova.domain.models import (
     CommandSource,
     DecisionVerdict,
     InferenceDevice,
+    WorkspaceQueryMode,
     utc_now_iso,
     validate_spoken_word_budget,
 )
@@ -33,6 +34,7 @@ class WorkspaceChangedEvent(BaseModel):
     correlation_id: str = Field(min_length=1)
     workspace_name: str = Field(min_length=1)
     canonical_path: str = Field(min_length=1)
+    selected_via: WorkspaceQueryMode = "exact_path"
     timestamp: str = Field(default_factory=utc_now_iso)
 
 

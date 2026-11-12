@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import AsyncIterator
+from pathlib import Path
 from typing import Protocol
 
 from nova.domain.events import CommandApprovalResolvedEvent
@@ -163,4 +164,12 @@ class TextToSpeechPort(Protocol):
 
     async def synthesize(self, text: str) -> SynthesizedAudio:
         """Synthesize spoken Spanish text into an in-memory mono s16le PCM buffer."""
+        ...
+
+
+class FolderPickerPort(Protocol):
+    """Abstract port for native desktop folder selection dialog (NOVA-004 OP-4)."""
+
+    async def pick_directory(self, initial_dir: Path | None = None) -> Path | None:
+        """Open a native folder picker; return selected directory Path, or None if cancelled."""
         ...

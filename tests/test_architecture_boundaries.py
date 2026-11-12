@@ -16,6 +16,11 @@ FORBIDDEN_ADAPTER_OR_RUNTIME_PREFIXES: tuple[str, ...] = (
     "sounddevice",
     "pyaudio",
     "subprocess",
+    "gi",
+    "tkinter",
+    "PyQt6",
+    "PySide6",
+    "webview",
 )
 
 
