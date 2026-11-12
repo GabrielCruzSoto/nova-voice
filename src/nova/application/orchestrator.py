@@ -13,9 +13,15 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from nova.domain.errors import NovaDomainError, WorkspaceResolutionError, redact_sensitive_text
+from nova.domain.errors import (
+    GatekeeperError,
+    NovaDomainError,
+    WorkspaceResolutionError,
+    redact_sensitive_text,
+)
 from nova.domain.events import (
     ChatStreamEvent,
+    CommandApprovalResolvedEvent,
     OrchestratorEventBus,
     RunnerFailureEvent,
     VoiceMilestoneEvent,
@@ -28,6 +34,7 @@ from nova.domain.models import (
 )
 from nova.domain.ports import (
     CodingRunnerPort,
+    SecurityGatekeeperPort,
     Tier1ConversationPort,
     WorkspaceResolverPort,
 )
@@ -117,12 +124,14 @@ class NovaOrchestrator:
         tier2_runner: CodingRunnerPort,
         event_bus: OrchestratorEventBus,
         settings: OrchestratorSettings | None = None,
+        security_gatekeeper: SecurityGatekeeperPort | None = None,
     ) -> None:
         self._workspace_resolver = workspace_resolver
         self._tier1_client = tier1_client
         self._tier2_runner = tier2_runner
         self._event_bus = event_bus
         self._settings = settings or OrchestratorSettings()
+        self._security_gatekeeper = security_gatekeeper
         self._tier2_conversations: dict[str, str] = {}
 
     async def select_workspace(
@@ -132,7 +141,7 @@ class NovaOrchestrator:
         correlation_id: str | None = None,
     ) -> WorkspaceContext:
         """Resolve, activate, and announce a target project directory."""
-        corr_id = correlation_id or f"corr-{uuid.uuid4().hex[:12]}"
+        corr_id = correlation_id or f"corr-{uuid.uuid4()}"
         context = await self._workspace_resolver.resolve(
             ResolveWorkspaceRequest(
                 correlation_id=corr_id,
@@ -165,7 +174,7 @@ class NovaOrchestrator:
         correlation_id: str | None = None,
     ) -> None:
         """Route a user utterance by complexity and emit synchronized Chat + Voice events."""
-        corr_id = correlation_id or f"corr-{uuid.uuid4().hex[:12]}"
+        corr_id = correlation_id or f"corr-{uuid.uuid4()}"
         active_ws = self._workspace_resolver.active_context
         if active_ws is None:
             raise WorkspaceResolutionError(
@@ -215,15 +224,35 @@ class NovaOrchestrator:
         _log_structured("barge_in_triggered")
         await self._tier1_client.barge_in_abort()
 
+    async def resolve_command_approval(
+        self,
+        audit_id: str,
+        *,
+        approved: bool,
+        resolved_by: str = "user_voice_or_ui",
+    ) -> CommandApprovalResolvedEvent:
+        """Delegate human command approval/rejection to the configured SecurityGatekeeper."""
+        if self._security_gatekeeper is None:
+            raise GatekeeperError(
+                code="GATEKEEPER_NOT_CONFIGURED",
+                message="SecurityGatekeeper is not attached to NovaOrchestrator.",
+            )
+        return await self._security_gatekeeper.resolve_command_approval(
+            audit_id,
+            approved=approved,
+            resolved_by=resolved_by,
+        )
+
     async def _run_tier1(self, utterance: str, correlation_id: str) -> None:
         collected: list[str] = []
         async with _closing_async_iter(self._tier1_client.stream_prompt(utterance)) as stream:
             async for delta in stream:
-                collected.append(delta)
+                redacted_delta = redact_sensitive_text(delta)
+                collected.append(redacted_delta)
                 await self._event_bus.publish(
                     ChatStreamEvent(
                         correlation_id=correlation_id,
-                        delta=delta,
+                        delta=redacted_delta,
                         source="tier1_pi",
                         step_type="agent_response",
                     )
@@ -276,10 +305,11 @@ class NovaOrchestrator:
                     self._tier2_conversations[workspace_path] = progress.conversation_id
 
                 if progress.kind == "delta" and progress.text_delta:
+                    redacted_delta = redact_sensitive_text(progress.text_delta)
                     await self._event_bus.publish(
                         ChatStreamEvent(
                             correlation_id=correlation_id,
-                            delta=progress.text_delta,
+                            delta=redacted_delta,
                             source="tier2_runner",
                             step_type=progress.step_type,
                         )
@@ -313,10 +343,11 @@ class NovaOrchestrator:
                     )
                 elif progress.kind == "completed":
                     if progress.final_response:
+                        redacted_final = redact_sensitive_text(progress.final_response)
                         await self._event_bus.publish(
                             ChatStreamEvent(
                                 correlation_id=correlation_id,
-                                delta=progress.final_response,
+                                delta=redacted_final,
                                 source="tier2_runner",
                                 step_type="result",
                             )

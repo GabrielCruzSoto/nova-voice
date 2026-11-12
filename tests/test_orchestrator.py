@@ -315,3 +315,47 @@ async def test_f4_f6_f8_redacts_secrets_tracks_stage_changes_and_strips_lowercas
     assert "nvapi-" not in failures[0].sanitized_message
     assert "dummy_tok" not in failures[0].sanitized_message
     assert "<REDACTED:secret>" in failures[0].sanitized_message
+
+
+async def test_fu2_fu3_chat_stream_secret_redaction_and_full_uuid4_correlation_id(
+    tmp_path: Path,
+) -> None:
+    import uuid as uuid_mod
+
+    root = tmp_path / "Proyectos"
+    repo = root / "sec-app"
+    repo.mkdir(parents=True)
+
+    bus = OrchestratorEventBus()
+    events: list[OrchestratorEvent] = []
+
+    async def collect(ev: OrchestratorEvent) -> None:
+        events.append(ev)
+
+    bus.subscribe(collect)
+    resolver = LocalWorkspaceResolver(allowed_roots=[root], event_bus=bus)
+    tier1 = _FakeTier1Client(
+        chunks=["Usando token sk-synt9988776655 y Bearer my_secret_bearer_token en respuesta."]
+    )
+    tier2 = _FakeTier2Runner()
+
+    orchestrator = NovaOrchestrator(
+        workspace_resolver=resolver,
+        tier1_client=tier1,
+        tier2_runner=tier2,
+        event_bus=bus,
+    )
+    await orchestrator.select_workspace(str(repo), mode="exact_path")
+    events.clear()
+
+    await orchestrator.handle_user_utterance("Revisa estado rapido")
+    chat_events = [e for e in events if isinstance(e, ChatStreamEvent)]
+    assert len(chat_events) == 1
+    assert "sk-synt9988776655" not in chat_events[0].delta
+    assert "my_secret_bearer_token" not in chat_events[0].delta
+    assert "<REDACTED:secret>" in chat_events[0].delta
+
+    corr_id = chat_events[0].correlation_id
+    assert corr_id.startswith("corr-")
+    parsed_uuid = uuid_mod.UUID(corr_id.removeprefix("corr-"))
+    assert parsed_uuid.version == 4
