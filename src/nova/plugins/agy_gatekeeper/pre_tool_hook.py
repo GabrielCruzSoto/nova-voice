@@ -104,7 +104,15 @@ def main() -> int:
         _emit("deny", f"GATEKEEPER_IPC_UNREACHABLE: {exc} (fail-closed).")
         return 0
 
-    raw_resp = b"".join(chunks).split(b"\n", 1)[0].strip()
+    joined_bytes = b"".join(chunks)
+    if b"\n" not in joined_bytes:
+        _emit(
+            "deny",
+            "GATEKEEPER_INCOMPLETE_IPC_RESPONSE: Missing newline frame delimiter (fail-closed).",
+        )
+        return 0
+
+    raw_resp = joined_bytes.split(b"\n", 1)[0].strip()
     try:
         parsed_any: Any = json.loads(raw_resp.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError):

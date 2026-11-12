@@ -396,6 +396,9 @@ async def test_op5_pi_gatekeeper_ts_extension_executes_over_real_unix_socket(
     outside_dir = tmp_path / "outside-target"
     os.makedirs(outside_dir, exist_ok=True)
     os.symlink(outside_dir, ws / "linked_out")
+    os.symlink(outside_dir, ws / "@at_link")
+    os.symlink(outside_dir, ws / " space_link")
+    os.symlink(outside_dir / "secret.png", ws / "Capture 10.00\u202FAM.png")
     bus = OrchestratorEventBus()
     resolver = LocalWorkspaceResolver(allowed_roots=[tmp_path / "Proyectos"], event_bus=bus)
     await resolver.resolve(
@@ -451,6 +454,22 @@ const resReadFileUri = await handler(
   {{ toolName: "read", input: {{ path: "file:///etc/passwd" }} }},
   ctx,
 );
+const resReadDoubleAtLink = await handler(
+  {{ toolName: "read", input: {{ path: "@@at_link/passwd" }} }},
+  ctx,
+);
+const resReadLeadingSpaceLink = await handler(
+  {{ toolName: "read", input: {{ path: " space_link/passwd" }} }},
+  ctx,
+);
+const resReadAtSpaceLink = await handler(
+  {{ toolName: "read", input: {{ path: "@ space_link/passwd" }} }},
+  ctx,
+);
+const resReadAmPmVariant = await handler(
+  {{ toolName: "read", input: {{ path: "Capture 10.00 AM.png" }} }},
+  ctx,
+);
 const resPowershellDeny = await handler(
   {{ toolName: "powershell", input: {{ command: "rm -rf /" }} }},
   ctx,
@@ -470,6 +489,10 @@ console.log(JSON.stringify({{
   resWriteAtHome,
   resReadAtRel,
   resReadFileUri,
+  resReadDoubleAtLink,
+  resReadLeadingSpaceLink,
+  resReadAtSpaceLink,
+  resReadAmPmVariant,
   resPowershellDeny,
   resUnknownTool,
   resSafe: resSafe ?? null,
@@ -501,6 +524,10 @@ console.log(JSON.stringify({{
     assert out["resWriteAtHome"]["block"] is True
     assert out["resReadAtRel"]["block"] is True
     assert out["resReadFileUri"]["block"] is True
+    assert out["resReadDoubleAtLink"]["block"] is True
+    assert out["resReadLeadingSpaceLink"]["block"] is True
+    assert out["resReadAtSpaceLink"]["block"] is True
+    assert out["resReadAmPmVariant"]["block"] is True
     assert out["resPowershellDeny"]["block"] is True
     assert "CATASTROPHIC" in out["resPowershellDeny"]["reason"]
     assert out["resUnknownTool"]["block"] is True
@@ -624,3 +651,94 @@ print(json.dumps({"event": "init", "conversation_id": "c-x"}))
             )
         ]
     assert exc_info.value.code == "GATEKEEPER_PLUGIN_MISSING"
+
+    # F6 regression: truncated IPC response without '\n' or 'null' JSON in pre_tool_hook / pi ext
+    raw_sock_path = str(tmp_path / "trunc.sock")
+
+    async def _handle_truncated(
+        reader: asyncio.StreamReader,
+        writer: asyncio.StreamWriter,
+    ) -> None:
+        await reader.readline()
+        writer.write(b'{"allowed": true}')  # deliberately missing trailing '\n'!
+        await writer.drain()
+        writer.close()
+        await writer.wait_closed()
+
+    trunc_server = await asyncio.start_unix_server(_handle_truncated, path=raw_sock_path)
+    try:
+        trunc_env = {
+            **os.environ,
+            "NOVA_GATEKEEPER_SOCKET": raw_sock_path,
+            "NOVA_GATEKEEPER_TOKEN": "tok",
+        }
+        valid_stdin = json.dumps(
+            {
+                "workspacePaths": [str(tmp_path)],
+                "toolCall": {"name": "run_command", "args": {"CommandLine": "pwd"}},
+            }
+        )
+        proc_trunc = await asyncio.create_subprocess_exec(
+            sys.executable,
+            str(hook_script),
+            cwd=str(plugin_dir),
+            env=trunc_env,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+        )
+        out_trunc, _ = await proc_trunc.communicate(valid_stdin.encode("utf-8"))
+        assert proc_trunc.returncode == 0
+        assert json.loads(out_trunc.decode("utf-8"))["decision"] == "deny"
+    finally:
+        trunc_server.close()
+        await trunc_server.wait_closed()
+
+    null_sock_path = str(tmp_path / "null.sock")
+
+    async def _handle_null(
+        reader: asyncio.StreamReader,
+        writer: asyncio.StreamWriter,
+    ) -> None:
+        await reader.readline()
+        writer.write(b"null\n")
+        await writer.drain()
+        writer.close()
+        await writer.wait_closed()
+
+    null_server = await asyncio.start_unix_server(_handle_null, path=null_sock_path)
+    try:
+        node_bin = shutil.which("node")
+        assert node_bin is not None
+        null_mjs = tmp_path / "null_ext.mjs"
+        await asyncio.to_thread(
+            null_mjs.write_text,
+            f"""
+import extFactory from {json.dumps(PI_GATEKEEPER_EXTENSION_PATH.as_uri())};
+let handler = null;
+extFactory({{ on(ev, fn) {{ if (ev === "tool_call") handler = fn; }} }});
+const res = await handler(
+  {{ toolName: "bash", input: {{ command: "pwd" }} }},
+  {{ cwd: {json.dumps(str(tmp_path))} }},
+);
+console.log(JSON.stringify(res));
+""",
+            "utf-8",
+        )
+        proc_null = await asyncio.create_subprocess_exec(
+            node_bin,
+            str(null_mjs),
+            cwd=str(tmp_path),
+            env={
+                **os.environ,
+                "NOVA_GATEKEEPER_SOCKET": null_sock_path,
+                "NOVA_GATEKEEPER_TOKEN": "tok",
+            },
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        out_null, err_null = await proc_null.communicate()
+        assert proc_null.returncode == 0, err_null.decode("utf-8", errors="replace")
+        assert json.loads(out_null.decode("utf-8"))["block"] is True
+    finally:
+        null_server.close()
+        await null_server.wait_closed()

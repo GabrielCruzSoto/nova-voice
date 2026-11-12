@@ -1,4 +1,4 @@
-"""Layer 1 pure deterministic shell command policy (<5 ms, fail-closed precedence)."""
+"""Layer 1 pure deterministic shell command policy (<5 ms, fail-closed positive allowlist)."""
 
 from __future__ import annotations
 
@@ -86,36 +86,124 @@ _SENSITIVE_BINARIES: frozenset[str] = frozenset(
 _SIMPLE_ALLOWLIST_BINARIES: frozenset[str] = frozenset(
     {"pwd", "ls", "stat", "wc", "head", "tail", "cat", "pytest", "mypy", "ruff"}
 )
-_SAFE_GIT_SUBCOMMANDS: frozenset[str] = frozenset(
-    {"status", "diff", "log", "show", "rev-parse"}
-)
-_UNSAFE_GIT_GLOBAL_FLAGS: frozenset[str] = frozenset(
-    {"-c", "-C", "--config-env", "--exec-path", "--git-dir", "--work-tree", "--paginate"}
-)
-_UNSAFE_PYTEST_LONG_FLAGS: frozenset[str] = frozenset(
+
+_SAFE_GIT_SUBCOMMAND_FLAGS: dict[str, frozenset[str]] = {
+    "status": frozenset(
+        {
+            "-s",
+            "-b",
+            "-sb",
+            "-bs",
+            "--short",
+            "--branch",
+            "--porcelain",
+            "--porcelain=v1",
+            "--porcelain=v2",
+            "-u",
+            "-uno",
+            "-unormal",
+            "-uall",
+        }
+    ),
+    "diff": frozenset(
+        {
+            "--stat",
+            "--numstat",
+            "--shortstat",
+            "--name-only",
+            "--name-status",
+            "--staged",
+            "--cached",
+            "--no-color",
+            "--check",
+        }
+    ),
+    "log": frozenset(
+        {
+            "--oneline",
+            "--graph",
+            "--decorate",
+            "--stat",
+            "--name-only",
+            "--name-status",
+            "--no-color",
+            "--abbrev-commit",
+        }
+    ),
+    "show": frozenset(
+        {
+            "--stat",
+            "--name-only",
+            "--name-status",
+            "--oneline",
+            "--no-color",
+            "-s",
+            "--no-patch",
+        }
+    ),
+    "rev-parse": frozenset(
+        {
+            "--abbrev-ref",
+            "--short",
+            "--verify",
+            "--show-toplevel",
+            "--is-inside-work-tree",
+        }
+    ),
+}
+
+_ALLOWED_PYTEST_BOOL_FLAGS: frozenset[str] = frozenset(
     {
-        "--config-file",
-        "--override-ini",
-        "--rootdir",
-        "--confcutdir",
-        "--import-mode",
-        "--basetemp",
+        "--collect-only",
+        "--co",
+        "--lf",
+        "--ff",
+        "--nf",
+        "--no-header",
+        "--no-summary",
+        "--showlocals",
+        "--strict-markers",
+        "--strict-config",
     }
 )
-_UNSAFE_MYPY_LONG_FLAGS: frozenset[str] = frozenset(
-    {"--config-file", "--custom-typeshed-dir", "--cache-dir"}
+_ALLOWED_TB_MODES: frozenset[str] = frozenset(
+    {"auto", "long", "short", "line", "native", "no"}
 )
-_UNSAFE_RUFF_LONG_FLAGS: frozenset[str] = frozenset({"--config", "--cache-dir"})
-_SAFE_AIGILE_PREFIXES: tuple[tuple[str, ...], ...] = (
-    ("scan",),
-    ("harness", "check"),
-    ("harness", "status"),
-    ("doctor",),
-    ("session", "status"),
-    ("receipt", "verify"),
-    ("--version",),
-    ("help",),
+_ALLOWED_COLOR_MODES: frozenset[str] = frozenset({"yes", "no", "auto"})
+
+_ALLOWED_MYPY_FLAGS: frozenset[str] = frozenset(
+    {
+        "--strict",
+        "--pretty",
+        "--no-pretty",
+        "--show-error-codes",
+        "--hide-error-codes",
+        "--show-column-numbers",
+        "--no-error-summary",
+        "--ignore-missing-imports",
+        "--check-untyped-defs",
+        "--warn-unused-ignores",
+        "--warn-return-any",
+        "--no-incremental",
+        "--version",
+        "-V",
+    }
 )
+
+_ALLOWED_RUFF_CHECK_BOOL_FLAGS: frozenset[str] = frozenset(
+    {"-q", "--quiet", "-v", "--verbose", "--statistics", "--no-cache", "--preview"}
+)
+_ALLOWED_RUFF_OUTPUT_FORMATS: frozenset[str] = frozenset(
+    {"full", "concise", "json", "github", "gitlab", "junit", "pylint", "rdjson", "azure", "sarif"}
+)
+
+_LS_SHORT_FLAG_RE = re.compile(r"^-[1aAhltrFdsS]+$")
+_WC_SHORT_FLAG_RE = re.compile(r"^-[lwcLm]+$")
+_CAT_SHORT_FLAG_RE = re.compile(r"^-[AbeEnstTuv]+$")
+_HEAD_TAIL_NUM_FLAG_RE = re.compile(r"^-(?:[0-9]+|[nc]\+?[0-9]+)$")
+_PYTEST_SHORT_CLUSTER_RE = re.compile(r"^-[qvxsl]+$")
+_RUFF_RULE_SELECTOR_RE = re.compile(r"^[A-Z0-9,]+$")
+_DIGITS_RE = re.compile(r"^\+?[0-9]+$")
 
 
 def _has_shell_control_or_substitution(command: str) -> bool:
@@ -154,36 +242,55 @@ def _is_within_workspace(candidate: Path, workspace_root: Path) -> bool:
     return resolved == workspace_root or resolved.is_relative_to(workspace_root)
 
 
+def _append_path_and_node_prefix(candidates: list[str], raw_val: str) -> None:
+    if not raw_val:
+        return
+    candidates.append(raw_val)
+    if "::" in raw_val:
+        prefix = raw_val.split("::", 1)[0]
+        if prefix:
+            candidates.append(prefix)
+
+
 def _extract_candidate_paths(tokens: list[str]) -> list[str]:
     """Extract all non-flag arguments plus paths embedded in single or clustered flags."""
     candidates: list[str] = []
+    after_double_dash = False
+
     for token in tokens[1:]:
+        if after_double_dash:
+            _append_path_and_node_prefix(candidates, token)
+            continue
+
+        if token == "--":
+            after_double_dash = True
+            continue
+
         if token.startswith("-"):
             if "=" in token:
                 _, rhs = token.split("=", 1)
                 if rhs and not rhs.startswith("@"):
-                    candidates.append(rhs)
+                    _append_path_and_node_prefix(candidates, rhs)
                     if "=" in rhs:
-                        candidates.append(rhs.split("=", 1)[1])
+                        _append_path_and_node_prefix(candidates, rhs.split("=", 1)[1])
             elif len(token) > 2 and token[1] != "-":
                 body = token[1:]
                 for idx, ch in enumerate(body):
                     if ch in {"/", "~", "."}:
-                        candidates.append(body[idx:])
+                        _append_path_and_node_prefix(candidates, body[idx:])
                         break
-                max_split = min(len(token), 12)
-                for split_idx in range(2, max_split):
+                for split_idx in range(2, len(token)):
                     suffix = token[split_idx:]
                     if suffix:
-                        candidates.append(suffix)
+                        _append_path_and_node_prefix(candidates, suffix)
             continue
 
         if not token.startswith("@"):
-            candidates.append(token)
+            _append_path_and_node_prefix(candidates, token)
             if "=" in token:
                 _, rhs = token.split("=", 1)
                 if rhs and not rhs.startswith("@"):
-                    candidates.append(rhs)
+                    _append_path_and_node_prefix(candidates, rhs)
     return candidates
 
 
@@ -194,6 +301,8 @@ def _check_response_file_tokens(
 ) -> Layer1Decision | None:
     """Detect argparse @response-file arguments and escalate (prioritizing path escapes)."""
     for token in tokens[1:]:
+        if token == "--":
+            break
         at_payload: str | None = None
         if token.startswith("@"):
             at_payload = token.lstrip("@")
@@ -244,20 +353,35 @@ def _check_paths_confined(
     return None
 
 
-def _evaluate_git_tokens(args: list[str]) -> Layer1Decision:
+def _validate_git_subcommand_flags(subcmd: str, rest: list[str]) -> bool:
+    allowed_flags = _SAFE_GIT_SUBCOMMAND_FLAGS[subcmd]
     idx = 0
-    while idx < len(args) and args[idx].startswith("-"):
-        flag = args[idx].split("=", 1)[0]
-        if flag in _UNSAFE_GIT_GLOBAL_FLAGS or flag.startswith(("-c", "-C")):
-            return Layer1Decision(
-                verdict="escalate",
-                rule_id="GIT_MUTATING_OR_UNSAFE_FLAG",
-                risk_hint="high",
-                reason=f"Git global flag '{flag}' requires auditor review.",
-            )
+    while idx < len(rest):
+        tok = rest[idx]
+        if tok == "--":
+            return True
+        if tok.startswith("-"):
+            if tok in allowed_flags:
+                idx += 1
+                continue
+            if subcmd == "diff" and re.fullmatch(r"(?:-U\d+|--unified=\d+)", tok):
+                idx += 1
+                continue
+            if subcmd == "log":
+                if re.fullmatch(r"(?:-\d+|-n\d+|--max-count=\d+)", tok):
+                    idx += 1
+                    continue
+                if tok in {"-n", "--max-count"} and idx + 1 < len(rest):
+                    if _DIGITS_RE.fullmatch(rest[idx + 1]):
+                        idx += 2
+                        continue
+            return False
         idx += 1
+    return True
 
-    if idx >= len(args):
+
+def _evaluate_git_tokens(args: list[str]) -> Layer1Decision:
+    if not args:
         return Layer1Decision(
             verdict="escalate",
             rule_id="GIT_MUTATING_OR_UNSAFE",
@@ -265,22 +389,46 @@ def _evaluate_git_tokens(args: list[str]) -> Layer1Decision:
             reason="Bare git invocation without subcommand requires review.",
         )
 
-    subcmd = args[idx]
-    rest = args[idx + 1 :]
-    if subcmd in _SAFE_GIT_SUBCOMMANDS:
+    if args[0].startswith("-"):
+        return Layer1Decision(
+            verdict="escalate",
+            rule_id="GIT_MUTATING_OR_UNSAFE_FLAG",
+            risk_hint="high",
+            reason=f"Git global option '{args[0]}' is not permitted in Layer 1 fast-path.",
+        )
+
+    subcmd = args[0]
+    rest = args[1:]
+    if subcmd == "branch":
+        if rest == ["--show-current"]:
+            return Layer1Decision(
+                verdict="allow",
+                rule_id="ALLOWLIST_GIT_BRANCH_CURRENT",
+                risk_hint="low",
+                reason="Read-only git branch inspection inside active workspace.",
+            )
+        return Layer1Decision(
+            verdict="escalate",
+            rule_id="GIT_MUTATING_OR_UNSAFE",
+            risk_hint="medium",
+            reason="Only 'git branch --show-current' is auto-allowed in Layer 1.",
+        )
+
+    if subcmd in _SAFE_GIT_SUBCOMMAND_FLAGS:
+        if not _validate_git_subcommand_flags(subcmd, rest):
+            return Layer1Decision(
+                verdict="escalate",
+                rule_id="GIT_MUTATING_OR_UNSAFE_FLAG",
+                risk_hint="high",
+                reason=f"Unapproved git '{subcmd}' option requires auditor review.",
+            )
         return Layer1Decision(
             verdict="allow",
             rule_id="ALLOWLIST_GIT_READONLY",
             risk_hint="low",
             reason=f"Read-only git '{subcmd}' inside active workspace.",
         )
-    if subcmd == "branch" and rest == ["--show-current"]:
-        return Layer1Decision(
-            verdict="allow",
-            rule_id="ALLOWLIST_GIT_BRANCH_CURRENT",
-            risk_hint="low",
-            reason="Read-only git branch inspection inside active workspace.",
-        )
+
     return Layer1Decision(
         verdict="escalate",
         rule_id="GIT_MUTATING_OR_UNSAFE",
@@ -290,21 +438,232 @@ def _evaluate_git_tokens(args: list[str]) -> Layer1Decision:
 
 
 def _evaluate_aigile_tokens(args: list[str]) -> Layer1Decision:
-    for prefix in _SAFE_AIGILE_PREFIXES:
-        if tuple(args[: len(prefix)]) == prefix:
-            if prefix == ("scan",) and "--install-hook" in args:
-                break
+    exact_safe: set[tuple[str, ...]] = {
+        ("--version",),
+        ("help",),
+        ("doctor",),
+        ("harness", "check"),
+        ("harness", "status"),
+        ("session", "status"),
+        ("scan",),
+    }
+    t_args = tuple(args)
+    if t_args in exact_safe:
+        return Layer1Decision(
+            verdict="allow",
+            rule_id="ALLOWLIST_AIGILE_READONLY",
+            risk_hint="low",
+            reason="Safe local aigile verification command.",
+        )
+
+    if len(args) == 3 and args[:2] == ["scan", "--path"] and not args[2].startswith("-"):
+        return Layer1Decision(
+            verdict="allow",
+            rule_id="ALLOWLIST_AIGILE_READONLY",
+            risk_hint="low",
+            reason="Safe local aigile path scan.",
+        )
+
+    if len(args) in {3, 4} and args[:2] == ["receipt", "verify"]:
+        rem = args[2:]
+        non_flags = [x for x in rem if not x.startswith("-")]
+        flags = [x for x in rem if x.startswith("-")]
+        if len(non_flags) == 1 and set(flags).issubset({"--verify-head"}):
             return Layer1Decision(
                 verdict="allow",
                 rule_id="ALLOWLIST_AIGILE_READONLY",
                 risk_hint="low",
-                reason="Safe local aigile verification command.",
+                reason="Safe local aigile receipt verification.",
             )
+
     return Layer1Decision(
         verdict="escalate",
         rule_id="AIGILE_MUTATING_SUBCOMMAND",
         risk_hint="medium",
-        reason="Mutating or unrecognized './aigile' subcommand requires approval.",
+        reason="Mutating or unrecognized './aigile' invocation requires approval.",
+    )
+
+
+def _validate_pytest_args(args: list[str]) -> bool:
+    idx = 0
+    while idx < len(args):
+        tok = args[idx]
+        if tok == "--":
+            return True
+        if tok.startswith("-"):
+            if _PYTEST_SHORT_CLUSTER_RE.fullmatch(tok) or tok in _ALLOWED_PYTEST_BOOL_FLAGS:
+                idx += 1
+                continue
+            if tok in {"-k", "-m"} and idx + 1 < len(args):
+                idx += 2
+                continue
+            if tok in {"--maxfail", "--durations"} and idx + 1 < len(args):
+                if _DIGITS_RE.fullmatch(args[idx + 1]):
+                    idx += 2
+                    continue
+                return False
+            if re.fullmatch(r"--(?:maxfail|durations)=\d+", tok):
+                idx += 1
+                continue
+            if tok == "--tb" and idx + 1 < len(args) and args[idx + 1] in _ALLOWED_TB_MODES:
+                idx += 2
+                continue
+            if tok.startswith("--tb=") and tok.split("=", 1)[1] in _ALLOWED_TB_MODES:
+                idx += 1
+                continue
+            if (
+                tok == "--color"
+                and idx + 1 < len(args)
+                and args[idx + 1] in _ALLOWED_COLOR_MODES
+            ):
+                idx += 2
+                continue
+            if tok.startswith("--color=") and tok.split("=", 1)[1] in _ALLOWED_COLOR_MODES:
+                idx += 1
+                continue
+            return False
+        idx += 1
+    return True
+
+
+def _validate_mypy_args(args: list[str]) -> bool:
+    if args in (["--version"], ["-V"]):
+        return True
+    has_target = False
+    after_dd = False
+    for tok in args:
+        if after_dd:
+            has_target = True
+            continue
+        if tok == "--":
+            after_dd = True
+            continue
+        if tok.startswith("-"):
+            if tok not in _ALLOWED_MYPY_FLAGS:
+                return False
+        else:
+            has_target = True
+    return has_target
+
+
+def _validate_ruff_args(args: list[str]) -> bool:
+    if args in (["--version"], ["-V"], ["version"]):
+        return True
+    if not args or args[0] != "check":
+        return False
+    idx = 1
+    while idx < len(args):
+        tok = args[idx]
+        if tok == "--":
+            return True
+        if tok.startswith("-"):
+            if tok in _ALLOWED_RUFF_CHECK_BOOL_FLAGS:
+                idx += 1
+                continue
+            if tok == "--output-format" and idx + 1 < len(args):
+                if args[idx + 1] in _ALLOWED_RUFF_OUTPUT_FORMATS:
+                    idx += 2
+                    continue
+                return False
+            if (
+                tok.startswith("--output-format=")
+                and tok.split("=", 1)[1] in _ALLOWED_RUFF_OUTPUT_FORMATS
+            ):
+                idx += 1
+                continue
+            if tok in {"--select", "--ignore"} and idx + 1 < len(args):
+                if _RUFF_RULE_SELECTOR_RE.fullmatch(args[idx + 1]):
+                    idx += 2
+                    continue
+                return False
+            if tok.startswith(("--select=", "--ignore=")):
+                if _RUFF_RULE_SELECTOR_RE.fullmatch(tok.split("=", 1)[1]):
+                    idx += 1
+                    continue
+                return False
+            return False
+        idx += 1
+    return True
+
+
+def _validate_coreutil_args(exe_name: str, args: list[str]) -> bool:
+    if exe_name == "pwd":
+        return args in ([], ["-L"], ["-P"])
+
+    positional = 0
+    idx = 0
+    after_dd = False
+    while idx < len(args):
+        tok = args[idx]
+        if after_dd:
+            positional += 1
+            idx += 1
+            continue
+        if tok == "--":
+            after_dd = True
+            idx += 1
+            continue
+        if tok.startswith("-"):
+            if exe_name == "ls":
+                if _LS_SHORT_FLAG_RE.fullmatch(tok) or tok in {
+                    "--color=never",
+                    "--color=auto",
+                    "--color=always",
+                }:
+                    idx += 1
+                    continue
+                return False
+            if exe_name == "stat":
+                if tok in {"-t", "--terse"}:
+                    idx += 1
+                    continue
+                return False
+            if exe_name == "wc":
+                if _WC_SHORT_FLAG_RE.fullmatch(tok):
+                    idx += 1
+                    continue
+                return False
+            if exe_name == "cat":
+                if _CAT_SHORT_FLAG_RE.fullmatch(tok):
+                    idx += 1
+                    continue
+                return False
+            if exe_name in {"head", "tail"}:
+                if tok in {"-q", "-v"} or _HEAD_TAIL_NUM_FLAG_RE.fullmatch(tok):
+                    idx += 1
+                    continue
+                if tok in {"-n", "-c"} and idx + 1 < len(args):
+                    if _DIGITS_RE.fullmatch(args[idx + 1]):
+                        idx += 2
+                        continue
+                return False
+            return False
+        positional += 1
+        idx += 1
+
+    if exe_name == "ls":
+        return True
+    return positional >= 1
+
+
+def _check_positive_allowlist_syntax(exe_name: str, args: list[str]) -> Layer1Decision | None:
+    """Enforce closed-world flag and subcommand allowlist for every Layer 1 tool."""
+    if exe_name == "pytest":
+        ok = _validate_pytest_args(args)
+    elif exe_name == "mypy":
+        ok = _validate_mypy_args(args)
+    elif exe_name == "ruff":
+        ok = _validate_ruff_args(args)
+    else:
+        ok = _validate_coreutil_args(exe_name, args)
+
+    if ok:
+        return None
+    return Layer1Decision(
+        verdict="escalate",
+        rule_id="UNSAFE_TOOL_CONFIG_FLAG",
+        risk_hint="high",
+        reason=f"Arguments or options for '{exe_name}' are outside Layer 1 positive allowlist.",
     )
 
 
@@ -342,6 +701,14 @@ class DeterministicCommandPolicy:
                 rule_id="CONTROL_CHARACTER_DETECTED",
                 risk_hint="high",
                 reason="Multiline or null-byte command requires auditor inspection.",
+            )
+
+        if not os.path.isabs(cwd) or not os.path.isabs(workspace_canonical_path):
+            return Layer1Decision(
+                verdict="escalate",
+                rule_id="OUTSIDE_WORKSPACE_CWD",
+                risk_hint="high",
+                reason="Command working directory and workspace root must be absolute paths.",
             )
 
         workspace_root = Path(os.path.realpath(workspace_canonical_path))
@@ -433,9 +800,9 @@ class DeterministicCommandPolicy:
             return _evaluate_git_tokens(args)
 
         if exe_name in _SIMPLE_ALLOWLIST_BINARIES:
-            unsafe_flag = _check_unsafe_allowlist_flags(exe_name, args)
-            if unsafe_flag is not None:
-                return unsafe_flag
+            unsafe_syntax = _check_positive_allowlist_syntax(exe_name, args)
+            if unsafe_syntax is not None:
+                return unsafe_syntax
             return Layer1Decision(
                 verdict="allow",
                 rule_id=f"ALLOWLIST_{exe_name.upper()}",
@@ -449,41 +816,3 @@ class DeterministicCommandPolicy:
             risk_hint="medium",
             reason=f"Executable '{exe_name}' is not in Layer 1 allowlist.",
         )
-
-
-def _check_unsafe_allowlist_flags(exe_name: str, args: list[str]) -> Layer1Decision | None:
-    """Escalate config/plugin override flags on allowlisted developer CLIs."""
-    for token in args:
-        if not token.startswith("-"):
-            continue
-        flag_head = token.split("=", 1)[0]
-        if exe_name == "pytest":
-            if flag_head in _UNSAFE_PYTEST_LONG_FLAGS:
-                return Layer1Decision(
-                    verdict="escalate",
-                    rule_id="UNSAFE_TOOL_CONFIG_FLAG",
-                    risk_hint="high",
-                    reason=f"Pytest flag '{flag_head}' overrides config or plugin loading.",
-                )
-            if not token.startswith("--") and any(ch in token[1:] for ch in ("c", "o", "p")):
-                return Layer1Decision(
-                    verdict="escalate",
-                    rule_id="UNSAFE_TOOL_CONFIG_FLAG",
-                    risk_hint="high",
-                    reason=f"Pytest short option '{token}' overrides config or plugins.",
-                )
-        elif exe_name == "mypy" and flag_head in _UNSAFE_MYPY_LONG_FLAGS:
-            return Layer1Decision(
-                verdict="escalate",
-                rule_id="UNSAFE_TOOL_CONFIG_FLAG",
-                risk_hint="high",
-                reason=f"Mypy flag '{flag_head}' overrides configuration boundary.",
-            )
-        elif exe_name == "ruff" and flag_head in _UNSAFE_RUFF_LONG_FLAGS:
-            return Layer1Decision(
-                verdict="escalate",
-                rule_id="UNSAFE_TOOL_CONFIG_FLAG",
-                risk_hint="high",
-                reason=f"Ruff flag '{flag_head}' overrides configuration boundary.",
-            )
-    return None

@@ -110,10 +110,22 @@ def test_ac2_catastrophic_commands_return_hard_deny(
         ('ls "unclosed', "SHLEX_PARSE_ERROR"),
         ("git push origin master", "GIT_MUTATING_OR_UNSAFE"),
         ("git -c core.pager=less status", "GIT_MUTATING_OR_UNSAFE"),
+        ("git --namespace status push origin master", "GIT_MUTATING_OR_UNSAFE"),
+        ("git --namespace status reset --hard HEAD~1", "GIT_MUTATING_OR_UNSAFE"),
+        ("git --namespace status -c alias.pwn=!id pwn", "GIT_MUTATING_OR_UNSAFE"),
+        ("git -p status", "GIT_MUTATING_OR_UNSAFE"),
+        ("git diff --ext-diff", "GIT_MUTATING_OR_UNSAFE"),
         ("git branch -D feat/old", "GIT_MUTATING_OR_UNSAFE"),
         ("pip install requests", "SENSITIVE_BINARY"),
         ("chmod 755 aigile", "SENSITIVE_BINARY"),
         ("./aigile harness clean", "AIGILE_MUTATING_SUBCOMMAND"),
+        ("pytest --override python_files=setup.py", "UNSAFE_TOOL_CONFIG_FLAG"),
+        ("pytest --rootd=.", "UNSAFE_TOOL_CONFIG_FLAG"),
+        ("mypy --config pyproject.toml src", "UNSAFE_TOOL_CONFIG_FLAG"),
+        ("mypy --executable /bin/sh src", "OUTSIDE_WORKSPACE_PATH"),
+        ("ruff format src", "UNSAFE_TOOL_CONFIG_FLAG"),
+        ("ruff clean", "UNSAFE_TOOL_CONFIG_FLAG"),
+        ("ruff check --fix src", "UNSAFE_TOOL_CONFIG_FLAG"),
         ("cat ../../etc/passwd", "OUTSIDE_WORKSPACE_PATH"),
         ("pytest -c/tmp/outside_pyproject.toml", "OUTSIDE_WORKSPACE_PATH"),
         ("pytest -qc/tmp/outside_pyproject.toml", "OUTSIDE_WORKSPACE_PATH"),
@@ -160,6 +172,8 @@ def test_symlink_escape_inside_workspace_escalates(
         "cat escape_in_cwd.txt",
         "pytest -cescape_in_cwd.txt",
         "pytest -qcescape_in_cwd.txt",
+        "pytest -qqqqqqqqqqqqcescape_in_cwd.txt",
+        "pytest escape_in_cwd.txt::test_anything",
     ):
         decision = policy.evaluate(
             command=cmd,
@@ -168,6 +182,21 @@ def test_symlink_escape_inside_workspace_escalates(
         )
         assert decision.verdict == "escalate"
         assert decision.rule_id == "OUTSIDE_WORKSPACE_PATH"
+
+
+def test_relative_cwd_escalates_fail_closed(
+    workspace_dir: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(workspace_dir)
+    policy = DeterministicCommandPolicy()
+    decision = policy.evaluate(
+        command="pwd",
+        cwd=".",
+        workspace_canonical_path=str(workspace_dir),
+    )
+    assert decision.verdict == "escalate"
+    assert decision.rule_id == "OUTSIDE_WORKSPACE_CWD"
 
 
 def test_cwd_outside_workspace_escalates(workspace_dir: Path, tmp_path: Path) -> None:

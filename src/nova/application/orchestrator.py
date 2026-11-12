@@ -367,6 +367,7 @@ class NovaOrchestrator:
                             summary_text=sanitize_for_voice(
                                 f"Entrando en etapa {progress.step_type}.",
                                 fallback="Avanzando en el proyecto.",
+                                extra_secrets=self._extra_secrets(),
                             ),
                             priority="normal",
                         )

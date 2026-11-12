@@ -2,8 +2,10 @@
  * Nova SecurityGatekeeper Extension for Pi Agent (Tier 1).
  *
  * 1. Confines approved workspace file tools (`read`, `write`, `edit`, `ls`, `find`, `grep`)
- *    strictly within `realpath(ctx.cwd)` after applying Pi's exact path normalizations
- *    (Unicode spaces, leading `@` prefixes, `~` expansion, `file://` URIs, and NFD/quote variants).
+ *    strictly within `realpath(ctx.cwd)` by validating BOTH Pi's exact `resolveToCwd` /
+ *    `resolveReadPathAsync` resolution (preserving ASCII spaces, single `@` strip, `~`,
+ *    `file://`, `\u202F` AM/PM, NFD, and `\u2019` variants) AND defensive trimmed/multi-`@`
+ *    forms.
  * 2. Intercepts pre-execution shell tools (`bash`, `powershell`, etc.) and authorizes them over
  *    Nova's authenticated AF_UNIX JSONL gatekeeper socket (`NOVA_GATEKEEPER_SOCKET`).
  * 3. Blocks unknown or untrusted non-file tools fail-closed when gatekeeper mode is active.
@@ -27,6 +29,7 @@ interface GatekeeperIPCResponse {
 const IPC_TIMEOUT_MS = 280_000;
 const MAX_IPC_FRAME_BYTES = 65_536;
 const UNICODE_SPACES_RE = /[\u00A0\u2000-\u200A\u202F\u205F\u3000]/g;
+const NARROW_NO_BREAK_SPACE = "\u202F";
 
 const SHELL_TOOLS = new Set(["bash", "powershell", "sh", "zsh", "cmd"]);
 const SAFE_FILE_TOOLS = new Set(["read", "write", "edit", "ls", "find", "grep"]);
@@ -47,13 +50,32 @@ function expandHome(rawPath: string): string {
   if (rawPath === "~") {
     return os.homedir();
   }
-  if (rawPath.startsWith("~/") || rawPath.startsWith("~\\")) {
+  if (rawPath.startsWith("~/") || (process.platform === "win32" && rawPath.startsWith("~\\"))) {
     return path.join(os.homedir(), rawPath.slice(2));
   }
   return rawPath;
 }
 
-function normalizePiPath(rawPath: string): string | null {
+function normalizeExactPiPath(rawPath: string): string | null {
+  let normalized = rawPath.replace(UNICODE_SPACES_RE, " ");
+  if (normalized.startsWith("@")) {
+    normalized = normalized.slice(1);
+  }
+  normalized = expandHome(normalized);
+  if (/^file:\/\//.test(normalized)) {
+    try {
+      return fileURLToPath(normalized);
+    } catch {
+      return null;
+    }
+  }
+  if (/^file:/i.test(normalized)) {
+    return null;
+  }
+  return normalized;
+}
+
+function normalizeDefensivePath(rawPath: string): string | null {
   let normalized = rawPath.replace(UNICODE_SPACES_RE, " ").trim();
   while (normalized.startsWith("@")) {
     normalized = normalized.slice(1).replace(UNICODE_SPACES_RE, " ").trim();
@@ -65,7 +87,20 @@ function normalizePiPath(rawPath: string): string | null {
       return null;
     }
   }
-  return expandHome(normalized);
+  if (normalized.startsWith("~/") || normalized.startsWith("~\\") || normalized === "~") {
+    return normalized === "~"
+      ? os.homedir()
+      : path.join(os.homedir(), normalized.slice(2));
+  }
+  return normalized;
+}
+
+function expandReadVariants(resolved: string): string[] {
+  const amPm = resolved.replace(/ (AM|PM)\./gi, `${NARROW_NO_BREAK_SPACE}$1.`);
+  const nfd = resolved.normalize("NFD");
+  const curly = resolved.replace(/'/g, "\u2019");
+  const nfdCurly = nfd.replace(/'/g, "\u2019");
+  return Array.from(new Set([resolved, amPm, nfd, curly, nfdCurly]));
 }
 
 function resolveAbsoluteRealpath(absolute: string): string | null {
@@ -112,24 +147,25 @@ function isInsideWorkspace(candidateReal: string, workspaceReal: string): boolea
 }
 
 function isPathConfinedToWorkspace(rawPath: string, workspaceReal: string): boolean {
-  const normalized = normalizePiPath(rawPath);
-  if (normalized === null) {
+  const exactNorm = normalizeExactPiPath(rawPath);
+  const defensiveNorm = normalizeDefensivePath(rawPath);
+  if (exactNorm === null || defensiveNorm === null) {
     return false;
   }
-  if (!normalized) {
-    return true;
+
+  const candidateForms = new Set<string>();
+  for (const norm of [exactNorm, defensiveNorm]) {
+    if (!norm) {
+      continue;
+    }
+    const abs = path.isAbsolute(norm) ? path.resolve(norm) : path.resolve(workspaceReal, norm);
+    for (const variant of expandReadVariants(abs)) {
+      candidateForms.add(variant);
+    }
   }
 
-  const baseAbsolute = path.resolve(workspaceReal, normalized);
-  const variants = new Set<string>([
-    baseAbsolute,
-    baseAbsolute.normalize("NFD"),
-    baseAbsolute.replace(/'/g, "\u2019"),
-    baseAbsolute.normalize("NFD").replace(/'/g, "\u2019"),
-  ]);
-
-  for (const variant of variants) {
-    const resolved = resolveAbsoluteRealpath(variant);
+  for (const candidateAbs of candidateForms) {
+    const resolved = resolveAbsoluteRealpath(candidateAbs);
     if (!resolved || !isInsideWorkspace(resolved, workspaceReal)) {
       return false;
     }
@@ -211,6 +247,10 @@ function checkFileToolConfinement(
   return undefined;
 }
 
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
 function queryGatekeeperSocket(
   socketPath: string,
   authSecret: string,
@@ -263,7 +303,23 @@ function queryGatekeeperSocket(
       if (newlineIdx !== -1) {
         const line = buffer.slice(0, newlineIdx).trim();
         try {
-          finish(JSON.parse(line) as GatekeeperIPCResponse);
+          const parsed: unknown = JSON.parse(line);
+          if (!isPlainObject(parsed)) {
+            finish({
+              allowed: false,
+              reason: "GATEKEEPER_INVALID_RESPONSE: Expected JSON object from Nova gatekeeper.",
+            });
+            return;
+          }
+          finish({
+            allowed: typeof parsed.allowed === "boolean" ? parsed.allowed : false,
+            verdict: typeof parsed.verdict === "string" ? parsed.verdict : undefined,
+            audit_id:
+              typeof parsed.audit_id === "string" || parsed.audit_id === null
+                ? parsed.audit_id
+                : undefined,
+            reason: typeof parsed.reason === "string" ? parsed.reason : undefined,
+          });
         } catch {
           finish({
             allowed: false,
@@ -296,7 +352,13 @@ export default function (pi: ExtensionAPI) {
       return undefined;
     }
 
-    const inputObj = event.input as Record<string, unknown> | undefined;
+    if (event.input !== undefined && !isPlainObject(event.input)) {
+      return {
+        block: true,
+        reason: "GATEKEEPER_INVALID_TOOL_INPUT: Tool input must be a JSON object.",
+      };
+    }
+    const inputObj = event.input;
     const hasShellCommandField =
       inputObj !== undefined &&
       (inputObj.command !== undefined || inputObj.CommandLine !== undefined);

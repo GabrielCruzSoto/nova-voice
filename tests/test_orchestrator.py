@@ -393,7 +393,7 @@ async def test_f7_orchestrator_redacts_gatekeeper_ephemeral_secrets_in_chat_stre
         auditor=_NoopAuditor(),
         event_bus=bus,
     )
-    bare_ephemeral = "bare_ipc_token_value_88776655"
+    bare_ephemeral = "ephemeralSecret99887766"
     gatekeeper.register_ephemeral_secret(bare_ephemeral)
 
     tier1 = _FakeTier1Client(chunks=[f"Salida accidental filtrando {bare_ephemeral} en texto."])
@@ -434,3 +434,29 @@ async def test_f7_orchestrator_redacts_gatekeeper_ephemeral_secrets_in_chat_stre
     assert len(failures) == 1
     assert bare_ephemeral not in failures[0].sanitized_message
     assert "<REDACTED:secret>" in failures[0].sanitized_message
+
+    class _MilestoneSecretRunner:
+        async def execute(self, request: CodingTaskRequest) -> AsyncIterator[RunnerProgressEvent]:
+            yield RunnerProgressEvent(
+                kind="milestone",
+                conversation_id="c-ms-sec",
+                step_type=f"stage_{bare_ephemeral}",
+            )
+            yield RunnerProgressEvent(
+                kind="completed",
+                conversation_id="c-ms-sec",
+                step_type="result",
+                final_response="ok",
+            )
+
+    events.clear()
+    ms_orchestrator = NovaOrchestrator(
+        workspace_resolver=resolver,
+        tier1_client=tier1,
+        tier2_runner=_MilestoneSecretRunner(),
+        event_bus=bus,
+        security_gatekeeper=gatekeeper,
+    )
+    await ms_orchestrator.handle_user_utterance("[delegate_tier2] Probar hito con secreto")
+    voice_evs = [e for e in events if isinstance(e, VoiceMilestoneEvent)]
+    assert all(bare_ephemeral not in v.summary_text for v in voice_evs)
