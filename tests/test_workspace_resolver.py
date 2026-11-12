@@ -15,7 +15,7 @@ from nova.domain.events import (
     VoiceMilestoneEvent,
     WorkspaceChangedEvent,
 )
-from nova.domain.models import ResolveWorkspaceRequest, WorkspaceQueryMode
+from nova.domain.models import ResolveWorkspaceRequest
 
 
 async def test_ac1_resolve_exact_path_within_allowed_roots_and_emit_event(tmp_path: Path) -> None:
@@ -84,13 +84,14 @@ async def test_ac1_resolve_voice_fuzzy_query_normalizes_accents_and_separators(
     ("query", "mode", "expected_code"),
     [
         ("   ", "voice_fuzzy", "WORKSPACE_INVALID_QUERY"),
+        ("mi-api", "invalid_mode", "WORKSPACE_INVALID_QUERY"),
         ("inexistente-xyz", "voice_fuzzy", "WORKSPACE_NOT_FOUND"),
     ],
 )
 async def test_ac5_rejects_empty_or_unknown_queries(
     tmp_path: Path,
     query: str,
-    mode: WorkspaceQueryMode,
+    mode: str,
     expected_code: str,
 ) -> None:
     root = tmp_path / "Proyectos"

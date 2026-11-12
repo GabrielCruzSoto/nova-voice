@@ -79,6 +79,11 @@ class LocalWorkspaceResolver:
 
     async def resolve(self, request: ResolveWorkspaceRequest) -> WorkspaceContext:
         """Resolve and activate a project directory under OP-1 rules without blocking the loop."""
+        if request.mode not in ("exact_path", "voice_fuzzy"):
+            raise WorkspaceResolutionError(
+                code="WORKSPACE_INVALID_QUERY",
+                message=f"Unsupported workspace resolution mode: '{request.mode}'.",
+            )
         raw_query = request.query.strip()
         if not raw_query:
             raise WorkspaceResolutionError(

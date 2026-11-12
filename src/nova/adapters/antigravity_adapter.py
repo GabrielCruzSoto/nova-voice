@@ -22,6 +22,7 @@ ALLOWED_TIER2_MODELS: frozenset[str] = frozenset(
     }
 )
 MAX_STDERR_BYTES = 16 * 1024
+DEFAULT_MAX_LINE_BYTES = 8 * 1024 * 1024
 
 
 class AntigravityRunnerConfig(BaseModel):
@@ -33,6 +34,7 @@ class AntigravityRunnerConfig(BaseModel):
     extra_leading_args: tuple[str, ...] = ()
     allowed_models: frozenset[str] = ALLOWED_TIER2_MODELS
     timeout_seconds: float = Field(default=300.0, gt=0.0)
+    max_line_bytes: int = Field(default=DEFAULT_MAX_LINE_BYTES, gt=0)
 
 
 class _AgyStepUpdate(BaseModel):
@@ -97,6 +99,7 @@ class AntigravityCLIAdapter:
                 stdin=asyncio.subprocess.DEVNULL,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
+                limit=self._config.max_line_bytes,
             )
         except OSError as exc:
             raise CodingRunnerError(
@@ -126,6 +129,11 @@ class AntigravityCLIAdapter:
                     raise CodingRunnerError(
                         code="RUNNER_SUBPROCESS_TIMEOUT_OR_CRASH",
                         message="Timed out waiting for agy stream-json output.",
+                    ) from exc
+                except (ValueError, asyncio.LimitOverrunError) as exc:
+                    raise CodingRunnerError(
+                        code="RUNNER_EXECUTION_FAILED",
+                        message="agy stream-json record exceeded configured max_line_bytes.",
                     ) from exc
 
                 if not raw_line:
@@ -159,6 +167,12 @@ class AntigravityCLIAdapter:
                                 conversation_id=conv_id or "unknown",
                                 step_type=step.step_type,
                                 text_delta=step.text_delta,
+                            )
+                        elif step.step_type and step.step_type != "user_input":
+                            yield RunnerProgressEvent(
+                                kind="milestone",
+                                conversation_id=conv_id or "unknown",
+                                step_type=step.step_type,
                             )
                 elif event_name == "result":
                     res_raw = record.get("result")
@@ -240,14 +254,18 @@ class AntigravityCLIAdapter:
 
     @staticmethod
     async def _terminate_process(proc: asyncio.subprocess.Process) -> None:
-        if proc.returncode is not None:
-            return
-        with contextlib.suppress(ProcessLookupError):
-            proc.terminate()
-        try:
-            await asyncio.wait_for(proc.wait(), timeout=2.0)
-        except TimeoutError:
+        if proc.returncode is None:
             with contextlib.suppress(ProcessLookupError):
-                proc.kill()
+                proc.terminate()
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=2.0)
+            except TimeoutError:
+                with contextlib.suppress(ProcessLookupError):
+                    proc.kill()
+                with contextlib.suppress(Exception):
+                    await asyncio.wait_for(proc.wait(), timeout=1.0)
+        transport = getattr(proc, "_transport", None)
+        if transport is not None:
             with contextlib.suppress(Exception):
-                await asyncio.wait_for(proc.wait(), timeout=1.0)
+                transport.close()
+        await asyncio.sleep(0)

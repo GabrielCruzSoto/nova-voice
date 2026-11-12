@@ -229,3 +229,89 @@ async def test_nfr1_event_dispatch_p95_overhead_is_well_under_50ms(tmp_path: Pat
     sorted_lat = sorted(latencies_ms)
     p95 = sorted_lat[int(len(sorted_lat) * 0.95) - 1]
     assert p95 < 50.0
+
+
+async def test_f4_f6_f8_redacts_secrets_tracks_stage_changes_and_strips_lowercase_marker(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "Proyectos"
+    repo = root / "seguro-app"
+    repo.mkdir(parents=True)
+
+    class _MultiStageRunner:
+        def __init__(self) -> None:
+            self.seen_prompts: list[str] = []
+
+        async def execute(
+            self,
+            request: CodingTaskRequest,
+        ) -> AsyncIterator[RunnerProgressEvent]:
+            self.seen_prompts.append(request.prompt)
+            if "fallar" in request.prompt:
+                raise CodingRunnerError(
+                    code="RUNNER_EXECUTION_FAILED",
+                    message="Auth failed for dummy key nvapi-sample123456 and Bearer dummy_tok",
+                )
+            yield RunnerProgressEvent(
+                kind="init",
+                conversation_id="conv-ms",
+                step_type="init",
+            )
+            yield RunnerProgressEvent(
+                kind="delta",
+                conversation_id="conv-ms",
+                step_type="analysis",
+                text_delta="Analizando contratos existentes.",
+            )
+            yield RunnerProgressEvent(
+                kind="delta",
+                conversation_id="conv-ms",
+                step_type="tool_call",
+                text_delta="Ejecutando suite de pruebas unitarias.",
+            )
+            yield RunnerProgressEvent(
+                kind="completed",
+                conversation_id="conv-ms",
+                step_type="result",
+                final_response="Cambios validados.",
+            )
+
+    bus = OrchestratorEventBus()
+    events: list[OrchestratorEvent] = []
+
+    async def collect(ev: OrchestratorEvent) -> None:
+        events.append(ev)
+
+    bus.subscribe(collect)
+    resolver = LocalWorkspaceResolver(allowed_roots=[root], event_bus=bus)
+    tier1 = _FakeTier1Client()
+    runner = _MultiStageRunner()
+
+    orchestrator = NovaOrchestrator(
+        workspace_resolver=resolver,
+        tier1_client=tier1,
+        tier2_runner=runner,
+        event_bus=bus,
+    )
+    await orchestrator.select_workspace(str(repo), mode="exact_path", correlation_id="c-s0")
+    events.clear()
+
+    await orchestrator.handle_user_utterance(
+        "[delegate_tier2] Audita modulos y pruebas",
+        correlation_id="c-s1",
+    )
+    assert runner.seen_prompts[0] == "Audita modulos y pruebas"
+    voice_milestones = [e for e in events if isinstance(e, VoiceMilestoneEvent)]
+    # Start + stage 'analysis' + stage 'tool_call' + completion = 4 spoken milestones
+    assert len(voice_milestones) == 4
+
+    events.clear()
+    await orchestrator.handle_user_utterance(
+        "[delegate_tier2] Hacer fallar con token",
+        correlation_id="c-s2",
+    )
+    failures = [e for e in events if isinstance(e, RunnerFailureEvent)]
+    assert len(failures) == 1
+    assert "nvapi-" not in failures[0].sanitized_message
+    assert "dummy_tok" not in failures[0].sanitized_message
+    assert "<REDACTED:secret>" in failures[0].sanitized_message

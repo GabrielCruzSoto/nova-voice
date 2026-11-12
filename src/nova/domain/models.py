@@ -23,7 +23,7 @@ class ResolveWorkspaceRequest(BaseModel):
 
     correlation_id: str = Field(min_length=1)
     query: str
-    mode: WorkspaceQueryMode = "voice_fuzzy"
+    mode: str = "voice_fuzzy"
 
 
 class WorkspaceContext(BaseModel):

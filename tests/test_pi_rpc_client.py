@@ -147,3 +147,99 @@ async def test_ac6_pi_rpc_handles_timeout_and_cleans_up_orphan_process(tmp_path:
         assert exc_info.value.code == "PI_RPC_SUBPROCESS_UNAVAILABLE"
 
     assert not client.is_running
+
+
+async def test_f2_pi_rpc_recovers_cleanly_on_dead_process_retry_without_poisoned_queue(
+    tmp_path: Path,
+) -> None:
+    marker = tmp_path / "attempt.txt"
+    fake_pi = tmp_path / "fake_pi_flaky.py"
+    argv = _write_fake_pi_script(
+        fake_pi,
+        f"""
+        import json, pathlib, sys
+
+        marker = pathlib.Path({str(marker)!r})
+        if not marker.exists():
+            marker.write_text("1", encoding="utf-8")
+            sys.exit(1)
+
+        raw = sys.stdin.buffer.readline()
+        req = json.loads(raw.decode("utf-8"))
+        ack = {{
+            "id": req.get("id"),
+            "type": "response",
+            "command": "prompt",
+            "success": True,
+            "data": {{"disposition": "started"}},
+        }}
+        ev = {{
+            "type": "message_update",
+            "assistantMessageEvent": {{"type": "text_delta", "delta": "Recuperado"}},
+        }}
+        sys.stdout.buffer.write((json.dumps(ack) + "\\n").encode("utf-8"))
+        sys.stdout.buffer.write((json.dumps(ev) + "\\n").encode("utf-8"))
+        sys.stdout.buffer.write((json.dumps({{"type": "agent_settled"}}) + "\\n").encode("utf-8"))
+        sys.stdout.buffer.flush()
+        """,
+    )
+
+    config = PiRpcConfig(
+        executable=argv[0],
+        extra_leading_args=tuple(argv[1:]),
+        workspace_path=str(tmp_path),
+    )
+    async with PiRpcClient(config) as client:
+        chunks = [c async for c in client.stream_prompt("Reintenta")]
+    assert "".join(chunks) == "Recuperado"
+
+
+async def test_f3_pi_rpc_handles_jsonl_over_64kib_and_fails_cleanly_on_overrun(
+    tmp_path: Path,
+) -> None:
+    fake_pi = tmp_path / "fake_pi_large.py"
+    argv = _write_fake_pi_script(
+        fake_pi,
+        """
+        import json, sys
+        raw = sys.stdin.buffer.readline()
+        req = json.loads(raw.decode("utf-8"))
+        ack = {
+            "id": req.get("id"),
+            "type": "response",
+            "command": "prompt",
+            "success": True,
+            "data": {"disposition": "started"},
+        }
+        big_delta = "A" * 90000
+        ev = {
+            "type": "message_update",
+            "assistantMessageEvent": {"type": "text_delta", "delta": big_delta},
+        }
+        sys.stdout.buffer.write((json.dumps(ack) + "\\n").encode("utf-8"))
+        sys.stdout.buffer.write((json.dumps(ev) + "\\n").encode("utf-8"))
+        sys.stdout.buffer.write((json.dumps({"type": "agent_settled"}) + "\\n").encode("utf-8"))
+        sys.stdout.buffer.flush()
+        """,
+    )
+
+    ok_cfg = PiRpcConfig(
+        executable=argv[0],
+        extra_leading_args=tuple(argv[1:]),
+        workspace_path=str(tmp_path),
+    )
+    async with PiRpcClient(ok_cfg) as client:
+        out = "".join([c async for c in client.stream_prompt("Grande")])
+    assert len(out) == 90000
+
+    tiny_limit_cfg = PiRpcConfig(
+        executable=argv[0],
+        extra_leading_args=tuple(argv[1:]),
+        workspace_path=str(tmp_path),
+        max_line_bytes=4096,
+    )
+    async with PiRpcClient(tiny_limit_cfg) as client2:
+        with pytest.raises(PiRpcError) as exc_info:
+            async for _ in client2.stream_prompt("Demasiado grande"):
+                pass
+        assert exc_info.value.code == "PI_RPC_SUBPROCESS_UNAVAILABLE"

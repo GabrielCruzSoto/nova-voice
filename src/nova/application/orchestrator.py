@@ -2,13 +2,18 @@
 
 from __future__ import annotations
 
+import contextlib
+import inspect
+import json
+import logging
 import re
 import uuid
+from collections.abc import AsyncIterator
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from nova.domain.errors import NovaDomainError, WorkspaceResolutionError
+from nova.domain.errors import NovaDomainError, WorkspaceResolutionError, redact_sensitive_text
 from nova.domain.events import (
     ChatStreamEvent,
     OrchestratorEventBus,
@@ -27,6 +32,8 @@ from nova.domain.ports import (
     WorkspaceResolverPort,
 )
 
+logger = logging.getLogger("nova.orchestrator")
+
 _HIGH_COMPLEXITY_KEYWORDS: tuple[str, ...] = (
     "arquitectura",
     "architecture",
@@ -42,8 +49,30 @@ _HIGH_COMPLEXITY_KEYWORDS: tuple[str, ...] = (
     "auditoria profunda",
 )
 
+_DELEGATE_MARKER_RE = re.compile(r"\[delegate_tier2\]", re.IGNORECASE)
 _CODE_BLOCK_RE = re.compile(r"```.*?```", re.DOTALL)
 _PATH_TOKEN_RE = re.compile(r"(?:~|/)[\w./-]+")
+
+
+@contextlib.asynccontextmanager
+async def _closing_async_iter[T](stream: AsyncIterator[T]) -> AsyncIterator[AsyncIterator[T]]:
+    """Deterministically await stream.aclose() when available on exit."""
+    try:
+        yield stream
+    finally:
+        aclose = getattr(stream, "aclose", None)
+        if callable(aclose):
+            res = aclose()
+            if inspect.isawaitable(res):
+                await res
+
+
+def _log_structured(event_name: str, **fields: str | bool) -> None:
+    """Emit structured JSON log record with sensitive values masked (NFR-3)."""
+    safe_payload: dict[str, str | bool] = {"event": event_name}
+    for key, val in fields.items():
+        safe_payload[key] = redact_sensitive_text(val) if isinstance(val, str) else val
+    logger.info(json.dumps(safe_payload, ensure_ascii=False, sort_keys=True))
 
 
 class OrchestratorSettings(BaseModel):
@@ -57,7 +86,7 @@ class OrchestratorSettings(BaseModel):
 def classify_complexity(utterance: str) -> Literal["low", "high"]:
     """Classify a user instruction into Tier 1 ('low') or Tier 2 ('high')."""
     normalized = utterance.lower()
-    if "[delegate_tier2]" in normalized:
+    if _DELEGATE_MARKER_RE.search(normalized) is not None:
         return "high"
 
     hits = sum(1 for kw in _HIGH_COMPLEXITY_KEYWORDS if kw in normalized)
@@ -70,7 +99,7 @@ def sanitize_for_voice(raw_text: str, fallback: str, max_words: int = 20) -> str
     """Strip code blocks and filesystem paths, returning a <=25-word spoken summary."""
     without_code = _CODE_BLOCK_RE.sub(" ", raw_text)
     without_paths = _PATH_TOKEN_RE.sub("archivo del proyecto", without_code)
-    cleaned = re.sub(r"[`*_#>]+", " ", without_paths)
+    cleaned = re.sub(r"[`*_#>]+", " ", redact_sensitive_text(without_paths))
     words = [w for w in cleaned.split() if w]
     if not words:
         words = fallback.split()
@@ -112,6 +141,12 @@ class NovaOrchestrator:
             )
         )
         await self._tier1_client.switch_workspace(context.canonical_path)
+        _log_structured(
+            "workspace_selected",
+            correlation_id=corr_id,
+            workspace_id=context.workspace_id,
+            workspace_name=context.name,
+        )
         await self._event_bus.publish(
             VoiceMilestoneEvent(
                 correlation_id=corr_id,
@@ -139,12 +174,24 @@ class NovaOrchestrator:
             )
 
         tier = classify_complexity(utterance)
+        _log_structured(
+            "utterance_routed",
+            correlation_id=corr_id,
+            tier=tier,
+            workspace_name=active_ws.name,
+        )
         try:
             if tier == "low":
                 await self._run_tier1(utterance, corr_id)
             else:
                 await self._run_tier2(utterance, active_ws.canonical_path, corr_id)
         except NovaDomainError as exc:
+            _log_structured(
+                "runner_failure",
+                correlation_id=corr_id,
+                error_code=exc.code,
+                message=exc.sanitized_message,
+            )
             await self._event_bus.publish(
                 RunnerFailureEvent(
                     correlation_id=corr_id,
@@ -165,20 +212,22 @@ class NovaOrchestrator:
 
     async def barge_in(self) -> None:
         """Interrupt active speech/agent turn immediately on user voice activity."""
+        _log_structured("barge_in_triggered")
         await self._tier1_client.barge_in_abort()
 
     async def _run_tier1(self, utterance: str, correlation_id: str) -> None:
         collected: list[str] = []
-        async for delta in self._tier1_client.stream_prompt(utterance):
-            collected.append(delta)
-            await self._event_bus.publish(
-                ChatStreamEvent(
-                    correlation_id=correlation_id,
-                    delta=delta,
-                    source="tier1_pi",
-                    step_type="agent_response",
+        async with _closing_async_iter(self._tier1_client.stream_prompt(utterance)) as stream:
+            async for delta in stream:
+                collected.append(delta)
+                await self._event_bus.publish(
+                    ChatStreamEvent(
+                        correlation_id=correlation_id,
+                        delta=delta,
+                        source="tier1_pi",
+                        step_type="agent_response",
+                    )
                 )
-            )
 
         joined = "".join(collected)
         await self._event_bus.publish(
@@ -198,7 +247,7 @@ class NovaOrchestrator:
         workspace_path: str,
         correlation_id: str,
     ) -> None:
-        cleaned_prompt = utterance.replace("[DELEGATE_TIER2]", "").strip() or utterance.strip()
+        cleaned_prompt = _DELEGATE_MARKER_RE.sub("", utterance).strip() or utterance.strip()
         prior_conv = self._tier2_conversations.get(workspace_path)
 
         await self._event_bus.publish(
@@ -211,56 +260,71 @@ class NovaOrchestrator:
             )
         )
 
-        emitted_working_milestone = False
+        last_milestone_stage: str | None = None
         final_summary = "Ejecucion profunda completada en Antigravity."
 
-        async for progress in self._tier2_runner.execute(
-            CodingTaskRequest(
-                correlation_id=correlation_id,
-                workspace_path=workspace_path,
-                prompt=cleaned_prompt,
-                model=self._settings.default_tier2_model,
-                conversation_id=prior_conv,
-            )
-        ):
-            if progress.conversation_id and progress.conversation_id != "unknown":
-                self._tier2_conversations[workspace_path] = progress.conversation_id
+        request = CodingTaskRequest(
+            correlation_id=correlation_id,
+            workspace_path=workspace_path,
+            prompt=cleaned_prompt,
+            model=self._settings.default_tier2_model,
+            conversation_id=prior_conv,
+        )
+        async with _closing_async_iter(self._tier2_runner.execute(request)) as stream:
+            async for progress in stream:
+                if progress.conversation_id and progress.conversation_id != "unknown":
+                    self._tier2_conversations[workspace_path] = progress.conversation_id
 
-            if progress.kind == "delta" and progress.text_delta:
-                await self._event_bus.publish(
-                    ChatStreamEvent(
-                        correlation_id=correlation_id,
-                        delta=progress.text_delta,
-                        source="tier2_runner",
-                        step_type=progress.step_type,
+                if progress.kind == "delta" and progress.text_delta:
+                    await self._event_bus.publish(
+                        ChatStreamEvent(
+                            correlation_id=correlation_id,
+                            delta=progress.text_delta,
+                            source="tier2_runner",
+                            step_type=progress.step_type,
+                        )
                     )
-                )
-                if not emitted_working_milestone:
-                    emitted_working_milestone = True
+                    if progress.step_type != last_milestone_stage:
+                        last_milestone_stage = progress.step_type
+                        await self._event_bus.publish(
+                            VoiceMilestoneEvent(
+                                correlation_id=correlation_id,
+                                summary_text=sanitize_for_voice(
+                                    progress.text_delta,
+                                    fallback=f"Avanzando en etapa {progress.step_type}.",
+                                ),
+                                priority="normal",
+                            )
+                        )
+                elif (
+                    progress.kind == "milestone"
+                    and progress.step_type != last_milestone_stage
+                ):
+                    last_milestone_stage = progress.step_type
                     await self._event_bus.publish(
                         VoiceMilestoneEvent(
                             correlation_id=correlation_id,
                             summary_text=sanitize_for_voice(
-                                progress.text_delta,
-                                fallback="Avanzando en los cambios del repositorio.",
+                                f"Entrando en etapa {progress.step_type}.",
+                                fallback="Avanzando en el proyecto.",
                             ),
                             priority="normal",
                         )
                     )
-            elif progress.kind == "completed":
-                if progress.final_response:
-                    await self._event_bus.publish(
-                        ChatStreamEvent(
-                            correlation_id=correlation_id,
-                            delta=progress.final_response,
-                            source="tier2_runner",
-                            step_type="result",
+                elif progress.kind == "completed":
+                    if progress.final_response:
+                        await self._event_bus.publish(
+                            ChatStreamEvent(
+                                correlation_id=correlation_id,
+                                delta=progress.final_response,
+                                source="tier2_runner",
+                                step_type="result",
+                            )
                         )
-                    )
-                    final_summary = sanitize_for_voice(
-                        progress.final_response,
-                        fallback=final_summary,
-                    )
+                        final_summary = sanitize_for_voice(
+                            progress.final_response,
+                            fallback=final_summary,
+                        )
 
         await self._event_bus.publish(
             VoiceMilestoneEvent(

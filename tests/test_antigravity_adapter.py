@@ -201,3 +201,61 @@ async def test_ac6_terminates_hanging_agy_subprocess_on_timeout(tmp_path: Path) 
         ):
             pass
     assert exc_info.value.code == "RUNNER_SUBPROCESS_TIMEOUT_OR_CRASH"
+
+
+async def test_f3_agy_handles_ndjson_over_64kib_and_maps_line_overrun_to_domain_error(
+    tmp_path: Path,
+) -> None:
+    fake_agy = tmp_path / "fake_agy_large.py"
+    argv = _write_fake_agy(
+        fake_agy,
+        """
+        import json, sys
+        big_resp = "R" * 95000
+        sys.stdout.write(json.dumps({"event": "init", "conversation_id": "conv-big"}) + "\\n")
+        sys.stdout.write(json.dumps({
+            "event": "result",
+            "result": {
+                "conversation_id": "conv-big",
+                "status": "SUCCESS",
+                "response": big_resp,
+                "duration_seconds": 0.5,
+            }
+        }) + "\\n")
+        sys.stdout.flush()
+        """,
+    )
+
+    ok_adapter = AntigravityCLIAdapter(
+        AntigravityRunnerConfig(executable=argv[0], extra_leading_args=tuple(argv[1:]))
+    )
+    events = [
+        ev
+        async for ev in ok_adapter.execute(
+            CodingTaskRequest(
+                correlation_id="corr-big",
+                workspace_path=str(tmp_path),
+                prompt="Genera reporte extenso",
+            )
+        )
+    ]
+    assert events[-1].final_response is not None
+    assert len(events[-1].final_response) == 95000
+
+    capped_adapter = AntigravityCLIAdapter(
+        AntigravityRunnerConfig(
+            executable=argv[0],
+            extra_leading_args=tuple(argv[1:]),
+            max_line_bytes=4096,
+        )
+    )
+    with pytest.raises(CodingRunnerError) as exc_info:
+        async for _ in capped_adapter.execute(
+            CodingTaskRequest(
+                correlation_id="corr-cap",
+                workspace_path=str(tmp_path),
+                prompt="Excede limite",
+            )
+        ):
+            pass
+    assert exc_info.value.code == "RUNNER_EXECUTION_FAILED"

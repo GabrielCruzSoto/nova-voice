@@ -16,6 +16,7 @@ from nova.domain.errors import PiRpcError
 
 MAX_PENDING_COMMANDS = 32
 MAX_STDERR_BYTES = 16 * 1024
+DEFAULT_MAX_LINE_BYTES = 8 * 1024 * 1024
 
 
 class PiRpcConfig(BaseModel):
@@ -31,6 +32,7 @@ class PiRpcConfig(BaseModel):
     no_session: bool = False
     ack_timeout_seconds: float = Field(default=5.0, gt=0.0)
     run_timeout_seconds: float = Field(default=180.0, gt=0.0)
+    max_line_bytes: int = Field(default=DEFAULT_MAX_LINE_BYTES, gt=0)
 
 
 class _PiRpcResponse(BaseModel):
@@ -101,6 +103,7 @@ class PiRpcClient:
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
+                limit=self._config.max_line_bytes,
             )
         except OSError as exc:
             raise PiRpcError(
@@ -141,19 +144,8 @@ class PiRpcClient:
 
     async def stream_prompt(self, message: str) -> AsyncIterator[str]:
         """Submit a prompt (with 1 restart retry on dead pipe) and yield text deltas."""
-        if not self.is_running:
-            await self.start()
-
-        queue: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue()
-        self._event_queues.append(queue)
+        queue, resp = await self._open_prompt_stream(message)
         try:
-            resp = await self._send_command_with_retry(
-                {
-                    "type": "prompt",
-                    "message": message,
-                    "streamingBehavior": "steer",
-                }
-            )
             disposition = str(resp.data.get("disposition", "started"))
             if disposition == "handled":
                 return
@@ -179,9 +171,10 @@ class PiRpcClient:
                     ) from exc
 
                 if record is None:
+                    await self.close()
                     raise PiRpcError(
                         code="PI_RPC_SUBPROCESS_UNAVAILABLE",
-                        message="Pi RPC subprocess exited before agent_settled.",
+                        message="Pi RPC subprocess exited or exceeded buffer before agent_settled.",
                     )
 
                 rec_type = record.get("type")
@@ -207,15 +200,36 @@ class PiRpcClient:
         await self._send_command({"type": "clear_queue"})
         await self._send_command({"type": "abort"})
 
-    async def _send_command_with_retry(self, payload: dict[str, Any]) -> _PiRpcResponse:
-        try:
-            return await self._send_command(payload)
-        except PiRpcError as exc:
-            if exc.code != "PI_RPC_SUBPROCESS_UNAVAILABLE":
+    async def _open_prompt_stream(
+        self,
+        message: str,
+    ) -> tuple[asyncio.Queue[dict[str, Any] | None], _PiRpcResponse]:
+        """Attach a fresh event queue per attempt so a restart never poisons the active queue."""
+        payload = {
+            "type": "prompt",
+            "message": message,
+            "streamingBehavior": "steer",
+        }
+        for attempt in range(2):
+            if not self.is_running:
+                await self.start()
+            queue: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue()
+            self._event_queues.append(queue)
+            try:
+                resp = await self._send_command(payload)
+                return queue, resp
+            except PiRpcError as exc:
+                if queue in self._event_queues:
+                    self._event_queues.remove(queue)
+                if attempt == 0 and exc.code == "PI_RPC_SUBPROCESS_UNAVAILABLE":
+                    await self.close()
+                    continue
                 raise
-            await self.close()
-            await self.start()
-            return await self._send_command(payload)
+
+        raise PiRpcError(
+            code="PI_RPC_SUBPROCESS_UNAVAILABLE",
+            message="Failed to submit prompt to Pi RPC after restart.",
+        )
 
     async def _send_command(self, payload: dict[str, Any]) -> _PiRpcResponse:
         if len(self._pending) >= MAX_PENDING_COMMANDS:
@@ -270,7 +284,11 @@ class PiRpcClient:
             return
         try:
             while True:
-                raw_line = await proc.stdout.readline()
+                try:
+                    raw_line = await proc.stdout.readline()
+                except (ValueError, asyncio.LimitOverrunError):
+                    await self._terminate_process(proc)
+                    break
                 if not raw_line:
                     break
                 # Strict LF framing: strip only trailing \n and optional \r
@@ -321,14 +339,18 @@ class PiRpcClient:
 
     @staticmethod
     async def _terminate_process(proc: asyncio.subprocess.Process) -> None:
-        if proc.returncode is not None:
-            return
-        with contextlib.suppress(ProcessLookupError):
-            proc.terminate()
-        try:
-            await asyncio.wait_for(proc.wait(), timeout=2.0)
-        except TimeoutError:
+        if proc.returncode is None:
             with contextlib.suppress(ProcessLookupError):
-                proc.kill()
+                proc.terminate()
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=2.0)
+            except TimeoutError:
+                with contextlib.suppress(ProcessLookupError):
+                    proc.kill()
+                with contextlib.suppress(Exception):
+                    await asyncio.wait_for(proc.wait(), timeout=1.0)
+        transport = getattr(proc, "_transport", None)
+        if transport is not None:
             with contextlib.suppress(Exception):
-                await asyncio.wait_for(proc.wait(), timeout=1.0)
+                transport.close()
+        await asyncio.sleep(0)
