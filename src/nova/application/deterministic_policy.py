@@ -204,24 +204,61 @@ _HEAD_TAIL_NUM_FLAG_RE = re.compile(r"^-(?:[0-9]+|[nc]\+?[0-9]+)$")
 _PYTEST_SHORT_CLUSTER_RE = re.compile(r"^-[qvxsl]+$")
 _RUFF_RULE_SELECTOR_RE = re.compile(r"^[A-Z0-9,]+$")
 _DIGITS_RE = re.compile(r"^\+?[0-9]+$")
+_BARE_EXE_RE = re.compile(r"^[A-Za-z0-9._-]+$")
+_VENV_EXE_RE = re.compile(r"^(?:\./)?\.venv/bin/[A-Za-z0-9._-]+$")
+_UNSAFE_GIT_CONFIG_TOKENS: tuple[str, ...] = (
+    "[include",
+    "[filter",
+    "[alias",
+    "[pager",
+    "[diff",
+    "[credential",
+    "[submodule",
+    "[guitool",
+    "[difftool",
+    "[mergetool",
+    "fsmonitor",
+    "worktree",
+    "external",
+    "textconv",
+    "command",
+    "clean",
+    "smudge",
+    "process",
+    "pager",
+    "sshcommand",
+    "gitproxy",
+    "hookspath",
+    "alternaterefscommand",
+    "askpass",
+    "helper",
+    "uploadpack",
+    "receivepack",
+    "attributesfile",
+    "excludesfile",
+)
+
+
+def _has_control_characters(command: str) -> bool:
+    """Detect ASCII control characters (except horizontal tab) or DEL."""
+    for ch in command:
+        code = ord(ch)
+        if (code < 32 and ch != "\t") or code == 127:
+            return True
+    return False
 
 
 def _has_shell_control_or_substitution(command: str) -> bool:
-    """Detect unquoted shell operators, globs, brace expansion, and any active $-expansion."""
+    """Detect unquoted operators/comments, backslashes outside single quotes, and $-expansion."""
     in_single = False
     in_double = False
-    escaped = False
     for ch in command:
-        if escaped:
-            escaped = False
-            continue
         if in_single:
             if ch == "'":
                 in_single = False
             continue
         if ch == "\\":
-            escaped = True
-            continue
+            return True
         if in_double:
             if ch == '"':
                 in_double = False
@@ -232,7 +269,24 @@ def _has_shell_control_or_substitution(command: str) -> bool:
             in_single = True
         elif ch == '"':
             in_double = True
-        elif ch in {";", "|", "&", "<", ">", "(", ")", "`", "$", "{", "}", "*", "?", "["}:
+        elif ch in {
+            "#",
+            ";",
+            "|",
+            "&",
+            "<",
+            ">",
+            "(",
+            ")",
+            "`",
+            "$",
+            "{",
+            "}",
+            "*",
+            "?",
+            "[",
+            "]",
+        }:
             return True
     return False
 
@@ -250,21 +304,23 @@ def _append_path_and_node_prefix(candidates: list[str], raw_val: str) -> None:
         prefix = raw_val.split("::", 1)[0]
         if prefix:
             candidates.append(prefix)
+    if ":~" in raw_val:
+        tilde_tail = "~" + raw_val.split(":~", 1)[1]
+        candidates.append(tilde_tail)
 
 
 def _extract_candidate_paths(tokens: list[str]) -> list[str]:
-    """Extract all non-flag arguments plus paths embedded in single or clustered flags."""
+    """Extract all non-flag arguments plus paths embedded in flags or after '--'."""
     candidates: list[str] = []
     after_double_dash = False
 
     for token in tokens[1:]:
-        if after_double_dash:
-            _append_path_and_node_prefix(candidates, token)
-            continue
-
-        if token == "--":
+        if token == "--" and not after_double_dash:
             after_double_dash = True
             continue
+
+        if after_double_dash and not token.startswith("@"):
+            _append_path_and_node_prefix(candidates, token)
 
         if token.startswith("-"):
             if "=" in token:
@@ -286,7 +342,8 @@ def _extract_candidate_paths(tokens: list[str]) -> list[str]:
             continue
 
         if not token.startswith("@"):
-            _append_path_and_node_prefix(candidates, token)
+            if not after_double_dash:
+                _append_path_and_node_prefix(candidates, token)
             if "=" in token:
                 _, rhs = token.split("=", 1)
                 if rhs and not rhs.startswith("@"):
@@ -317,7 +374,11 @@ def _check_response_file_tokens(
         if at_payload:
             expanded = os.path.expanduser(at_payload)
             candidate = Path(expanded) if os.path.isabs(expanded) else resolved_cwd / expanded
-            if not _is_within_workspace(candidate, workspace_root):
+            if (
+                at_payload.startswith("~")
+                or expanded.startswith("~")
+                or not _is_within_workspace(candidate, workspace_root)
+            ):
                 return Layer1Decision(
                     verdict="escalate",
                     rule_id="OUTSIDE_WORKSPACE_PATH",
@@ -342,6 +403,13 @@ def _check_paths_confined(
 ) -> Layer1Decision | None:
     for raw_path in _extract_candidate_paths(tokens):
         expanded = os.path.expanduser(raw_path)
+        if raw_path.startswith("~") or expanded.startswith("~"):
+            return Layer1Decision(
+                verdict="escalate",
+                rule_id="OUTSIDE_WORKSPACE_PATH",
+                risk_hint="high",
+                reason=f"Shell tilde path '{raw_path}' requires auditor review.",
+            )
         candidate = Path(expanded) if os.path.isabs(expanded) else resolved_cwd / expanded
         if not _is_within_workspace(candidate, workspace_root):
             return Layer1Decision(
@@ -361,7 +429,7 @@ def _validate_git_subcommand_flags(subcmd: str, rest: list[str]) -> bool:
     while idx < len(rest):
         tok = rest[idx]
         if tok == "--":
-            return True
+            return False
         if tok.startswith("-"):
             if tok in allowed_flags:
                 idx += 1
@@ -461,23 +529,37 @@ def _verify_confined_git_repository(
             if os.path.lexists(sub_entry):
                 if not _is_within_workspace(Path(os.path.realpath(sub_entry)), workspace_root):
                     return outside_decision
-        if os.path.lexists(gdir / "objects" / "info" / "alternates"):
+        if os.path.lexists(gdir / "objects" / "info" / "alternates") or os.path.lexists(
+            gdir / "config.worktree"
+        ):
             return outside_decision
         cfg_path = gdir / "config"
-        if cfg_path.is_file():
+        if os.path.lexists(cfg_path):
+            if not cfg_path.is_file():
+                return outside_decision
             try:
-                cfg_lower = cfg_path.read_text(encoding="utf-8", errors="replace")[:16384].lower()
+                if cfg_path.stat().st_size > 16384:
+                    return Layer1Decision(
+                        verdict="escalate",
+                        rule_id="GIT_MUTATING_OR_UNSAFE_FLAG",
+                        risk_hint="high",
+                        reason="Git config exceeds 16 KiB Layer 1 fast-path limit.",
+                    )
+                cfg_raw = cfg_path.read_text(encoding="utf-8", errors="replace")
             except OSError:
                 return outside_decision
-            if any(
-                directive in cfg_lower
-                for directive in ("fsmonitor", "worktree", "external", "textconv")
-            ):
+            active_lines = [
+                line.strip().lower()
+                for line in cfg_raw.splitlines()
+                if line.strip() and not line.lstrip().startswith(("#", ";"))
+            ]
+            cfg_lower = "\n".join(active_lines)
+            if any(directive in cfg_lower for directive in _UNSAFE_GIT_CONFIG_TOKENS):
                 return Layer1Decision(
                     verdict="escalate",
                     rule_id="GIT_MUTATING_OR_UNSAFE_FLAG",
                     risk_hint="high",
-                    reason="Git config defines external hooks, worktree, or diff drivers.",
+                    reason="Git config defines external includes, filters, hooks, or drivers.",
                 )
 
     return None
@@ -592,12 +674,12 @@ def _validate_pytest_args(args: list[str]) -> bool:
     while idx < len(args):
         tok = args[idx]
         if tok == "--":
-            return True
+            return False
         if tok.startswith("-"):
             if _PYTEST_SHORT_CLUSTER_RE.fullmatch(tok) or tok in _ALLOWED_PYTEST_BOOL_FLAGS:
                 idx += 1
                 continue
-            if tok in {"-k", "-m"} and idx + 1 < len(args):
+            if tok in {"-k", "-m"} and idx + 1 < len(args) and not args[idx + 1].startswith("-"):
                 idx += 2
                 continue
             if tok in {"--maxfail", "--durations"} and idx + 1 < len(args):
@@ -633,14 +715,9 @@ def _validate_mypy_args(args: list[str]) -> bool:
     if args in (["--version"], ["-V"]):
         return True
     has_target = False
-    after_dd = False
     for tok in args:
-        if after_dd:
-            has_target = True
-            continue
         if tok == "--":
-            after_dd = True
-            continue
+            return False
         if tok.startswith("-"):
             if tok not in _ALLOWED_MYPY_FLAGS:
                 return False
@@ -658,7 +735,7 @@ def _validate_ruff_args(args: list[str]) -> bool:
     while idx < len(args):
         tok = args[idx]
         if tok == "--":
-            return True
+            return False
         if tok.startswith("-"):
             if tok in _ALLOWED_RUFF_CHECK_BOOL_FLAGS:
                 idx += 1
@@ -695,17 +772,10 @@ def _validate_coreutil_args(exe_name: str, args: list[str]) -> bool:
 
     positional = 0
     idx = 0
-    after_dd = False
     while idx < len(args):
         tok = args[idx]
-        if after_dd:
-            positional += 1
-            idx += 1
-            continue
         if tok == "--":
-            after_dd = True
-            idx += 1
-            continue
+            return False
         if tok.startswith("-"):
             if exe_name == "ls":
                 if _LS_SHORT_FLAG_RE.fullmatch(tok) or tok in {
@@ -780,8 +850,8 @@ class DeterministicCommandPolicy:
         workspace_canonical_path: str,
     ) -> Layer1Decision:
         """Evaluate command under strict fail-closed precedence (<5 ms p95)."""
-        stripped = command.strip()
-        if not stripped:
+        stripped_for_deny = command.strip()
+        if not stripped_for_deny:
             return Layer1Decision(
                 verdict="escalate",
                 rule_id="EMPTY_COMMAND",
@@ -790,7 +860,7 @@ class DeterministicCommandPolicy:
             )
 
         for rule_id, pattern, reason in _HARD_DENY_PATTERNS:
-            if pattern.search(stripped) is not None:
+            if pattern.search(stripped_for_deny) is not None:
                 return Layer1Decision(
                     verdict="hard_deny",
                     rule_id=rule_id,
@@ -798,12 +868,21 @@ class DeterministicCommandPolicy:
                     reason=reason,
                 )
 
-        if "\n" in command or "\r" in command or "\x00" in command:
+        if _has_control_characters(command):
             return Layer1Decision(
                 verdict="escalate",
                 rule_id="CONTROL_CHARACTER_DETECTED",
                 risk_hint="high",
-                reason="Multiline or null-byte command requires auditor inspection.",
+                reason="Multiline or control-character command requires auditor inspection.",
+            )
+
+        stripped = command.strip(" \t")
+        if not stripped:
+            return Layer1Decision(
+                verdict="escalate",
+                rule_id="EMPTY_COMMAND",
+                risk_hint="medium",
+                reason="Empty command string cannot be auto-approved.",
             )
 
         if not os.path.isabs(cwd) or not os.path.isabs(workspace_canonical_path):
@@ -868,6 +947,15 @@ class DeterministicCommandPolicy:
     ) -> Layer1Decision:
         head = tokens[0]
         args = tokens[1:]
+
+        if "=" in head:
+            return Layer1Decision(
+                verdict="escalate",
+                rule_id="UNTRUSTED_RELATIVE_EXECUTABLE",
+                risk_hint="high",
+                reason="Environment variable assignment or '=' in executable token requires audit.",
+            )
+
         exe_name = Path(head).name
 
         if exe_name in _SENSITIVE_BINARIES:
@@ -888,16 +976,26 @@ class DeterministicCommandPolicy:
                 )
             return _evaluate_aigile_tokens(args)
 
-        if "/" in head or head.startswith((".", "~")):
-            venv_bin = workspace_root / ".venv" / "bin"
-            resolved_exe = Path(os.path.realpath(resolved_cwd / os.path.expanduser(head)))
-            if resolved_exe.parent != venv_bin:
+        if _VENV_EXE_RE.fullmatch(head):
+            venv_bin = Path(os.path.realpath(workspace_root / ".venv" / "bin"))
+            resolved_exe = Path(os.path.realpath(resolved_cwd / head))
+            if (
+                not _is_within_workspace(resolved_exe, workspace_root)
+                or resolved_exe.parent != venv_bin
+            ):
                 return Layer1Decision(
                     verdict="escalate",
                     rule_id="UNTRUSTED_RELATIVE_EXECUTABLE",
-                    risk_hint="medium",
+                    risk_hint="high",
                     reason=f"Executable path '{head}' is outside workspace .venv/bin.",
                 )
+        elif not _BARE_EXE_RE.fullmatch(head) or head in {".", ".."}:
+            return Layer1Decision(
+                verdict="escalate",
+                rule_id="UNTRUSTED_RELATIVE_EXECUTABLE",
+                risk_hint="high",
+                reason=f"Executable path '{head}' is outside workspace .venv/bin.",
+            )
 
         if exe_name == "git":
             git_decision = _evaluate_git_tokens(args)

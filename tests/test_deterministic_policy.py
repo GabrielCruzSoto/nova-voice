@@ -104,6 +104,8 @@ def test_ac2_catastrophic_commands_return_hard_deny(
         ("cat $HOME/.ssh/id_rsa", "COMPOUND_OR_SUBSTITUTION"),
         ("pytest $TMPDIR/evil_test.py", "COMPOUND_OR_SUBSTITUTION"),
         ("cat {.,..}/secret.txt", "COMPOUND_OR_SUBSTITUTION"),
+        ('cat "a\\$b"', "COMPOUND_OR_SUBSTITUTION"),
+        ("pytest -q # trailing comment", "COMPOUND_OR_SUBSTITUTION"),
         ("ls `id`", "COMPOUND_OR_SUBSTITUTION"),
         ("cat src/app.py > /tmp/out.txt", "COMPOUND_OR_SUBSTITUTION"),
         ("ls\nwhoami", "CONTROL_CHARACTER"),
@@ -129,7 +131,14 @@ def test_ac2_catastrophic_commands_return_hard_deny(
         ("ruff format src", "UNSAFE_TOOL_CONFIG_FLAG"),
         ("ruff clean", "UNSAFE_TOOL_CONFIG_FLAG"),
         ("ruff check --fix src", "UNSAFE_TOOL_CONFIG_FLAG"),
+        ('pytest -- -o "python_files=setup.py"', "UNSAFE_TOOL_CONFIG_FLAG"),
+        ("X=1/../.venv/bin/pytest sudo -- apt-get update", "UNTRUSTED_RELATIVE_EXECUTABLE"),
+        ("FOO=1 pytest -q", "UNTRUSTED_RELATIVE_EXECUTABLE"),
         ("cat ../../etc/passwd", "OUTSIDE_WORKSPACE_PATH"),
+        ("pytest -- --basetemp=/tmp/outside_host_dir", "OUTSIDE_WORKSPACE_PATH"),
+        ("cat ~-/etc/passwd", "OUTSIDE_WORKSPACE_PATH"),
+        ("cat ~+/secret.txt", "OUTSIDE_WORKSPACE_PATH"),
+        ('cat "~/secret.txt"', "OUTSIDE_WORKSPACE_PATH"),
         ("pytest -c/tmp/outside_pyproject.toml", "OUTSIDE_WORKSPACE_PATH"),
         ("pytest -qc/tmp/outside_pyproject.toml", "OUTSIDE_WORKSPACE_PATH"),
         ("pytest -qc../outside.ini", "OUTSIDE_WORKSPACE_PATH"),
@@ -248,6 +257,32 @@ def test_git_ancestor_or_gitdir_pointer_escape_escalates(tmp_path: Path) -> None
     )
     assert dec_alt.verdict == "escalate"
     assert dec_alt.rule_id == "OUTSIDE_WORKSPACE_PATH"
+
+    # 4. .git/config with [include] or oversized > 16 KiB
+    inc_ws = tmp_path / "Proyectos" / "inc-pkg"
+    (inc_ws / ".git").mkdir(parents=True)
+    (inc_ws / ".git" / "config").write_text(
+        "[include]\n\tpath = /tmp/evil_gitconfig\n",
+        encoding="utf-8",
+    )
+    dec_inc = policy.evaluate(
+        command="git status -sb",
+        cwd=str(inc_ws),
+        workspace_canonical_path=str(inc_ws),
+    )
+    assert dec_inc.verdict == "escalate"
+    assert dec_inc.rule_id == "GIT_MUTATING_OR_UNSAFE_FLAG"
+
+    huge_ws = tmp_path / "Proyectos" / "huge-pkg"
+    (huge_ws / ".git").mkdir(parents=True)
+    (huge_ws / ".git" / "config").write_text("# pad\n" * 4000, encoding="utf-8")
+    dec_huge = policy.evaluate(
+        command="git status -sb",
+        cwd=str(huge_ws),
+        workspace_canonical_path=str(huge_ws),
+    )
+    assert dec_huge.verdict == "escalate"
+    assert dec_huge.rule_id == "GIT_MUTATING_OR_UNSAFE_FLAG"
 
 
 def test_cwd_outside_workspace_escalates(workspace_dir: Path, tmp_path: Path) -> None:
