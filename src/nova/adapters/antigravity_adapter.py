@@ -6,6 +6,7 @@ import asyncio
 import contextlib
 import json
 import os
+import time
 from collections.abc import AsyncIterator
 from typing import Any
 
@@ -39,6 +40,7 @@ class AntigravityRunnerConfig(BaseModel):
     gatekeeper_ipc_env: dict[str, str] | None = None
     require_gatekeeper_plugin: bool = True
     gatekeeper_plugin_name: str = Field(default="nova-agy-gatekeeper", min_length=1)
+    plugin_check_ttl_seconds: float = Field(default=60.0, gt=0.0)
 
 
 class _AgyStepUpdate(BaseModel):
@@ -65,7 +67,7 @@ class AntigravityCLIAdapter:
 
     def __init__(self, config: AntigravityRunnerConfig | None = None) -> None:
         self._config = config or AntigravityRunnerConfig()
-        self._gatekeeper_plugin_verified = False
+        self._plugin_verified_until_monotonic: float = 0.0
 
     async def execute(self, request: CodingTaskRequest) -> AsyncIterator[RunnerProgressEvent]:
         """Run a heavy coding turn and yield structured RunnerProgressEvent records."""
@@ -84,10 +86,12 @@ class AntigravityCLIAdapter:
         if (
             self._config.gatekeeper_ipc_env
             and self._config.require_gatekeeper_plugin
-            and not self._gatekeeper_plugin_verified
+            and time.monotonic() >= self._plugin_verified_until_monotonic
         ):
             await self._verify_gatekeeper_plugin_installed(request.workspace_path)
-            self._gatekeeper_plugin_verified = True
+            self._plugin_verified_until_monotonic = (
+                time.monotonic() + self._config.plugin_check_ttl_seconds
+            )
 
         cmd: list[str] = [
             self._config.executable,

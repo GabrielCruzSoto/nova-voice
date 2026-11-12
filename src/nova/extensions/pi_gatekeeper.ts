@@ -34,6 +34,7 @@ const NARROW_NO_BREAK_SPACE = "\u202F";
 const SHELL_TOOLS = new Set(["bash", "powershell", "sh", "zsh", "cmd"]);
 const SAFE_FILE_TOOLS = new Set(["read", "write", "edit", "ls", "find", "grep"]);
 const MANDATORY_PATH_TOOLS = new Set(["read", "write", "edit"]);
+const MUTATING_FILE_TOOLS = new Set(["write", "edit"]);
 
 const PATH_ARGUMENT_KEYS = [
   "path",
@@ -146,7 +147,20 @@ function isInsideWorkspace(candidateReal: string, workspaceReal: string): boolea
   return candidateReal.startsWith(prefix);
 }
 
-function isPathConfinedToWorkspace(rawPath: string, workspaceReal: string): boolean {
+function touchesGitMetadata(candidateReal: string, workspaceReal: string): boolean {
+  const rel = path.relative(workspaceReal, candidateReal);
+  if (!rel || rel.startsWith("..")) {
+    return false;
+  }
+  const segments = rel.split(/[\\/]+/);
+  return segments.some((seg) => seg.toLowerCase() === ".git");
+}
+
+function isPathConfinedToWorkspace(
+  rawPath: string,
+  workspaceReal: string,
+  forbidGitMetadataWrite = false,
+): boolean {
   const exactNorm = normalizeExactPiPath(rawPath);
   const defensiveNorm = normalizeDefensivePath(rawPath);
   if (exactNorm === null || defensiveNorm === null) {
@@ -167,6 +181,9 @@ function isPathConfinedToWorkspace(rawPath: string, workspaceReal: string): bool
   for (const candidateAbs of candidateForms) {
     const resolved = resolveAbsoluteRealpath(candidateAbs);
     if (!resolved || !isInsideWorkspace(resolved, workspaceReal)) {
+      return false;
+    }
+    if (forbidGitMetadataWrite && touchesGitMetadata(resolved, workspaceReal)) {
       return false;
     }
   }
@@ -236,10 +253,11 @@ function checkFileToolConfinement(
         reason: `GATEKEEPER_INVALID_FILE_PATH: Argument '${key}' must be a string.`,
       };
     }
-    if (!isPathConfinedToWorkspace(val, workspaceReal)) {
+    const forbidGitWrite = MUTATING_FILE_TOOLS.has(toolName);
+    if (!isPathConfinedToWorkspace(val, workspaceReal, forbidGitWrite)) {
       return {
         block: true,
-        reason: `GATEKEEPER_OUTSIDE_WORKSPACE_FILE: File path '${val}' escapes active workspace.`,
+        reason: `GATEKEEPER_OUTSIDE_WORKSPACE_FILE: File path '${val}' escapes workspace or mutates protected .git metadata.`,
       };
     }
   }

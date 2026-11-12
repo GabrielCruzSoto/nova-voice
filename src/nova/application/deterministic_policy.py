@@ -299,10 +299,10 @@ def _check_response_file_tokens(
     resolved_cwd: Path,
     workspace_root: Path,
 ) -> Layer1Decision | None:
-    """Detect argparse @response-file arguments and escalate (prioritizing path escapes)."""
+    """Detect argparse @response-file arguments anywhere in argv (even after '--')."""
     for token in tokens[1:]:
         if token == "--":
-            break
+            continue
         at_payload: str | None = None
         if token.startswith("@"):
             at_payload = token.lstrip("@")
@@ -354,6 +354,8 @@ def _check_paths_confined(
 
 
 def _validate_git_subcommand_flags(subcmd: str, rest: list[str]) -> bool:
+    if any(":" in tok for tok in rest):
+        return False
     allowed_flags = _SAFE_GIT_SUBCOMMAND_FLAGS[subcmd]
     idx = 0
     while idx < len(rest):
@@ -378,6 +380,107 @@ def _validate_git_subcommand_flags(subcmd: str, rest: list[str]) -> bool:
             return False
         idx += 1
     return True
+
+
+def _verify_confined_git_repository(
+    resolved_cwd: Path,
+    workspace_root: Path,
+) -> Layer1Decision | None:
+    """Ensure Git resolves a confined .git inside workspace_root without external pointers."""
+    outside_decision = Layer1Decision(
+        verdict="escalate",
+        rule_id="OUTSIDE_WORKSPACE_PATH",
+        risk_hint="high",
+        reason="Git repository metadata resolves outside the active workspace.",
+    )
+
+    cur = resolved_cwd
+    found_dot_git: Path | None = None
+    found_parent: Path | None = None
+    while _is_within_workspace(cur, workspace_root):
+        candidate_git = cur / ".git"
+        if os.path.lexists(candidate_git):
+            found_dot_git = candidate_git
+            found_parent = cur
+            break
+        if cur == workspace_root:
+            break
+        parent = cur.parent
+        if parent == cur:
+            break
+        cur = parent
+
+    if found_dot_git is None or found_parent is None:
+        return outside_decision
+
+    real_dot_git = Path(os.path.realpath(found_dot_git))
+    if not _is_within_workspace(real_dot_git, workspace_root):
+        return outside_decision
+
+    if real_dot_git.is_file():
+        try:
+            raw_ptr = real_dot_git.read_text(encoding="utf-8", errors="replace")[:4096]
+        except OSError:
+            return outside_decision
+        first_line = raw_ptr.splitlines()[0].strip() if raw_ptr.splitlines() else ""
+        if not first_line.startswith("gitdir:"):
+            return outside_decision
+        ptr_target = first_line.removeprefix("gitdir:").strip()
+        if not ptr_target:
+            return outside_decision
+        git_dir = Path(os.path.realpath(found_parent / ptr_target))
+        if not git_dir.is_dir() or not _is_within_workspace(git_dir, workspace_root):
+            return outside_decision
+    elif real_dot_git.is_dir():
+        git_dir = real_dot_git
+    else:
+        return outside_decision
+
+    effective_dirs = [git_dir]
+    commondir_entry = git_dir / "commondir"
+    if os.path.lexists(commondir_entry):
+        real_common_file = Path(os.path.realpath(commondir_entry))
+        if not _is_within_workspace(real_common_file, workspace_root):
+            return outside_decision
+        if real_common_file.is_file():
+            try:
+                raw_common = real_common_file.read_text(encoding="utf-8", errors="replace")[:4096]
+            except OSError:
+                return outside_decision
+            common_rel = raw_common.strip()
+            if not common_rel:
+                return outside_decision
+            common_dir = Path(os.path.realpath(git_dir / common_rel))
+            if not common_dir.is_dir() or not _is_within_workspace(common_dir, workspace_root):
+                return outside_decision
+            effective_dirs.append(common_dir)
+
+    for gdir in effective_dirs:
+        for entry_name in ("HEAD", "objects", "refs", "config", "packed-refs"):
+            sub_entry = gdir / entry_name
+            if os.path.lexists(sub_entry):
+                if not _is_within_workspace(Path(os.path.realpath(sub_entry)), workspace_root):
+                    return outside_decision
+        if os.path.lexists(gdir / "objects" / "info" / "alternates"):
+            return outside_decision
+        cfg_path = gdir / "config"
+        if cfg_path.is_file():
+            try:
+                cfg_lower = cfg_path.read_text(encoding="utf-8", errors="replace")[:16384].lower()
+            except OSError:
+                return outside_decision
+            if any(
+                directive in cfg_lower
+                for directive in ("fsmonitor", "worktree", "external", "textconv")
+            ):
+                return Layer1Decision(
+                    verdict="escalate",
+                    rule_id="GIT_MUTATING_OR_UNSAFE_FLAG",
+                    risk_hint="high",
+                    reason="Git config defines external hooks, worktree, or diff drivers.",
+                )
+
+    return None
 
 
 def _evaluate_git_tokens(args: list[str]) -> Layer1Decision:
@@ -797,7 +900,12 @@ class DeterministicCommandPolicy:
                 )
 
         if exe_name == "git":
-            return _evaluate_git_tokens(args)
+            git_decision = _evaluate_git_tokens(args)
+            if git_decision.verdict == "allow":
+                repo_escape = _verify_confined_git_repository(resolved_cwd, workspace_root)
+                if repo_escape is not None:
+                    return repo_escape
+            return git_decision
 
         if exe_name in _SIMPLE_ALLOWLIST_BINARIES:
             unsafe_syntax = _check_positive_allowlist_syntax(exe_name, args)

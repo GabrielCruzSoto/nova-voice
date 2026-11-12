@@ -268,6 +268,32 @@ async def test_ac5_and_op5_agy_pre_tool_hook_standalone_and_connected(tmp_path: 
             parsed_cwd_escape = json.loads(out_cwd_escape.decode("utf-8"))
             assert parsed_cwd_escape["decision"] == "deny"
 
+            # 5. F3 regression: empty Cwd or trailing-space symlink Cwd MUST deny fail-closed
+            legit_sub = ws / "sub"
+            os.makedirs(legit_sub, exist_ok=True)
+            os.symlink(tmp_path, ws / "sub ")
+
+            for bad_cwd in ("", "   ", 123, str(ws / "sub ")):
+                bad_cwd_stdin = json.dumps(
+                    {
+                        "workspacePaths": [str(ws)],
+                        "toolCall": {
+                            "name": "run_command",
+                            "args": {"CommandLine": "pwd", "Cwd": bad_cwd},
+                        },
+                    }
+                )
+                proc_bad_cwd = await asyncio.create_subprocess_exec(
+                    sys.executable,
+                    str(hook_script),
+                    cwd=str(plugin_dir),
+                    env=short_env,
+                    stdin=asyncio.subprocess.PIPE,
+                    stdout=asyncio.subprocess.PIPE,
+                )
+                out_bad_cwd, _ = await proc_bad_cwd.communicate(bad_cwd_stdin.encode("utf-8"))
+                assert json.loads(out_bad_cwd.decode("utf-8"))["decision"] == "deny"
+
 
 @pytest.mark.asyncio
 async def test_cli_adapters_inject_gatekeeper_env_and_pi_extension(tmp_path: Path) -> None:
@@ -470,6 +496,10 @@ const resReadAmPmVariant = await handler(
   {{ toolName: "read", input: {{ path: "Capture 10.00 AM.png" }} }},
   ctx,
 );
+const resWriteDotGit = await handler(
+  {{ toolName: "write", input: {{ path: ".git/hooks/pre-commit" }} }},
+  ctx,
+);
 const resPowershellDeny = await handler(
   {{ toolName: "powershell", input: {{ command: "rm -rf /" }} }},
   ctx,
@@ -493,6 +523,7 @@ console.log(JSON.stringify({{
   resReadLeadingSpaceLink,
   resReadAtSpaceLink,
   resReadAmPmVariant,
+  resWriteDotGit,
   resPowershellDeny,
   resUnknownTool,
   resSafe: resSafe ?? null,
@@ -528,6 +559,7 @@ console.log(JSON.stringify({{
     assert out["resReadLeadingSpaceLink"]["block"] is True
     assert out["resReadAtSpaceLink"]["block"] is True
     assert out["resReadAmPmVariant"]["block"] is True
+    assert out["resWriteDotGit"]["block"] is True
     assert out["resPowershellDeny"]["block"] is True
     assert "CATASTROPHIC" in out["resPowershellDeny"]["reason"]
     assert out["resUnknownTool"]["block"] is True
@@ -742,3 +774,66 @@ console.log(JSON.stringify(res));
     finally:
         null_server.close()
         await null_server.wait_closed()
+
+    # F4 regression: plugin check TTL expires and catches runtime plugin disablement
+    state_flag = tmp_path / "plugin_enabled.txt"
+    await asyncio.to_thread(state_flag.write_text, "1", "utf-8")
+    real_plugin_dir = str(REPO_ROOT / "src" / "nova" / "plugins" / "agy_gatekeeper")
+    fake_agy_ttl = tmp_path / "fake_agy_ttl.py"
+    await asyncio.to_thread(
+        fake_agy_ttl.write_text,
+        f"""
+import json, pathlib, sys
+if sys.argv[1:4] == ["plugin", "list", "--json"]:
+    enabled = pathlib.Path({str(state_flag)!r}).read_text().strip() == "1"
+    print(json.dumps([{{
+        "name": "nova-agy-gatekeeper",
+        "enabled": enabled,
+        "path": {real_plugin_dir!r},
+    }}]))
+    raise SystemExit(0)
+print(json.dumps({{"event": "init", "conversation_id": "c-ttl"}}), flush=True)
+print(json.dumps({{
+    "event": "result",
+    "result": {{"conversation_id": "c-ttl", "status": "SUCCESS", "response": "ok"}},
+}}), flush=True)
+""",
+        "utf-8",
+    )
+    ttl_adapter = AntigravityCLIAdapter(
+        AntigravityRunnerConfig(
+            executable=sys.executable,
+            extra_leading_args=(str(fake_agy_ttl),),
+            gatekeeper_ipc_env={
+                "NOVA_GATEKEEPER_SOCKET": "/tmp/synt.sock",
+                "NOVA_GATEKEEPER_TOKEN": "synt-tok",
+            },
+            plugin_check_ttl_seconds=0.05,
+        )
+    )
+    first_events = [
+        ev
+        async for ev in ttl_adapter.execute(
+            CodingTaskRequest(
+                correlation_id="c-ttl-1",
+                workspace_path=str(tmp_path),
+                prompt="check",
+            )
+        )
+    ]
+    assert any(e.kind == "completed" for e in first_events)
+
+    await asyncio.to_thread(state_flag.write_text, "0", "utf-8")
+    await asyncio.sleep(0.07)
+    with pytest.raises(CodingRunnerError) as ttl_exc:
+        _ = [
+            ev
+            async for ev in ttl_adapter.execute(
+                CodingTaskRequest(
+                    correlation_id="c-ttl-2",
+                    workspace_path=str(tmp_path),
+                    prompt="check",
+                )
+            )
+        ]
+    assert ttl_exc.value.code == "GATEKEEPER_PLUGIN_MISSING"

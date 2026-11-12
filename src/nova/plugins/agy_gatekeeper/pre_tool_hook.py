@@ -25,25 +25,36 @@ def _emit(decision: str, reason: str | None = None) -> None:
 def _extract_effective_cwd(
     hook_input: dict[str, Any],
     tool_args: dict[str, Any],
-) -> str | None:
-    """Resolve effective execution directory prioritizing toolCall.args.Cwd (F2)."""
+) -> tuple[str | None, str | None]:
+    """Resolve effective execution directory preserving exact POSIX characters (F2, F3)."""
     for key in ("Cwd", "cwd", "workingDirectory", "DirectoryPath"):
-        raw = tool_args.get(key)
-        if isinstance(raw, str) and raw.strip():
-            return raw.strip()
+        if key in tool_args and tool_args[key] is not None:
+            raw = tool_args[key]
+            if not isinstance(raw, str) or not raw.strip():
+                return (
+                    None,
+                    f"GATEKEEPER_INVALID_CWD: Explicit tool argument '{key}' is empty or invalid.",
+                )
+            return raw, None
 
     for key in ("cwd", "Cwd"):
-        raw_top = hook_input.get(key)
-        if isinstance(raw_top, str) and raw_top.strip():
-            return raw_top.strip()
+        if key in hook_input and hook_input[key] is not None:
+            raw_top = hook_input[key]
+            if not isinstance(raw_top, str) or not raw_top.strip():
+                return (
+                    None,
+                    f"GATEKEEPER_INVALID_CWD: Hook field '{key}' is empty or invalid.",
+                )
+            return raw_top, None
 
     workspace_paths = hook_input.get("workspacePaths")
     if isinstance(workspace_paths, list) and workspace_paths:
         first_ws = workspace_paths[0]
         if isinstance(first_ws, str) and first_ws.strip():
-            return first_ws.strip()
+            return first_ws, None
+        return None, "GATEKEEPER_INVALID_CWD: workspacePaths[0] is empty or invalid."
 
-    return None
+    return None, "GATEKEEPER_MISSING_CWD: Unable to determine target working directory."
 
 
 def main() -> int:
@@ -70,9 +81,9 @@ def main() -> int:
     tool_args: dict[str, Any] = raw_args if isinstance(raw_args, dict) else {}
     command_line = tool_args.get("CommandLine", "")
 
-    effective_cwd = _extract_effective_cwd(hook_input, tool_args)
+    effective_cwd, cwd_err = _extract_effective_cwd(hook_input, tool_args)
     if effective_cwd is None:
-        _emit("deny", "GATEKEEPER_MISSING_CWD: Unable to determine target working directory.")
+        _emit("deny", cwd_err or "GATEKEEPER_MISSING_CWD: Missing working directory.")
         return 0
 
     ipc_request = {
