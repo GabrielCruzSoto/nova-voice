@@ -9,31 +9,37 @@ from pathlib import Path
 
 from nova.domain.models import Layer1Decision
 
+_PRIV_PREFIX = r"(?:(?:sudo|doas|pkexec|env)(?:\s+-[^\s;&|]+)*\s+)*"
+
 _HARD_DENY_PATTERNS: tuple[tuple[str, re.Pattern[str], str], ...] = (
     (
         "CATASTROPHIC_RM_ROOT_OR_HOME",
         re.compile(
-            r"(?:^|[;&|]\s*)\brm\b(?=[^\n;&|]*(?:\s-(?:[A-Za-z]*[rf][A-Za-z]*)|--recursive|--force))"
-            r"[^\n;&|]*(?:\s+(?:/|/\*|~|\$HOME|\$\{HOME\}|\.\.)(?:\s|$|[;&|]))"
+            rf"(?:^|[;&|]\s*){_PRIV_PREFIX}\brm\b"
+            r"(?=[^\n;&|]*(?:\s-(?:[A-Za-z]*[rf][A-Za-z]*)|--recursive|--force))"
+            r"[^\n;&|]*\s+['\"]?(?:/|/\*|~/?|\$HOME/?|\$\{HOME\}/?|\.\./?)['\"]?(?:\s|$|[;&|])"
         ),
         "Recursive or forced deletion targeting host root, home, or parent directory.",
     ),
     (
         "CATASTROPHIC_FILESYSTEM_FORMAT",
-        re.compile(r"(?:^|[;&|]\s*)\bmkfs(?:\.[A-Za-z0-9_-]+)?\b"),
+        re.compile(rf"(?:^|[;&|]\s*){_PRIV_PREFIX}\bmkfs(?:\.[A-Za-z0-9_-]+)?\b"),
         "Filesystem formatting command targeting block storage.",
     ),
     (
         "CATASTROPHIC_RAW_BLOCK_WRITE",
         re.compile(
-            r"(?:^|[;&|]\s*)(?:\bdd\b[^\n;&|]*\bof=/dev/|\bshred\b[^\n;&|]*/dev/)"
+            rf"(?:^|[;&|]\s*){_PRIV_PREFIX}"
+            r"(?:\bdd\b[^\n;&|]*\bof=/dev/|\bshred\b[^\n;&|]*/dev/)"
         ),
         "Direct destructive write or shred targeting a raw /dev device.",
     ),
     (
         "CATASTROPHIC_CHMOD_ROOT",
         re.compile(
-            r"(?:^|[;&|]\s*)\b(?:chmod|chown)\b[^\n;&|]*(?:-R|--recursive)[^\n;&|]*\s777\s+/(?:\s|$)"
+            rf"(?:^|[;&|]\s*){_PRIV_PREFIX}\b(?:chmod|chown)\b"
+            r"(?=[^\n;&|]*(?:-R|--recursive))(?=[^\n;&|]*\b777\b)"
+            r"[^\n;&|]*\s+['\"]?/(?:['\"]|\s|$|[;&|])"
         ),
         "Recursive world-writable permission change targeting filesystem root.",
     ),
@@ -43,48 +49,6 @@ _HARD_DENY_PATTERNS: tuple[tuple[str, re.Pattern[str], str], ...] = (
         "Shell fork bomb pattern detected.",
     ),
 )
-
-def _has_shell_control_or_substitution(command: str) -> bool:
-    """Detect unquoted shell operators (; | & < > ( )) and active substitutions ($( or `)."""
-    in_single = False
-    in_double = False
-    escaped = False
-    length = len(command)
-    i = 0
-    while i < length:
-        ch = command[i]
-        if escaped:
-            escaped = False
-            i += 1
-            continue
-        if in_single:
-            if ch == "'":
-                in_single = False
-            i += 1
-            continue
-        if ch == "\\":
-            escaped = True
-            i += 1
-            continue
-        if in_double:
-            if ch == '"':
-                in_double = False
-            elif ch == "`" or (
-                ch == "$" and i + 1 < length and command[i + 1] in {"(", "{"}
-            ):
-                return True
-            i += 1
-            continue
-        if ch == "'":
-            in_single = True
-        elif ch == '"':
-            in_double = True
-        elif ch in {";", "|", "&", "<", ">", "(", ")", "`"}:
-            return True
-        elif ch == "$" and i + 1 < length and command[i + 1] in {"(", "{", "'", '"'}:
-            return True
-        i += 1
-    return False
 
 _SENSITIVE_BINARIES: frozenset[str] = frozenset(
     {
@@ -140,27 +104,64 @@ _SAFE_AIGILE_PREFIXES: tuple[tuple[str, ...], ...] = (
 )
 
 
+def _has_shell_control_or_substitution(command: str) -> bool:
+    """Detect unquoted shell operators, globs, brace expansion, and any active $-expansion."""
+    in_single = False
+    in_double = False
+    escaped = False
+    for ch in command:
+        if escaped:
+            escaped = False
+            continue
+        if in_single:
+            if ch == "'":
+                in_single = False
+            continue
+        if ch == "\\":
+            escaped = True
+            continue
+        if in_double:
+            if ch == '"':
+                in_double = False
+            elif ch in {"`", "$"}:
+                return True
+            continue
+        if ch == "'":
+            in_single = True
+        elif ch == '"':
+            in_double = True
+        elif ch in {";", "|", "&", "<", ">", "(", ")", "`", "$", "{", "}", "*", "?", "["}:
+            return True
+    return False
+
+
 def _is_within_workspace(candidate: Path, workspace_root: Path) -> bool:
     resolved = Path(os.path.realpath(candidate))
     return resolved == workspace_root or resolved.is_relative_to(workspace_root)
 
 
 def _extract_candidate_paths(tokens: list[str]) -> list[str]:
+    """Extract all non-flag arguments plus paths embedded in flags or key=value pairs."""
     candidates: list[str] = []
-    for token in tokens:
-        if token.startswith("-") and "=" in token:
-            _, value = token.split("=", 1)
-            if value:
-                candidates.append(value)
-            continue
+    for token in tokens[1:]:
         if token.startswith("-"):
+            if "=" in token:
+                _, rhs = token.split("=", 1)
+                if rhs:
+                    candidates.append(rhs)
+                    if "=" in rhs:
+                        candidates.append(rhs.split("=", 1)[1])
+            elif len(token) > 2 and token[1] != "-":
+                attached = token[2:]
+                if attached.startswith(("/", "~", ".")) or "/" in attached:
+                    candidates.append(attached)
             continue
-        if (
-            token.startswith(("/", "~", "./", "../"))
-            or token in {"..", "~"}
-            or "/" in token
-        ):
-            candidates.append(token)
+
+        candidates.append(token)
+        if "=" in token:
+            _, rhs = token.split("=", 1)
+            if rhs:
+                candidates.append(rhs)
     return candidates
 
 
@@ -186,7 +187,7 @@ def _evaluate_git_tokens(args: list[str]) -> Layer1Decision:
     idx = 0
     while idx < len(args) and args[idx].startswith("-"):
         flag = args[idx].split("=", 1)[0]
-        if flag in _UNSAFE_GIT_GLOBAL_FLAGS:
+        if flag in _UNSAFE_GIT_GLOBAL_FLAGS or flag.startswith("-c"):
             return Layer1Decision(
                 verdict="escalate",
                 rule_id="GIT_MUTATING_OR_UNSAFE_FLAG",
@@ -297,7 +298,7 @@ class DeterministicCommandPolicy:
                 verdict="escalate",
                 rule_id="COMPOUND_OR_SUBSTITUTION_OPERATOR",
                 risk_hint="high",
-                reason="Shell chaining, pipe, redirection, or substitution requires audit.",
+                reason="Shell chaining, expansion, redirection, or substitution requires audit.",
             )
 
         try:
@@ -343,11 +344,18 @@ class DeterministicCommandPolicy:
             )
 
         if head == "./aigile":
+            if not _is_within_workspace(resolved_cwd / head, workspace_root):
+                return Layer1Decision(
+                    verdict="escalate",
+                    rule_id="OUTSIDE_WORKSPACE_PATH",
+                    risk_hint="high",
+                    reason="'./aigile' resolves outside active workspace.",
+                )
             return _evaluate_aigile_tokens(args)
 
-        if "/" in head:
+        if "/" in head or head.startswith((".", "~")):
             venv_bin = workspace_root / ".venv" / "bin"
-            resolved_exe = Path(os.path.realpath(resolved_cwd / head))
+            resolved_exe = Path(os.path.realpath(resolved_cwd / os.path.expanduser(head)))
             if resolved_exe.parent != venv_bin:
                 return Layer1Decision(
                     verdict="escalate",

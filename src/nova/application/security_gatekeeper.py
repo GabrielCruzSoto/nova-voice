@@ -75,6 +75,16 @@ class SecurityGatekeeper:
         """Expose event bus reference for orchestration wiring."""
         return self._event_bus
 
+    @property
+    def extra_secrets(self) -> tuple[str, ...]:
+        """Expose registered ephemeral session secrets for cross-component redaction."""
+        return tuple(self._extra_secrets)
+
+    @property
+    def pending_count(self) -> int:
+        """Current count of pending human command approvals."""
+        return len(self._pending)
+
     def register_ephemeral_secret(self, secret: str) -> None:
         """Register an ephemeral session token to scrub from all logs, events, and prompts."""
         if secret and secret not in self._extra_secrets:

@@ -359,3 +359,56 @@ async def test_fu2_fu3_chat_stream_secret_redaction_and_full_uuid4_correlation_i
     assert corr_id.startswith("corr-")
     parsed_uuid = uuid_mod.UUID(corr_id.removeprefix("corr-"))
     assert parsed_uuid.version == 4
+
+
+async def test_f7_orchestrator_redacts_gatekeeper_ephemeral_secrets_in_chat_stream(
+    tmp_path: Path,
+) -> None:
+    from nova.application.security_gatekeeper import SecurityGatekeeper
+    from nova.domain.models import CommandAuditInput, CommandAuditResult
+
+    class _NoopAuditor:
+        async def audit(self, request: CommandAuditInput) -> CommandAuditResult:
+            return CommandAuditResult(
+                risk_level="medium",
+                spoken_summary="Necesito aprobacion para este comando.",
+                technical_explanation=request.rule_id,
+                audited_by="deterministic_fallback",
+            )
+
+    root = tmp_path / "Proyectos"
+    repo = root / "f7-app"
+    repo.mkdir(parents=True)
+
+    bus = OrchestratorEventBus()
+    events: list[OrchestratorEvent] = []
+
+    async def collect(ev: OrchestratorEvent) -> None:
+        events.append(ev)
+
+    bus.subscribe(collect)
+    resolver = LocalWorkspaceResolver(allowed_roots=[root], event_bus=bus)
+    gatekeeper = SecurityGatekeeper(
+        workspace_resolver=resolver,
+        auditor=_NoopAuditor(),
+        event_bus=bus,
+    )
+    bare_ephemeral = "bare_ipc_token_value_88776655"
+    gatekeeper.register_ephemeral_secret(bare_ephemeral)
+
+    tier1 = _FakeTier1Client(chunks=[f"Salida accidental filtrando {bare_ephemeral} en texto."])
+    orchestrator = NovaOrchestrator(
+        workspace_resolver=resolver,
+        tier1_client=tier1,
+        tier2_runner=_FakeTier2Runner(),
+        event_bus=bus,
+        security_gatekeeper=gatekeeper,
+    )
+    await orchestrator.select_workspace(str(repo), mode="exact_path")
+    events.clear()
+
+    await orchestrator.handle_user_utterance("Consulta simple")
+    chat_events = [e for e in events if isinstance(e, ChatStreamEvent)]
+    assert len(chat_events) == 1
+    assert bare_ephemeral not in chat_events[0].delta
+    assert "<REDACTED:secret>" in chat_events[0].delta

@@ -22,6 +22,30 @@ def _emit(decision: str, reason: str | None = None) -> None:
     sys.stdout.flush()
 
 
+def _extract_effective_cwd(
+    hook_input: dict[str, Any],
+    tool_args: dict[str, Any],
+) -> str | None:
+    """Resolve effective execution directory prioritizing toolCall.args.Cwd (F2)."""
+    for key in ("Cwd", "cwd", "workingDirectory", "DirectoryPath"):
+        raw = tool_args.get(key)
+        if isinstance(raw, str) and raw.strip():
+            return raw.strip()
+
+    for key in ("cwd", "Cwd"):
+        raw_top = hook_input.get(key)
+        if isinstance(raw_top, str) and raw_top.strip():
+            return raw_top.strip()
+
+    workspace_paths = hook_input.get("workspacePaths")
+    if isinstance(workspace_paths, list) and workspace_paths:
+        first_ws = workspace_paths[0]
+        if isinstance(first_ws, str) and first_ws.strip():
+            return first_ws.strip()
+
+    return None
+
+
 def main() -> int:
     socket_path = os.environ.get("NOVA_GATEKEEPER_SOCKET", "").strip()
     if not socket_path:
@@ -37,16 +61,14 @@ def main() -> int:
         return 0
 
     tool_call = hook_input.get("toolCall")
-    tool_args = tool_call.get("args") if isinstance(tool_call, dict) else {}
-    command_line = (
-        tool_args.get("CommandLine", "") if isinstance(tool_args, dict) else ""
-    )
-    workspace_paths = hook_input.get("workspacePaths")
-    cwd = (
-        str(workspace_paths[0])
-        if isinstance(workspace_paths, list) and workspace_paths
-        else os.getcwd()
-    )
+    raw_args = tool_call.get("args") if isinstance(tool_call, dict) else None
+    tool_args: dict[str, Any] = raw_args if isinstance(raw_args, dict) else {}
+    command_line = tool_args.get("CommandLine", "")
+
+    effective_cwd = _extract_effective_cwd(hook_input, tool_args)
+    if effective_cwd is None:
+        _emit("deny", "GATEKEEPER_MISSING_CWD: Unable to determine target working directory.")
+        return 0
 
     ipc_request = {
         "protocol_version": "1.0",
@@ -55,7 +77,7 @@ def main() -> int:
         "source": "tier2_agy",
         "tool_name": "run_command",
         "command": str(command_line),
-        "cwd": cwd,
+        "cwd": effective_cwd,
     }
 
     try:

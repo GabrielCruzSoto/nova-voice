@@ -230,14 +230,15 @@ class UnixSocketGatekeeperServer:
             )
 
         try:
-            return await self._gatekeeper.evaluate_and_authorize(
-                CommandInterceptRequest(
+            return await self._await_authorization_or_disconnect(
+                reader=reader,
+                request=CommandInterceptRequest(
                     correlation_id=ipc_req.correlation_id,
                     source=ipc_req.source,
                     tool_name=ipc_req.tool_name,
                     command=ipc_req.command,
                     cwd=ipc_req.cwd,
-                )
+                ),
             )
         except GatekeeperError as exc:
             return CommandExecutionDecision(
@@ -246,3 +247,42 @@ class UnixSocketGatekeeperServer:
                 audit_id=None,
                 reason=f"{exc.code}: {exc.sanitized_message}",
             )
+
+    async def _await_authorization_or_disconnect(
+        self,
+        *,
+        reader: asyncio.StreamReader,
+        request: CommandInterceptRequest,
+    ) -> CommandExecutionDecision:
+        auth_task = asyncio.create_task(self._gatekeeper.evaluate_and_authorize(request))
+        eof_task = asyncio.create_task(reader.read(1))
+        try:
+            done, _ = await asyncio.wait(
+                {auth_task, eof_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            if auth_task in done:
+                return auth_task.result()
+
+            eof_bytes = eof_task.result()
+            if eof_bytes == b"":
+                auth_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await auth_task
+                return CommandExecutionDecision(
+                    allowed=False,
+                    verdict="invalid_request",
+                    audit_id=None,
+                    reason="GATEKEEPER_CLIENT_DISCONNECTED: IPC client closed socket early.",
+                )
+
+            return await auth_task
+        finally:
+            if not eof_task.done():
+                eof_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await eof_task
+            if not auth_task.done():
+                auth_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await auth_task

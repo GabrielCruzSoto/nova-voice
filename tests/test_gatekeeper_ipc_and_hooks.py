@@ -235,6 +235,39 @@ async def test_ac5_and_op5_agy_pre_tool_hook_standalone_and_connected(tmp_path: 
         assert parsed_deny["decision"] == "deny"
         assert "CATASTROPHIC" in parsed_deny["reason"]
 
+        # 4. F2 regression: toolCall.args.Cwd outside workspace MUST escalate (not auto-allow!)
+        outside_cwd_stdin = json.dumps(
+            {
+                "workspacePaths": [str(ws)],
+                "toolCall": {
+                    "name": "run_command",
+                    "args": {"CommandLine": "pytest -q", "Cwd": str(tmp_path)},
+                },
+            }
+        )
+        # Configure short approval timeout on a dedicated gatekeeper to observe fail-closed deny
+        short_gk = SecurityGatekeeper(
+            workspace_resolver=resolver,
+            auditor=_StubAuditor(),
+            event_bus=bus,
+            settings=GatekeeperSettings(approval_timeout_seconds=0.15),
+        )
+        async with UnixSocketGatekeeperServer(short_gk) as short_ipc:
+            short_env = {**clean_env, **short_ipc.child_env()}
+            proc_cwd_escape = await asyncio.create_subprocess_exec(
+                sys.executable,
+                str(hook_script),
+                cwd=str(plugin_dir),
+                env=short_env,
+                stdin=asyncio.subprocess.PIPE,
+                stdout=asyncio.subprocess.PIPE,
+            )
+            out_cwd_escape, _ = await proc_cwd_escape.communicate(
+                outside_cwd_stdin.encode("utf-8")
+            )
+            parsed_cwd_escape = json.loads(out_cwd_escape.decode("utf-8"))
+            assert parsed_cwd_escape["decision"] == "deny"
+
 
 @pytest.mark.asyncio
 async def test_cli_adapters_inject_gatekeeper_env_and_pi_extension(tmp_path: Path) -> None:
@@ -352,6 +385,9 @@ async def test_op5_pi_gatekeeper_ts_extension_executes_over_real_unix_socket(
 
     ws = tmp_path / "Proyectos" / "ts-ws"
     os.makedirs(ws, exist_ok=True)
+    outside_dir = tmp_path / "outside-target"
+    os.makedirs(outside_dir, exist_ok=True)
+    os.symlink(outside_dir, ws / "linked_out")
     bus = OrchestratorEventBus()
     resolver = LocalWorkspaceResolver(allowed_roots=[tmp_path / "Proyectos"], event_bus=bus)
     await resolver.resolve(
@@ -378,10 +414,29 @@ const fakePi = {{
 extFactory(fakePi);
 
 const ctx = {{ cwd: {json.dumps(str(ws))} }};
-const resWrite = await handler({{ toolName: "write", input: {{ path: "a.py" }} }}, ctx);
+const resWriteInside = await handler({{ toolName: "write", input: {{ path: "a.py" }} }}, ctx);
+const resReadOutside = await handler(
+  {{ toolName: "read", input: {{ path: "../../outside.txt" }} }},
+  ctx,
+);
+const resWriteHome = await handler(
+  {{ toolName: "write", input: {{ path: "~/.bashrc" }} }},
+  ctx,
+);
+const resWriteSymlinkDir = await handler(
+  {{ toolName: "write", input: {{ path: "linked_out/pwn.txt" }} }},
+  ctx,
+);
 const resSafe = await handler({{ toolName: "bash", input: {{ command: "pytest -q" }} }}, ctx);
 const resDeny = await handler({{ toolName: "bash", input: {{ command: "rm -rf /" }} }}, ctx);
-console.log(JSON.stringify({{ resWrite: resWrite ?? null, resSafe: resSafe ?? null, resDeny }}));
+console.log(JSON.stringify({{
+  resWriteInside: resWriteInside ?? null,
+  resReadOutside,
+  resWriteHome,
+  resWriteSymlinkDir,
+  resSafe: resSafe ?? null,
+  resDeny,
+}}));
 """,
         "utf-8",
     )
@@ -400,7 +455,65 @@ console.log(JSON.stringify({{ resWrite: resWrite ?? null, resSafe: resSafe ?? nu
         assert proc.returncode == 0, stderr_b.decode("utf-8", errors="replace")
 
     out = json.loads(stdout_b.decode("utf-8"))
-    assert out["resWrite"] is None
+    assert out["resWriteInside"] is None
+    assert out["resReadOutside"]["block"] is True
+    assert out["resWriteHome"]["block"] is True
+    assert out["resWriteSymlinkDir"]["block"] is True
     assert out["resSafe"] is None
     assert out["resDeny"]["block"] is True
     assert "CATASTROPHIC" in out["resDeny"]["reason"]
+
+
+@pytest.mark.asyncio
+async def test_f9_early_ipc_client_disconnect_releases_pending_approval_slot(
+    tmp_path: Path,
+) -> None:
+    ws = tmp_path / "Proyectos" / "f9-ws"
+    os.makedirs(ws, exist_ok=True)
+    bus = OrchestratorEventBus()
+    resolver = LocalWorkspaceResolver(allowed_roots=[tmp_path / "Proyectos"], event_bus=bus)
+    await resolver.resolve(
+        ResolveWorkspaceRequest(correlation_id="c-f9", query=str(ws), mode="exact_path")
+    )
+    gatekeeper = SecurityGatekeeper(
+        workspace_resolver=resolver,
+        auditor=_StubAuditor(),
+        event_bus=bus,
+        settings=GatekeeperSettings(approval_timeout_seconds=30.0, max_pending_approvals=1),
+    )
+
+    entered_pending = asyncio.Event()
+
+    async def on_event(ev: OrchestratorEvent) -> None:
+        if isinstance(ev, CommandApprovalRequestedEvent):
+            entered_pending.set()
+
+    bus.subscribe(on_event)
+
+    async with UnixSocketGatekeeperServer(gatekeeper) as ipc:
+        env = ipc.child_env()
+        _, writer = await asyncio.open_unix_connection(ipc.socket_path)
+        req_bytes = (
+            json.dumps(
+                {
+                    "protocol_version": "1.0",
+                    "token": env["NOVA_GATEKEEPER_TOKEN"],
+                    "correlation_id": "c-drop",
+                    "source": "tier1_pi",
+                    "tool_name": "bash",
+                    "command": "sudo whoami",
+                    "cwd": str(ws),
+                }
+            )
+            + "\n"
+        ).encode()
+        writer.write(req_bytes)
+        await writer.drain()
+        await asyncio.wait_for(entered_pending.wait(), timeout=2.0)
+
+        # Simulate abrupt client disconnect (e.g. barge-in abort)
+        writer.close()
+        await writer.wait_closed()
+        await asyncio.sleep(0.05)
+
+        assert gatekeeper.pending_count == 0

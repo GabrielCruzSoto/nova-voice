@@ -102,11 +102,17 @@ def classify_complexity(utterance: str) -> Literal["low", "high"]:
     return "low"
 
 
-def sanitize_for_voice(raw_text: str, fallback: str, max_words: int = 20) -> str:
+def sanitize_for_voice(
+    raw_text: str,
+    fallback: str,
+    max_words: int = 20,
+    extra_secrets: tuple[str, ...] = (),
+) -> str:
     """Strip code blocks and filesystem paths, returning a <=25-word spoken summary."""
     without_code = _CODE_BLOCK_RE.sub(" ", raw_text)
     without_paths = _PATH_TOKEN_RE.sub("archivo del proyecto", without_code)
-    cleaned = re.sub(r"[`*_#>]+", " ", redact_sensitive_text(without_paths))
+    redacted = redact_sensitive_text(without_paths, extra_secrets=extra_secrets)
+    cleaned = re.sub(r"[`*_#>]+", " ", redacted)
     words = [w for w in cleaned.split() if w]
     if not words:
         words = fallback.split()
@@ -133,6 +139,14 @@ class NovaOrchestrator:
         self._settings = settings or OrchestratorSettings()
         self._security_gatekeeper = security_gatekeeper
         self._tier2_conversations: dict[str, str] = {}
+
+    def _extra_secrets(self) -> tuple[str, ...]:
+        if self._security_gatekeeper is None:
+            return ()
+        return self._security_gatekeeper.extra_secrets
+
+    def _redact(self, text: str) -> str:
+        return redact_sensitive_text(text, extra_secrets=self._extra_secrets())
 
     async def select_workspace(
         self,
@@ -247,7 +261,7 @@ class NovaOrchestrator:
         collected: list[str] = []
         async with _closing_async_iter(self._tier1_client.stream_prompt(utterance)) as stream:
             async for delta in stream:
-                redacted_delta = redact_sensitive_text(delta)
+                redacted_delta = self._redact(delta)
                 collected.append(redacted_delta)
                 await self._event_bus.publish(
                     ChatStreamEvent(
@@ -265,6 +279,7 @@ class NovaOrchestrator:
                 summary_text=sanitize_for_voice(
                     joined,
                     fallback="Listo, complete la consulta en el proyecto.",
+                    extra_secrets=self._extra_secrets(),
                 ),
                 priority="normal",
             )
@@ -305,7 +320,7 @@ class NovaOrchestrator:
                     self._tier2_conversations[workspace_path] = progress.conversation_id
 
                 if progress.kind == "delta" and progress.text_delta:
-                    redacted_delta = redact_sensitive_text(progress.text_delta)
+                    redacted_delta = self._redact(progress.text_delta)
                     await self._event_bus.publish(
                         ChatStreamEvent(
                             correlation_id=correlation_id,
@@ -320,8 +335,9 @@ class NovaOrchestrator:
                             VoiceMilestoneEvent(
                                 correlation_id=correlation_id,
                                 summary_text=sanitize_for_voice(
-                                    progress.text_delta,
+                                    redacted_delta,
                                     fallback=f"Avanzando en etapa {progress.step_type}.",
+                                    extra_secrets=self._extra_secrets(),
                                 ),
                                 priority="normal",
                             )
@@ -343,7 +359,7 @@ class NovaOrchestrator:
                     )
                 elif progress.kind == "completed":
                     if progress.final_response:
-                        redacted_final = redact_sensitive_text(progress.final_response)
+                        redacted_final = self._redact(progress.final_response)
                         await self._event_bus.publish(
                             ChatStreamEvent(
                                 correlation_id=correlation_id,
@@ -353,8 +369,9 @@ class NovaOrchestrator:
                             )
                         )
                         final_summary = sanitize_for_voice(
-                            progress.final_response,
+                            redacted_final,
                             fallback=final_summary,
+                            extra_secrets=self._extra_secrets(),
                         )
 
         await self._event_bus.publish(

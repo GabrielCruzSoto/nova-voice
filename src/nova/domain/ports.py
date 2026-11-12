@@ -66,6 +66,11 @@ class CommandAuditorPort(Protocol):
 class SecurityGatekeeperPort(Protocol):
     """Abstract port for pre-execution command authorization and human approval."""
 
+    @property
+    def extra_secrets(self) -> tuple[str, ...]:
+        """Dynamic session secrets registered for universal stream redaction."""
+        ...
+
     async def evaluate_and_authorize(
         self,
         request: CommandInterceptRequest,

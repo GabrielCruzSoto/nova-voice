@@ -59,15 +59,21 @@ def test_ac1_safe_workspace_commands_return_allow(
     "catastrophic_cmd",
     [
         "rm -rf /",
+        "sudo rm -rf /",
+        "doas rm -rf /",
+        'rm -rf "/"',
+        "rm -rf ~/",
         "rm -fr /*",
         "rm -rf ~",
         "rm -rf $HOME",
         "rm --recursive --force /",
         "pytest -q && rm -rf /",
         "mkfs.ext4 /dev/sda1",
+        "sudo mkfs.ext4 /dev/sda1",
         "dd if=/dev/zero of=/dev/nvme0n1 bs=1M",
         "shred -u /dev/sda",
         "chmod -R 777 /",
+        "chmod 777 -R /",
         ":(){ :|:& };:",
     ],
 )
@@ -94,6 +100,9 @@ def test_ac2_catastrophic_commands_return_hard_deny(
         ("git status && whoami", "COMPOUND_OR_SUBSTITUTION"),
         ("echo $(whoami)", "COMPOUND_OR_SUBSTITUTION"),
         ('echo "$(whoami)"', "COMPOUND_OR_SUBSTITUTION"),
+        ("cat $HOME/.ssh/id_rsa", "COMPOUND_OR_SUBSTITUTION"),
+        ("pytest $TMPDIR/evil_test.py", "COMPOUND_OR_SUBSTITUTION"),
+        ("cat {.,..}/secret.txt", "COMPOUND_OR_SUBSTITUTION"),
         ("ls `id`", "COMPOUND_OR_SUBSTITUTION"),
         ("cat src/app.py > /tmp/out.txt", "COMPOUND_OR_SUBSTITUTION"),
         ("ls\nwhoami", "CONTROL_CHARACTER"),
@@ -106,6 +115,8 @@ def test_ac2_catastrophic_commands_return_hard_deny(
         ("chmod 755 aigile", "SENSITIVE_BINARY"),
         ("./aigile harness clean", "AIGILE_MUTATING_SUBCOMMAND"),
         ("cat ../../etc/passwd", "OUTSIDE_WORKSPACE_PATH"),
+        ("pytest -c/tmp/outside_pyproject.toml", "OUTSIDE_WORKSPACE_PATH"),
+        ("pytest -o testpaths=/tmp/outside_tests", "OUTSIDE_WORKSPACE_PATH"),
         ("ls /etc", "OUTSIDE_WORKSPACE_PATH"),
         ("ls ~/Desktop", "OUTSIDE_WORKSPACE_PATH"),
         ("python3 -c 'print(1)'", "UNLISTED_COMMAND"),
@@ -134,15 +145,18 @@ def test_symlink_escape_inside_workspace_escalates(
     outside_file.write_text("synthetic-data", encoding="utf-8")
     escape_link = workspace_dir / "src" / "linked.txt"
     escape_link.symlink_to(outside_file)
+    direct_cwd_link = workspace_dir / "escape_in_cwd.txt"
+    direct_cwd_link.symlink_to(outside_file)
 
     policy = DeterministicCommandPolicy()
-    decision = policy.evaluate(
-        command="cat src/linked.txt",
-        cwd=str(workspace_dir),
-        workspace_canonical_path=str(workspace_dir),
-    )
-    assert decision.verdict == "escalate"
-    assert decision.rule_id == "OUTSIDE_WORKSPACE_PATH"
+    for cmd in ("cat src/linked.txt", "cat escape_in_cwd.txt"):
+        decision = policy.evaluate(
+            command=cmd,
+            cwd=str(workspace_dir),
+            workspace_canonical_path=str(workspace_dir),
+        )
+        assert decision.verdict == "escalate"
+        assert decision.rule_id == "OUTSIDE_WORKSPACE_PATH"
 
 
 def test_cwd_outside_workspace_escalates(workspace_dir: Path, tmp_path: Path) -> None:
