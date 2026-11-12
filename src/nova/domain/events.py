@@ -1,22 +1,28 @@
-"""Domain events and asynchronous OrchestratorEventBus (NOVA-001 OP-4 & NOVA-002 OP-4)."""
+"""Domain events and asynchronous OrchestratorEventBus (NOVA-001..NOVA-003 OP-4)."""
 
 from __future__ import annotations
 
+import json
+import logging
 from collections.abc import Awaitable, Callable
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from nova.domain.errors import redact_sensitive_text
 from nova.domain.models import (
     MAX_SPOKEN_WORDS,
     AuditRiskLevel,
+    CallSessionState,
     CommandSource,
     DecisionVerdict,
+    InferenceDevice,
     utc_now_iso,
     validate_spoken_word_budget,
 )
 
 MAX_VOICE_MILESTONE_WORDS = MAX_SPOKEN_WORDS
+_bus_logger = logging.getLogger("nova.event_bus")
 
 
 class WorkspaceChangedEvent(BaseModel):
@@ -59,7 +65,7 @@ class VoiceMilestoneEvent(BaseModel):
 
 
 class RunnerFailureEvent(BaseModel):
-    """Sanitized failure event emitted when Tier 1 or Tier 2 fails."""
+    """Sanitized failure event emitted when Tier 1, Tier 2, or Voice pipeline fails."""
 
     model_config = ConfigDict(frozen=True, extra="ignore")
 
@@ -119,6 +125,32 @@ class CommandApprovalResolvedEvent(BaseModel):
     timestamp: str = Field(default_factory=utc_now_iso)
 
 
+class CallStateChangedEvent(BaseModel):
+    """Published whenever CallSession transitions across standby/listening/speaking/etc."""
+
+    model_config = ConfigDict(frozen=True, extra="ignore")
+
+    call_id: str = Field(min_length=1)
+    correlation_id: str = Field(min_length=1)
+    previous_state: CallSessionState
+    state: CallSessionState
+    reason: str = Field(min_length=1)
+    timestamp: str = Field(default_factory=utc_now_iso)
+
+
+class VoiceTranscriptionEvent(BaseModel):
+    """Published when local SpeechToTextPort completes a sanitized Spanish transcription."""
+
+    model_config = ConfigDict(frozen=True, extra="ignore")
+
+    call_id: str = Field(min_length=1)
+    correlation_id: str = Field(min_length=1)
+    sanitized_text: str = Field(min_length=1)
+    backend_device: InferenceDevice
+    duration_ms: float = Field(ge=0.0)
+    timestamp: str = Field(default_factory=utc_now_iso)
+
+
 OrchestratorEvent = (
     WorkspaceChangedEvent
     | ChatStreamEvent
@@ -127,21 +159,43 @@ OrchestratorEvent = (
     | CommandBlockedEvent
     | CommandApprovalRequestedEvent
     | CommandApprovalResolvedEvent
+    | CallStateChangedEvent
+    | VoiceTranscriptionEvent
 )
 EventSubscriber = Callable[[OrchestratorEvent], Awaitable[None]]
 
 
 class OrchestratorEventBus:
-    """In-memory asynchronous pub/sub bus for Nova domain events."""
+    """In-memory asynchronous pub/sub bus with per-subscriber fault isolation."""
 
     def __init__(self) -> None:
         self._subscribers: list[EventSubscriber] = []
 
     def subscribe(self, subscriber: EventSubscriber) -> None:
         """Register an async event subscriber."""
-        self._subscribers.append(subscriber)
+        if subscriber not in self._subscribers:
+            self._subscribers.append(subscriber)
+
+    def unsubscribe(self, subscriber: EventSubscriber) -> None:
+        """Idempotently remove a previously registered async event subscriber."""
+        self._subscribers = [sub for sub in self._subscribers if sub != subscriber]
 
     async def publish(self, event: OrchestratorEvent) -> None:
-        """Deliver event sequentially to all registered async subscribers."""
+        """Deliver event sequentially to all subscribers, isolating individual Exceptions."""
         for subscriber in list(self._subscribers):
-            await subscriber(event)
+            try:
+                await subscriber(event)
+            except Exception as exc:
+                safe_error = redact_sensitive_text(str(exc))
+                _bus_logger.error(
+                    json.dumps(
+                        {
+                            "error": safe_error,
+                            "event": "event_bus_subscriber_error",
+                            "event_type": type(event).__name__,
+                            "subscriber": getattr(subscriber, "__qualname__", repr(subscriber)),
+                        },
+                        ensure_ascii=False,
+                        sort_keys=True,
+                    )
+                )

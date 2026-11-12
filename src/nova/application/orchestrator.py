@@ -2,12 +2,14 @@
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import inspect
 import json
 import logging
 import re
 import uuid
+import weakref
 from collections.abc import AsyncIterator
 from typing import Literal
 
@@ -148,6 +150,9 @@ class NovaOrchestrator:
         self._settings = settings or OrchestratorSettings()
         self._security_gatekeeper = security_gatekeeper
         self._tier2_conversations: dict[str, str] = {}
+        self._turn_lock = asyncio.Lock()
+        self._active_turn_task: asyncio.Task[None] | None = None
+        self._barge_in_cancelled: weakref.WeakSet[asyncio.Task[None]] = weakref.WeakSet()
 
     def _extra_secrets(self) -> tuple[str, ...]:
         if self._security_gatekeeper is None:
@@ -168,32 +173,33 @@ class NovaOrchestrator:
     ) -> WorkspaceContext:
         """Resolve, activate, and announce a target project directory."""
         corr_id = correlation_id or f"corr-{uuid.uuid4()}"
-        context = await self._workspace_resolver.resolve(
-            ResolveWorkspaceRequest(
-                correlation_id=corr_id,
-                query=query,
-                mode=mode,
+        async with self._turn_lock:
+            context = await self._workspace_resolver.resolve(
+                ResolveWorkspaceRequest(
+                    correlation_id=corr_id,
+                    query=query,
+                    mode=mode,
+                )
             )
-        )
-        await self._tier1_client.switch_workspace(context.canonical_path)
-        self._log(
-            "workspace_selected",
-            correlation_id=corr_id,
-            workspace_id=context.workspace_id,
-            workspace_name=context.name,
-        )
-        await self._event_bus.publish(
-            VoiceMilestoneEvent(
+            await self._tier1_client.switch_workspace(context.canonical_path)
+            self._log(
+                "workspace_selected",
                 correlation_id=corr_id,
-                summary_text=sanitize_for_voice(
-                    f"Proyecto activo cambiado a {context.name}.",
-                    fallback="Proyecto activo actualizado.",
-                    extra_secrets=self._extra_secrets(),
-                ),
-                priority="normal",
+                workspace_id=context.workspace_id,
+                workspace_name=context.name,
             )
-        )
-        return context
+            await self._event_bus.publish(
+                VoiceMilestoneEvent(
+                    correlation_id=corr_id,
+                    summary_text=sanitize_for_voice(
+                        f"Proyecto activo cambiado a {context.name}.",
+                        fallback="Proyecto activo actualizado.",
+                        extra_secrets=self._extra_secrets(),
+                    ),
+                    priority="normal",
+                )
+            )
+            return context
 
     async def handle_user_utterance(
         self,
@@ -202,13 +208,38 @@ class NovaOrchestrator:
     ) -> None:
         """Route a user utterance by complexity and emit synchronized Chat + Voice events."""
         corr_id = correlation_id or f"corr-{uuid.uuid4()}"
-        active_ws = self._workspace_resolver.active_context
-        if active_ws is None:
-            raise WorkspaceResolutionError(
-                code="WORKSPACE_NOT_FOUND",
-                message="No active workspace selected before handling utterance.",
-            )
+        async with self._turn_lock:
+            active_ws = self._workspace_resolver.active_context
+            if active_ws is None:
+                raise WorkspaceResolutionError(
+                    code="WORKSPACE_NOT_FOUND",
+                    message="No active workspace selected before handling utterance.",
+                )
 
+            turn_task = asyncio.create_task(
+                self._execute_utterance(utterance, active_ws, corr_id)
+            )
+            self._active_turn_task = turn_task
+            try:
+                await turn_task
+            except asyncio.CancelledError:
+                if turn_task in self._barge_in_cancelled:
+                    self._log("utterance_aborted_by_barge_in", correlation_id=corr_id)
+                    return
+                turn_task.cancel()
+                with contextlib.suppress(asyncio.CancelledError):
+                    await turn_task
+                raise
+            finally:
+                if self._active_turn_task is turn_task:
+                    self._active_turn_task = None
+
+    async def _execute_utterance(
+        self,
+        utterance: str,
+        active_ws: WorkspaceContext,
+        corr_id: str,
+    ) -> None:
         tier = classify_complexity(utterance)
         self._log(
             "utterance_routed",
@@ -250,7 +281,14 @@ class NovaOrchestrator:
     async def barge_in(self) -> None:
         """Interrupt active speech/agent turn immediately on user voice activity."""
         self._log("barge_in_triggered")
+        turn_task = self._active_turn_task
+        if turn_task is not None and not turn_task.done():
+            self._barge_in_cancelled.add(turn_task)
+            turn_task.cancel()
         await self._tier1_client.barge_in_abort()
+        if turn_task is not None and not turn_task.done():
+            with contextlib.suppress(TimeoutError, asyncio.CancelledError):
+                await asyncio.wait_for(asyncio.shield(turn_task), timeout=0.05)
 
     async def resolve_command_approval(
         self,

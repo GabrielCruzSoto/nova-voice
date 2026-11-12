@@ -28,8 +28,14 @@ def redact_sensitive_text(message: str, extra_secrets: tuple[str, ...] = ()) -> 
 class NovaDomainError(Exception):
     """Base domain error with a machine-readable contract code and redacted message."""
 
-    def __init__(self, code: str, message: str) -> None:
-        redacted = redact_sensitive_text(message)
+    def __init__(
+        self,
+        code: str,
+        message: str,
+        *,
+        extra_secrets: tuple[str, ...] = (),
+    ) -> None:
+        redacted = redact_sensitive_text(message, extra_secrets=extra_secrets)
         super().__init__(redacted)
         self.code = code
         self.sanitized_message = redacted
@@ -68,3 +74,7 @@ class ApprovalNotFoundError(GatekeeperError):
             code="GATEKEEPER_APPROVAL_NOT_FOUND",
             message=f"Pending command approval '{audit_id}' was not found or already expired.",
         )
+
+
+class VoicePipelineError(NovaDomainError):
+    """Raised when an audio stream, wake-word, VAD, STT, or TTS operation fails (NOVA-003)."""
