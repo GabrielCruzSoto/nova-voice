@@ -3,13 +3,14 @@
  * Holds CSRF token strictly in private JS memory, manages SSE + fetch lifecycle via
  * AbortController, and delegates rendering to pure components.ts functions.
  */
-import { escapeHtml, renderAppShell, renderApprovalBanner, renderCallControls, renderChatTimeline, renderNovaReactiveOrb, renderWorkspaceBar, } from "./components.js";
+import { escapeHtml, renderAppShell, renderApprovalBanner, renderCallControls, renderChatTimeline, renderNovaReactiveOrb, renderNovaSquircleSvg, renderSinusoidalWave, renderWorkspaceBar, } from "./components.js";
 const MAX_CLIENT_MESSAGES = 200;
 export class DesktopAppController {
     #csrfToken = "";
     #abortController = new AbortController();
     #disposed = false;
     #shellMounted = false;
+    #sleepTimer = null;
     #fetch;
     #root;
     #onRender;
@@ -75,6 +76,10 @@ export class DesktopAppController {
             return;
         }
         this.#disposed = true;
+        if (this.#sleepTimer) {
+            clearTimeout(this.#sleepTimer);
+            this.#sleepTimer = null;
+        }
         this.#csrfToken = "";
         this.#abortController.abort();
     }
@@ -311,6 +316,7 @@ export class DesktopAppController {
                     active_correlation_id: env.correlation_id,
                 },
             });
+            this.#resetSleepTimer();
             return;
         }
         if (env.event_type === "chat_stream") {
@@ -382,6 +388,24 @@ export class DesktopAppController {
     #appendMessage(msg) {
         const next = [...this.#model.messages, msg].slice(-MAX_CLIENT_MESSAGES);
         this.#updateModel({ status: "success", messages: next });
+        this.#resetSleepTimer();
+    }
+    #resetSleepTimer() {
+        if (this.#sleepTimer) {
+            clearTimeout(this.#sleepTimer);
+            this.#sleepTimer = null;
+        }
+        const state = this.#model.callSession.state;
+        if (state !== "standby" && state !== "closed") {
+            this.#sleepTimer = setTimeout(() => {
+                if (this.#disposed) {
+                    return;
+                }
+                if (this.#model.callSession.state !== "standby" && this.#model.callSession.state !== "closed") {
+                    void this.triggerCallAction("end");
+                }
+            }, 12000);
+        }
     }
     #updateModel(patch) {
         this.#model = { ...this.#model, ...patch };
@@ -427,6 +451,38 @@ export class DesktopAppController {
             timelineSlot.innerHTML = renderChatTimeline(this.#model.status, this.#model.messages, this.#model.errorBanner);
             timelineSlot.scrollTop = timelineSlot.scrollHeight;
         }
+        const waveSlot = this.#root.querySelector('[data-slot="wave"]');
+        if (waveSlot) {
+            waveSlot.innerHTML = renderSinusoidalWave(this.#model.callSession.state);
+        }
+        const headerSlot = this.#root.querySelector('[data-slot="panel-header"]');
+        if (headerSlot) {
+            const isStandby = this.#model.callSession.state === "standby" || this.#model.callSession.state === "closed";
+            const uiMode = this.#model.uiMode ?? "panel";
+            headerSlot.innerHTML = `
+        <div class="panel-header-brand">
+          ${renderNovaSquircleSvg(32, !isStandby)}
+          <span class="panel-brand-text">NOVA</span>
+          ${isStandby
+                ? `<span class="panel-standby-badge">EN REPOSO <span class="status-dot status-dot--off"></span></span>`
+                : `<span class="status-dot status-dot--on" title="Conectado y escuchando"></span>`}
+        </div>
+        <button
+          type="button"
+          class="btn-toggle-view"
+          data-action="toggle-ui-mode"
+          title="Alternar entre panel y orbe flotante"
+          aria-label="Alternar vista compacta de orbe"
+        >
+          ${uiMode === "orb" ? "Ampliar panel" : "Modo widget"}
+        </button>
+      `.trim();
+        }
+        const layoutEl = this.#root.querySelector(".nova-layout");
+        if (layoutEl) {
+            layoutEl.dataset["uiMode"] = this.#model.uiMode ?? "panel";
+            layoutEl.dataset["callState"] = this.#model.callSession.state;
+        }
     }
     #bindDomEvents() {
         const root = this.#root;
@@ -440,7 +496,15 @@ export class DesktopAppController {
                 return;
             }
             const action = target.dataset["action"];
-            if (action === "call-start") {
+            if (action === "toggle-ui-mode") {
+                if (this.#model.callSession.state === "standby" ||
+                    this.#model.callSession.state === "closed") {
+                    void this.triggerCallAction("start");
+                }
+                const nextMode = (this.#model.uiMode ?? "panel") === "orb" ? "panel" : "orb";
+                this.#updateModel({ uiMode: nextMode });
+            }
+            else if (action === "call-start") {
                 void this.triggerCallAction("start");
             }
             else if (action === "call-end") {

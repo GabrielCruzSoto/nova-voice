@@ -465,6 +465,48 @@ class VoiceCallCoordinator:
                         speech_run = 0
                         silence_run = 0
                         barge_in_run = 0
+                        continue
+
+                    # Hybrid acoustic + VAD/STT keyword spotter for "Oye Nova" / "Nova"
+                    prob = await self._vad.speech_probability(frame)
+                    if prob >= self._settings.speech_threshold:
+                        utterance_buf.extend(frame.pcm_s16le)
+                        silence_run = 0
+                        if len(utterance_buf) >= 32000:  # ~1 second of speech
+                            res = await self._stt.transcribe(bytes(utterance_buf))
+                            cleaned_txt = res.text.lower().strip()
+                            logger.info("Standby spotter (chunk) heard: '%s'", cleaned_txt)
+                            if any(k in cleaned_txt for k in ("nova", "oye", "hola", "hey")):
+                                logger.info("Wake word activated via STT: '%s'", cleaned_txt)
+                                await self.start_call(reason="wake_word_transcribed")
+                                seen_reset_epoch = self._capture_reset_epoch
+                                pre_roll.clear()
+                                utterance_buf.clear()
+                                in_speech = True
+                                speech_started_at = self._clock()
+                                speech_run = 0
+                                silence_run = 0
+                                continue
+                            utterance_buf.clear()
+                    elif utterance_buf:
+                        silence_run += 1
+                        if silence_run >= 8:
+                            if len(utterance_buf) >= 8000:
+                                res = await self._stt.transcribe(bytes(utterance_buf))
+                                cleaned_txt = res.text.lower().strip()
+                                logger.info("Standby spotter (pause) heard: '%s'", cleaned_txt)
+                                if any(k in cleaned_txt for k in ("nova", "oye", "hola", "hey")):
+                                    logger.info("Wake word activated via STT: '%s'", cleaned_txt)
+                                    await self.start_call(reason="wake_word_transcribed")
+                                    seen_reset_epoch = self._capture_reset_epoch
+                                    pre_roll.clear()
+                                    utterance_buf.clear()
+                                    in_speech = False
+                                    speech_run = 0
+                                    silence_run = 0
+                                    continue
+                            utterance_buf.clear()
+                            silence_run = 0
                     continue
 
                 # Active call states: speaking, thinking, executing -> monitor for <100 ms barge-in

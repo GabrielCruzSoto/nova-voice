@@ -54,7 +54,7 @@ from nova.domain.ports import FolderPickerPort
 
 logger = logging.getLogger("nova.desktop_launcher")
 
-BrowserPreference = Literal["auto", "xdg-open", "firefox"]
+BrowserPreference = Literal["auto", "xdg-open", "firefox", "webview", "window"]
 TtsEngineChoice = Literal["kokoro", "piper"]
 
 _LOOPBACK_BROWSER_URL_RE = re.compile(r"^http://127\.0\.0\.1:[1-9][0-9]{0,4}/?$")
@@ -308,7 +308,9 @@ async def open_local_browser_window(
         return False
 
     argv: tuple[str, ...] | None = None
-    if preference == "firefox":
+    if preference in ("webview", "window"):
+        argv = (sys.executable, "-m", "nova.adapters.desktop_window", cleaned_url)
+    elif preference == "firefox":
         ff_bin = which_resolver("firefox")
         if ff_bin:
             argv = (ff_bin, "--new-window", cleaned_url)
@@ -643,9 +645,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--browser",
-        choices=("auto", "xdg-open", "firefox"),
+        choices=("auto", "xdg-open", "firefox", "webview", "window"),
         default="auto",
-        help="Browser launcher preference when opening the local UI.",
+        help="Browser or native desktop window launcher preference when opening the local UI.",
     )
     parser.add_argument(
         "--no-voice",
@@ -737,7 +739,40 @@ def build_arg_parser() -> argparse.ArgumentParser:
 def config_from_namespace(ns: argparse.Namespace) -> NovaDesktopConfig:
     """Convert parsed CLI namespace into a validated `NovaDesktopConfig`."""
     roots = tuple(ns.allowed_roots) if ns.allowed_roots else _default_allowed_roots()
+    repo_models_dir = Path(__file__).resolve().parents[3] / "models"
+
     wake_models = tuple(ns.wakeword_models) if ns.wakeword_models else ()
+    if not wake_models:
+        default_ww = repo_models_dir / "oye_nova.onnx"
+        if default_ww.is_file():
+            wake_models = (str(default_ww),)
+
+    vad_model = ns.silero_vad_model
+    if not vad_model:
+        default_vad = repo_models_dir / "silero_vad.onnx"
+        if default_vad.is_file():
+            vad_model = str(default_vad)
+
+    tts_engine = ns.tts_engine
+    piper_model = ns.piper_model
+    if not piper_model:
+        default_piper = repo_models_dir / "es_ES-davefx-medium.onnx"
+        if default_piper.is_file():
+            piper_model = str(default_piper)
+            if tts_engine == "kokoro" and not ns.kokoro_model:
+                tts_engine = "piper"
+
+    piper_bin = ns.piper_binary
+    if piper_bin == "piper" and shutil.which("piper") is None:
+        venv_piper = Path(sys.executable).parent / "piper"
+        if venv_piper.is_file() and os.access(venv_piper, os.X_OK):
+            piper_bin = str(venv_piper)
+
+    whisper_model = ns.whisper_model
+    whisper_dev = ns.whisper_device
+    if whisper_dev == "cuda" and not shutil.which("nvidia-smi"):
+        whisper_dev = "cpu"
+
     return NovaDesktopConfig(
         port=int(ns.port),
         allowed_roots=roots,
@@ -752,14 +787,14 @@ def config_from_namespace(ns: argparse.Namespace) -> NovaDesktopConfig:
         agy_executable=ns.agy_executable,
         tier2_model=ns.tier2_model,
         wakeword_models=wake_models,
-        silero_vad_model_path=ns.silero_vad_model,
-        whisper_model=ns.whisper_model,
-        whisper_device=ns.whisper_device,
-        tts_engine=ns.tts_engine,
+        silero_vad_model_path=vad_model,
+        whisper_model=whisper_model,
+        whisper_device=whisper_dev,
+        tts_engine=tts_engine,
         kokoro_model_path=ns.kokoro_model,
         kokoro_voices_path=ns.kokoro_voices,
-        piper_binary=ns.piper_binary,
-        piper_model_path=ns.piper_model,
+        piper_binary=piper_bin,
+        piper_model_path=piper_model,
     )
 
 

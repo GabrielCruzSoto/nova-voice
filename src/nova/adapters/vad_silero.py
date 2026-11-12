@@ -65,18 +65,35 @@ class _OnnxSileroVadBackend:
                 code="VOICE_MODEL_UNAVAILABLE",
                 message=f"Failed to load Silero VAD ONNX session: {exc}",
             ) from exc
-        self._state: Any = self._np.zeros((2, 1, 128), dtype=self._np.float32)
+        input_names = {inp.name for inp in self._session.get_inputs()}
+        self._is_v4 = "h" in input_names and "c" in input_names
+        if self._is_v4:
+            self._h: Any = self._np.zeros((2, 1, 64), dtype=self._np.float32)
+            self._c: Any = self._np.zeros((2, 1, 64), dtype=self._np.float32)
+        else:
+            self._state: Any = self._np.zeros((2, 1, 128), dtype=self._np.float32)
 
     def score_samples(self, samples: list[float], sample_rate_hz: int) -> float:
         x = self._np.asarray([samples], dtype=self._np.float32)
         sr = self._np.asarray(sample_rate_hz, dtype=self._np.int64)
-        ort_inputs = {"input": x, "state": self._state, "sr": sr}
-        out, new_state = self._session.run(None, ort_inputs)
-        self._state = new_state
-        return float(out[0][0])
+        if self._is_v4:
+            ort_inputs = {"input": x, "sr": sr, "h": self._h, "c": self._c}
+            out, hn, cn = self._session.run(None, ort_inputs)
+            self._h = hn
+            self._c = cn
+            return float(out[0][0])
+        else:
+            ort_inputs = {"input": x, "state": self._state, "sr": sr}
+            out, new_state = self._session.run(None, ort_inputs)
+            self._state = new_state
+            return float(out[0][0])
 
     def reset(self) -> None:
-        self._state = self._np.zeros((2, 1, 128), dtype=self._np.float32)
+        if self._is_v4:
+            self._h = self._np.zeros((2, 1, 64), dtype=self._np.float32)
+            self._c = self._np.zeros((2, 1, 64), dtype=self._np.float32)
+        else:
+            self._state = self._np.zeros((2, 1, 128), dtype=self._np.float32)
 
 
 class SileroVadSettings(BaseModel):

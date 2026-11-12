@@ -364,6 +364,14 @@ async def test_s4_open_local_browser_window_enforces_loopback_and_shell_false() 
     )
     assert opened_ff is True
     assert spawned == [("/usr/bin/firefox", "--new-window", "http://127.0.0.1:8765")]
+    opened_webview = await open_local_browser_window(
+        "http://127.0.0.1:8765",
+        preference="webview",
+        env={"WAYLAND_DISPLAY": "wayland-0"},
+        spawner=_fake_spawner,
+    )
+    assert opened_webview is True
+    assert spawned[-1] == (sys.executable, "-m", "nova.adapters.desktop_window", "http://127.0.0.1:8765")
 
 
 async def test_ac6_python_m_nova_cli_starts_and_exits_cleanly_on_sigterm(
