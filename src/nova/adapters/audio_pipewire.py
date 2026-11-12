@@ -235,6 +235,22 @@ class PipeWireAudioAdapter:
             maxsize=self._settings.max_frame_queue
         )
         self._capture_queue = queue
+        stderr_tail = bytearray()
+
+        async def _drain_stderr_continuously() -> None:
+            stderr = proc.stderr
+            if stderr is None:
+                return
+            with contextlib.suppress(OSError, asyncio.CancelledError):
+                while not self._stopping_capture:
+                    chunk = await stderr.read(2048)
+                    if not chunk:
+                        break
+                    stderr_tail.extend(chunk)
+                    if len(stderr_tail) > 2048:
+                        del stderr_tail[:-2048]
+
+        stderr_task = asyncio.create_task(_drain_stderr_continuously())
 
         async def _pump_stdout() -> None:
             buf = bytearray()
@@ -264,8 +280,13 @@ class PipeWireAudioAdapter:
                         self._enqueue_bounded(queue, frame)
 
                 rc = await proc.wait()
+                with contextlib.suppress(TimeoutError, asyncio.CancelledError):
+                    await asyncio.wait_for(stderr_task, timeout=0.05)
                 if not self._stopping_capture and rc != 0:
-                    stderr_msg = await self._read_bounded_stderr(proc)
+                    stderr_msg = (
+                        bytes(stderr_tail).decode("utf-8", errors="replace").strip()
+                        or "audio stream terminated"
+                    )
                     self._enqueue_bounded(
                         queue,
                         VoicePipelineError(
@@ -290,6 +311,11 @@ class PipeWireAudioAdapter:
                         )
                     )
                     self._enqueue_bounded(queue, wrapped)
+            finally:
+                if not stderr_task.done():
+                    stderr_task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await stderr_task
 
         self._capture_reader_task = asyncio.create_task(_pump_stdout())
         try:

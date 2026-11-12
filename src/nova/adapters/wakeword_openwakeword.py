@@ -107,7 +107,16 @@ class OpenWakeWordAdapter:
                 factory = self._predictor_factory or (
                     lambda: _OpenWakeWordRuntimeBackend(self._settings.model_paths)
                 )
-                self._backend = await asyncio.to_thread(factory)
+                try:
+                    self._backend = await asyncio.wait_for(
+                        asyncio.to_thread(factory),
+                        timeout=self._settings.inference_timeout_seconds,
+                    )
+                except TimeoutError as exc:
+                    raise VoicePipelineError(
+                        code="VOICE_MODEL_UNAVAILABLE",
+                        message="Timed out while loading local OpenWakeWord model.",
+                    ) from exc
             return self._backend
 
     async def detect(self, frame: AudioFrame) -> WakeWordDetection:

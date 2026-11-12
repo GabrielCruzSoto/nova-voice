@@ -135,21 +135,32 @@ class FasterWhisperSttAdapter:
 
             if self._settings.preferred_device == "cuda":
                 try:
-                    self._model = await asyncio.to_thread(self._instantiate_sync, "cuda")
+                    self._model = await asyncio.wait_for(
+                        asyncio.to_thread(self._instantiate_sync, "cuda"),
+                        timeout=self._settings.timeout_seconds,
+                    )
                     self._active_device = "cuda"
                     return self._model, "cuda"
                 except VoicePipelineError:
                     raise
-                except (RuntimeError, OSError, ValueError):
-                    # Automatic fallback to CPU/int8 when CUDA runtime or VRAM fails
+                except (TimeoutError, RuntimeError, OSError, ValueError):
+                    # Automatic fallback to CPU/int8 when CUDA runtime or VRAM fails/hangs
                     pass
 
             try:
-                self._model = await asyncio.to_thread(self._instantiate_sync, "cpu")
+                self._model = await asyncio.wait_for(
+                    asyncio.to_thread(self._instantiate_sync, "cpu"),
+                    timeout=self._settings.timeout_seconds,
+                )
                 self._active_device = "cpu"
                 return self._model, "cpu"
             except VoicePipelineError:
                 raise
+            except TimeoutError as exc:
+                raise VoicePipelineError(
+                    code="VOICE_TRANSCRIPTION_TIMEOUT",
+                    message="Timed out while loading local faster-whisper model.",
+                ) from exc
             except Exception as exc:
                 raise VoicePipelineError(
                     code="VOICE_MODEL_UNAVAILABLE",
@@ -159,11 +170,19 @@ class FasterWhisperSttAdapter:
     async def _fallback_to_cpu_model(self) -> tuple[WhisperModelProtocol, InferenceDevice]:
         async with self._load_lock:
             try:
-                self._model = await asyncio.to_thread(self._instantiate_sync, "cpu")
+                self._model = await asyncio.wait_for(
+                    asyncio.to_thread(self._instantiate_sync, "cpu"),
+                    timeout=self._settings.timeout_seconds,
+                )
                 self._active_device = "cpu"
                 return self._model, "cpu"
             except VoicePipelineError:
                 raise
+            except TimeoutError as exc:
+                raise VoicePipelineError(
+                    code="VOICE_TRANSCRIPTION_TIMEOUT",
+                    message="Timed out during CUDA->CPU fallback initialization.",
+                ) from exc
             except Exception as exc:
                 raise VoicePipelineError(
                     code="VOICE_MODEL_UNAVAILABLE",

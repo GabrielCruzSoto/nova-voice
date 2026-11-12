@@ -189,7 +189,16 @@ class LocalOnnxTtsAdapter:
         async with self._load_lock:
             if self._kokoro is None:
                 factory = self._kokoro_factory or self._build_default_kokoro
-                self._kokoro = await asyncio.to_thread(factory)
+                try:
+                    self._kokoro = await asyncio.wait_for(
+                        asyncio.to_thread(factory),
+                        timeout=self._settings.timeout_seconds,
+                    )
+                except TimeoutError as exc:
+                    raise VoicePipelineError(
+                        code="VOICE_TTS_TIMEOUT",
+                        message="Timed out while loading local Kokoro ONNX model.",
+                    ) from exc
             return self._kokoro
 
     async def synthesize(self, text: str) -> SynthesizedAudio:

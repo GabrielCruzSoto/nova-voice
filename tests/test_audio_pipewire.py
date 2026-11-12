@@ -246,3 +246,34 @@ async def test_playback_and_barge_in_stop_playback_under_100ms_even_when_sigterm
     assert adapter.is_playing is False
     assert spawned[0].returncode == -9
     assert bytes(spawned[0].stdin.buffer) == synth.pcm_s16le
+
+
+async def test_continuous_bounded_stderr_drain_during_long_capture() -> None:
+    heavy_stderr_chunks = [b"PipeWire xrun warning line\n" * 80 for _ in range(80)]
+    spawned: list[_FakeAudioProcess] = []
+
+    async def spawner(*argv: str) -> _FakeAudioProcess:
+        proc = _FakeAudioProcess(
+            argv,
+            stdout_chunks=[b"\x01\x00" * 512, b"\x02\x00" * 512],
+            hang_until_terminated=True,
+        )
+        proc.stderr = _FakeStdout(heavy_stderr_chunks, hang_after=True)
+        spawned.append(proc)
+        return proc
+
+    adapter = PipeWireAudioAdapter(
+        which_resolver=lambda cmd: "/usr/bin/pw-record" if cmd == "pw-record" else None,
+        subprocess_spawner=spawner,
+    )
+
+    seen = 0
+    async for _frame in adapter.frames():
+        seen += 1
+        if seen == 2:
+            await asyncio.sleep(0.02)
+            await adapter.stop_capture()
+
+    assert seen == 2
+    assert spawned[0].stderr._chunks == []
+

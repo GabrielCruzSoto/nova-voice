@@ -110,7 +110,16 @@ class SileroVadAdapter:
                 factory = self._scorer_factory or (
                     lambda: _OnnxSileroVadBackend(self._settings.model_path)
                 )
-                self._backend = await asyncio.to_thread(factory)
+                try:
+                    self._backend = await asyncio.wait_for(
+                        asyncio.to_thread(factory),
+                        timeout=self._settings.inference_timeout_seconds,
+                    )
+                except TimeoutError as exc:
+                    raise VoicePipelineError(
+                        code="VOICE_MODEL_UNAVAILABLE",
+                        message="Timed out while loading local Silero VAD model.",
+                    ) from exc
             return self._backend
 
     async def speech_probability(self, frame: AudioFrame) -> float:

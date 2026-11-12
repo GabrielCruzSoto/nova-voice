@@ -280,3 +280,19 @@ async def test_local_onnx_tts_supports_kokoro_and_piper_in_ram_without_disk_writ
 
     with pytest.raises(ValidationError):
         LocalOnnxTtsSettings(piper_binary="--malicious")
+
+
+async def test_f8_lazy_model_loading_enforces_explicit_timeout() -> None:
+    import time as time_mod
+
+    def hung_loader() -> object:
+        time_mod.sleep(0.2)
+        raise AssertionError("unreachable")
+
+    vad = SileroVadAdapter(
+        settings=SileroVadSettings(inference_timeout_seconds=0.03),
+        scorer_factory=hung_loader,  # type: ignore[arg-type]
+    )
+    with pytest.raises(VoicePipelineError) as exc_info:
+        await vad.speech_probability(_make_frame())
+    assert exc_info.value.code == "VOICE_MODEL_UNAVAILABLE"

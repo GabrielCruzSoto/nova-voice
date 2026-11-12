@@ -775,3 +775,266 @@ async def test_end_to_end_real_orchestrator_and_gatekeeper_spoken_approval_flow(
     await asyncio.sleep(0.04)
     assert "Comando autorizado y ejecutado con exito." in tts.synthesized_texts
     await coordinator.shutdown()
+
+
+async def test_f2_fifo_approvals_and_anti_toctou_blocks_stale_speech() -> None:
+    bus = OrchestratorEventBus()
+    audio_in = _ScriptedAudioInput()
+    vad = _FakeVad()
+    orch = _FakeOrchestrator(event_bus=bus)
+
+    stt_entered = asyncio.Event()
+    release_stt = asyncio.Event()
+
+    class _DelayedStt(_FakeStt):
+        async def transcribe(
+            self,
+            pcm_s16le: bytes,
+            sample_rate_hz: int = 16000,
+        ) -> TranscriptionResult:
+            if not stt_entered.is_set():
+                stt_entered.set()
+                await release_stt.wait()
+            return await super().transcribe(pcm_s16le, sample_rate_hz=sample_rate_hz)
+
+    stt = _DelayedStt(
+        transcripts=[
+            "sí aprobar comando",  # spoken BEFORE aud-1 existed -> must NOT approve aud-1!
+            "sí aprobar comando",  # spoken AFTER aud-1 & aud-2 -> approves aud-1 (FIFO)
+            "no rechazar comando",  # approves/rejects next FIFO item aud-2
+        ]
+    )
+
+    now = 50.0
+
+    def fake_clock() -> float:
+        return now
+
+    coordinator = VoiceCallCoordinator(
+        audio_input=audio_in,
+        audio_output=_ControlledAudioOutput(),
+        wake_word=_FakeWakeWord(),
+        vad=vad,
+        stt=stt,
+        tts=_FakeTts(),
+        orchestrator=orch,
+        event_bus=bus,
+        settings=VoiceCoordinatorSettings(min_speech_frames=2, end_silence_frames=2),
+        clock=fake_clock,
+    )
+    await coordinator.start()
+    await coordinator.start_call()
+
+    # 1. User speaks "sí aprobar comando" at t=50.0 BEFORE any CommandApprovalRequestedEvent!
+    vad.probs = [0.9, 0.9, 0.05, 0.05]
+    for _ in range(4):
+        audio_in.push_frame(_frame(ts=now))
+    await asyncio.wait_for(stt_entered.wait(), timeout=1.0)
+
+    # While STT is still transcribing, aud-1 (t=51.0) and aud-2 (t=52.0) arrive!
+    now = 51.0
+    await bus.publish(
+        CommandApprovalRequestedEvent(
+            audit_id="aud-fifo-1",
+            correlation_id="c-1",
+            source="tier1_pi",
+            sanitized_command="sudo cmd1",
+            cwd="/tmp",
+            risk_level="high",
+            spoken_summary="Aprobar primer comando retenido.",
+            technical_explanation="cmd1",
+            expires_in_seconds=60.0,
+        )
+    )
+    now = 52.0
+    await bus.publish(
+        CommandApprovalRequestedEvent(
+            audit_id="aud-fifo-2",
+            correlation_id="c-2",
+            source="tier2_agy",
+            sanitized_command="sudo cmd2",
+            cwd="/tmp",
+            risk_level="high",
+            spoken_summary="Aprobar segundo comando retenido.",
+            technical_explanation="cmd2",
+            expires_in_seconds=60.0,
+        )
+    )
+
+    release_stt.set()
+    await asyncio.sleep(0.05)
+    # Anti-TOCTOU: speech captured at t=50.0 MUST NOT approve aud-fifo-1 or aud-fifo-2!
+    assert orch.approvals == []
+
+    # 2. Now at t=53.0 user speaks -> resolves aud-fifo-1 first (FIFO)
+    now = 53.0
+    vad.probs = [0.9, 0.9, 0.05, 0.05]
+    for _ in range(4):
+        audio_in.push_frame(_frame(ts=now))
+    await asyncio.sleep(0.05)
+    assert orch.approvals == [("aud-fifo-1", True, "user_voice")]
+
+    # 3. Next utterance at t=54.0 resolves aud-fifo-2
+    now = 54.0
+    vad.probs = [0.9, 0.9, 0.05, 0.05]
+    for _ in range(4):
+        audio_in.push_frame(_frame(ts=now))
+    await asyncio.sleep(0.05)
+    assert orch.approvals == [
+        ("aud-fifo-1", True, "user_voice"),
+        ("aud-fifo-2", False, "user_voice"),
+    ]
+    await coordinator.shutdown()
+
+
+async def test_f3_intermediate_tts_completion_restores_executing_and_keeps_barge_in_armed() -> None:
+    bus = OrchestratorEventBus()
+    audio_in = _ScriptedAudioInput()
+    audio_out = _ControlledAudioOutput(hold_playback=False)
+    vad = _FakeVad()
+    stt = _FakeStt(transcripts=["Refactoriza la arquitectura completa"])
+    tts = _FakeTts()
+    orch = _FakeOrchestrator(event_bus=bus, hold_utterance=True)
+
+    coordinator = VoiceCallCoordinator(
+        audio_input=audio_in,
+        audio_output=audio_out,
+        wake_word=_FakeWakeWord(),
+        vad=vad,
+        stt=stt,
+        tts=tts,
+        orchestrator=orch,
+        event_bus=bus,
+        settings=VoiceCoordinatorSettings(min_speech_frames=3, end_silence_frames=3),
+    )
+    await coordinator.start()
+    await coordinator.start_call()
+
+    # Dispatch heavy turn that stays in-flight (hold_utterance=True)
+    vad.probs = [0.9, 0.9, 0.9, 0.05, 0.05, 0.05]
+    for _ in range(6):
+        audio_in.push_frame(_frame())
+    await asyncio.sleep(0.04)
+    assert _state_of(coordinator) == "executing"
+
+    # Intermediate Tier 2 milestone plays and finishes while turn is STILL running
+    await bus.publish(
+        VoiceMilestoneEvent(
+            correlation_id="c-t2",
+            summary_text="Tarea compleja detectada, delegando ejecucion.",
+            priority="normal",
+        )
+    )
+    await asyncio.sleep(0.05)
+
+    # State MUST return to "executing" (NOT "listening") so <100 ms barge-in stays armed!
+    assert _state_of(coordinator) == "executing"
+
+    # Now user speaks 3 onset frames -> must immediately fire orchestrator.barge_in()!
+    vad.probs = [0.85, 0.85, 0.85]
+    for _ in range(3):
+        audio_in.push_frame(_frame())
+    await asyncio.sleep(0.03)
+    assert orch.barge_in_calls == 1
+    assert _state_of(coordinator) == "listening"
+    await coordinator.shutdown()
+
+
+async def test_f4_f5_cancels_inflight_tts_ignores_standby_and_preserves_buf() -> None:
+    bus = OrchestratorEventBus()
+    audio_in = _ScriptedAudioInput()
+    audio_out = _ControlledAudioOutput()
+    vad = _FakeVad()
+    stt = _FakeStt(transcripts=["frase completa sin recortar inicio"])
+
+    synth_started = asyncio.Event()
+
+    class _SlowNormalTts(_FakeTts):
+        async def synthesize(self, text: str) -> SynthesizedAudio:
+            if "lento" in text:
+                synth_started.set()
+                await asyncio.sleep(5.0)
+            return await super().synthesize(text)
+
+    tts = _SlowNormalTts()
+    orch = _FakeOrchestrator(event_bus=bus)
+
+    coordinator = VoiceCallCoordinator(
+        audio_input=audio_in,
+        audio_output=audio_out,
+        wake_word=_FakeWakeWord(),
+        vad=vad,
+        stt=stt,
+        tts=tts,
+        orchestrator=orch,
+        event_bus=bus,
+        settings=VoiceCoordinatorSettings(
+            pre_roll_frames=2,
+            min_speech_frames=2,
+            end_silence_frames=2,
+        ),
+    )
+    await coordinator.start()
+
+    # 1. In "standby" (_call_open=False), normal VoiceMilestoneEvent must be ignored
+    await bus.publish(
+        VoiceMilestoneEvent(
+            correlation_id="c-standby",
+            summary_text="No debe hablar estando en standby.",
+            priority="normal",
+        )
+    )
+    await asyncio.sleep(0.03)
+    assert _state_of(coordinator) == "standby"
+    assert audio_out.played == []
+
+    # 2. Open call and start a slow normal synthesis, then preempt mid-synthesis with interrupt!
+    await coordinator.start_call()
+    await bus.publish(
+        VoiceMilestoneEvent(
+            correlation_id="c-slow",
+            summary_text="Hito normal lento sintetizando.",
+            priority="normal",
+        )
+    )
+    await asyncio.wait_for(synth_started.wait(), timeout=1.0)
+    await bus.publish(
+        VoiceMilestoneEvent(
+            correlation_id="c-int",
+            summary_text="Alerta urgente interrumpe sintesis lenta.",
+            priority="interrupt",
+        )
+    )
+    await asyncio.sleep(0.05)
+    assert tts.synthesized_texts == ["Alerta urgente interrumpe sintesis lenta."]
+    assert len(audio_out.played) == 1
+
+    # 3. F5: Start speaking in listening (tags 11, 12), transition to speaking mid-utterance,
+    # continue speaking (tags 13, 14) + silence -> initial bytes (11, 12) must NOT be lost!
+    vad.probs = [0.9, 0.9]
+    audio_in.push_frame(_frame(tag=11))
+    audio_in.push_frame(_frame(tag=12))
+    await asyncio.sleep(0.02)
+
+    audio_out.hold_playback = True
+    await bus.publish(
+        VoiceMilestoneEvent(
+            correlation_id="c-mid",
+            summary_text="Locucion asincrona mientras usuario hablaba.",
+            priority="normal",
+        )
+    )
+    await asyncio.wait_for(audio_out.started_ev.wait(), timeout=1.0)
+
+    vad.probs = [0.9, 0.9, 0.05, 0.05]
+    audio_in.push_frame(_frame(tag=13))
+    audio_in.push_frame(_frame(tag=14))
+    audio_in.push_frame(_frame(tag=15))
+    audio_in.push_frame(_frame(tag=16))
+    await asyncio.sleep(0.05)
+
+    assert len(stt.captured_buffers) == 1
+    captured = stt.captured_buffers[0]
+    assert captured[0] == 11
+    assert len(captured) >= 4 * 1024
+    await coordinator.shutdown()
