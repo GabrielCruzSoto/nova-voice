@@ -1,4 +1,4 @@
-"""Domain events and asynchronous OrchestratorEventBus (OP-4)."""
+"""Domain events and asynchronous OrchestratorEventBus (NOVA-001 OP-4 & NOVA-002 OP-4)."""
 
 from __future__ import annotations
 
@@ -7,9 +7,16 @@ from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-from nova.domain.models import utc_now_iso
+from nova.domain.models import (
+    MAX_SPOKEN_WORDS,
+    AuditRiskLevel,
+    CommandSource,
+    DecisionVerdict,
+    utc_now_iso,
+    validate_spoken_word_budget,
+)
 
-MAX_VOICE_MILESTONE_WORDS = 25
+MAX_VOICE_MILESTONE_WORDS = MAX_SPOKEN_WORDS
 
 
 class WorkspaceChangedEvent(BaseModel):
@@ -48,15 +55,7 @@ class VoiceMilestoneEvent(BaseModel):
     @field_validator("summary_text")
     @classmethod
     def _validate_word_budget(cls, value: str) -> str:
-        cleaned = " ".join(value.strip().split())
-        if not cleaned:
-            raise ValueError("summary_text cannot be empty")
-        word_count = len(cleaned.split(" "))
-        if word_count > MAX_VOICE_MILESTONE_WORDS:
-            raise ValueError(
-                f"summary_text exceeds {MAX_VOICE_MILESTONE_WORDS} words (got {word_count})"
-            )
-        return cleaned
+        return validate_spoken_word_budget(value)
 
 
 class RunnerFailureEvent(BaseModel):
@@ -71,8 +70,63 @@ class RunnerFailureEvent(BaseModel):
     timestamp: str = Field(default_factory=utc_now_iso)
 
 
+class CommandBlockedEvent(BaseModel):
+    """Published when Layer 1 hard-blocks a catastrophic host command."""
+
+    model_config = ConfigDict(frozen=True, extra="ignore")
+
+    audit_id: str = Field(min_length=1)
+    correlation_id: str = Field(min_length=1)
+    source: CommandSource
+    sanitized_command: str = Field(min_length=1)
+    rule_id: str = Field(min_length=1)
+    reason: str = Field(min_length=1)
+    timestamp: str = Field(default_factory=utc_now_iso)
+
+
+class CommandApprovalRequestedEvent(BaseModel):
+    """Published when Layer 2 holds a dubious command awaiting explicit human decision."""
+
+    model_config = ConfigDict(frozen=True, extra="ignore")
+
+    audit_id: str = Field(min_length=1)
+    correlation_id: str = Field(min_length=1)
+    source: CommandSource
+    sanitized_command: str = Field(min_length=1)
+    cwd: str = Field(min_length=1)
+    risk_level: AuditRiskLevel
+    spoken_summary: str = Field(min_length=1)
+    technical_explanation: str = Field(min_length=1)
+    expires_in_seconds: float = Field(gt=0.0)
+    timestamp: str = Field(default_factory=utc_now_iso)
+
+    @field_validator("spoken_summary")
+    @classmethod
+    def _validate_spoken_summary(cls, value: str) -> str:
+        return validate_spoken_word_budget(value)
+
+
+class CommandApprovalResolvedEvent(BaseModel):
+    """Published when a held command approval is approved, rejected, or times out."""
+
+    model_config = ConfigDict(frozen=True, extra="ignore")
+
+    audit_id: str = Field(min_length=1)
+    correlation_id: str = Field(min_length=1)
+    approved: bool
+    verdict: DecisionVerdict
+    resolved_by: str = Field(min_length=1)
+    timestamp: str = Field(default_factory=utc_now_iso)
+
+
 OrchestratorEvent = (
-    WorkspaceChangedEvent | ChatStreamEvent | VoiceMilestoneEvent | RunnerFailureEvent
+    WorkspaceChangedEvent
+    | ChatStreamEvent
+    | VoiceMilestoneEvent
+    | RunnerFailureEvent
+    | CommandBlockedEvent
+    | CommandApprovalRequestedEvent
+    | CommandApprovalResolvedEvent
 )
 EventSubscriber = Callable[[OrchestratorEvent], Awaitable[None]]
 
