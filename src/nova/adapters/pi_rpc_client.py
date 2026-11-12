@@ -134,9 +134,11 @@ class PiRpcClient:
         """Restart the RPC subprocess cleanly inside a new canonical workspace."""
         if new_workspace_path == self._config.workspace_path and self.is_running:
             return
+        was_running = self.is_running
         await self.close()
         self._config = self._config.model_copy(update={"workspace_path": new_workspace_path})
-        await self.start()
+        if was_running:
+            await self.start()
 
     async def close(self) -> None:
         """Close stdin for orderly shutdown and escalate to SIGTERM/SIGKILL if needed."""
