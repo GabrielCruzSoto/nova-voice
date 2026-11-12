@@ -412,3 +412,25 @@ async def test_f7_orchestrator_redacts_gatekeeper_ephemeral_secrets_in_chat_stre
     assert len(chat_events) == 1
     assert bare_ephemeral not in chat_events[0].delta
     assert "<REDACTED:secret>" in chat_events[0].delta
+
+    class _LeakingFailRunner:
+        async def execute(self, request: CodingTaskRequest) -> AsyncIterator[RunnerProgressEvent]:
+            raise CodingRunnerError(
+                code="RUNNER_EXECUTION_FAILED",
+                message=f"Subprocess failed with {bare_ephemeral} in stderr",
+            )
+            yield  # pragma: no cover
+
+    events.clear()
+    fail_orchestrator = NovaOrchestrator(
+        workspace_resolver=resolver,
+        tier1_client=tier1,
+        tier2_runner=_LeakingFailRunner(),
+        event_bus=bus,
+        security_gatekeeper=gatekeeper,
+    )
+    await fail_orchestrator.handle_user_utterance("[delegate_tier2] Forzar fallo con secreto")
+    failures = [e for e in events if isinstance(e, RunnerFailureEvent)]
+    assert len(failures) == 1
+    assert bare_ephemeral not in failures[0].sanitized_message
+    assert "<REDACTED:secret>" in failures[0].sanitized_message

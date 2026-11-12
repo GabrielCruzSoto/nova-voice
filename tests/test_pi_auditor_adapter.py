@@ -139,6 +139,29 @@ print(json.dumps({{
         )
     assert adapter.cache_size <= 2
 
+    # Verify cached medium entry never downgrades a later high/critical risk_hint (F6)
+    low_req = CommandAuditInput(
+        correlation_id="corr-f6-1",
+        command="python3 build.py",
+        cwd=str(tmp_path),
+        workspace_path=str(tmp_path),
+        rule_id="UNLISTED_COMMAND",
+        risk_hint="medium",
+    )
+    med_res = await adapter.audit(low_req)
+    assert med_res.risk_level == "medium"
+
+    elevated_same_rule = CommandAuditInput(
+        correlation_id="corr-f6-2",
+        command="python3 build.py",
+        cwd=str(tmp_path),
+        workspace_path=str(tmp_path),
+        rule_id="UNLISTED_COMMAND",
+        risk_hint="critical",
+    )
+    elevated_res = await adapter.audit(elevated_same_rule)
+    assert elevated_res.risk_level == "critical"
+
 
 @pytest.mark.asyncio
 async def test_ac5_pi_auditor_timeout_and_malformed_output_trigger_deterministic_fallback(

@@ -320,10 +320,18 @@ for line in sys.stdin:
 
     dump_agy = tmp_path / "agy_env.json"
     fake_agy = tmp_path / "fake_agy.py"
+    real_plugin_dir = str(REPO_ROOT / "src" / "nova" / "plugins" / "agy_gatekeeper")
     await asyncio.to_thread(
         fake_agy.write_text,
         f"""
-import json, os, pathlib
+import json, os, pathlib, sys
+if sys.argv[1:4] == ["plugin", "list", "--json"]:
+    print(json.dumps([{{
+        "name": "nova-agy-gatekeeper",
+        "enabled": True,
+        "path": {real_plugin_dir!r},
+    }}]), flush=True)
+    raise SystemExit(0)
 pathlib.Path({str(dump_agy)!r}).write_text(json.dumps({{
     "sock": os.environ.get("NOVA_GATEKEEPER_SOCKET"),
 }}))
@@ -427,6 +435,30 @@ const resWriteSymlinkDir = await handler(
   {{ toolName: "write", input: {{ path: "linked_out/pwn.txt" }} }},
   ctx,
 );
+const resReadAtAbs = await handler(
+  {{ toolName: "read", input: {{ path: "@/etc/passwd" }} }},
+  ctx,
+);
+const resWriteAtHome = await handler(
+  {{ toolName: "write", input: {{ path: "@~/.bashrc" }} }},
+  ctx,
+);
+const resReadAtRel = await handler(
+  {{ toolName: "read", input: {{ path: "@\u00A0../../outside.txt" }} }},
+  ctx,
+);
+const resReadFileUri = await handler(
+  {{ toolName: "read", input: {{ path: "file:///etc/passwd" }} }},
+  ctx,
+);
+const resPowershellDeny = await handler(
+  {{ toolName: "powershell", input: {{ command: "rm -rf /" }} }},
+  ctx,
+);
+const resUnknownTool = await handler(
+  {{ toolName: "custom_untrusted_exec", input: {{ script: "id" }} }},
+  ctx,
+);
 const resSafe = await handler({{ toolName: "bash", input: {{ command: "pytest -q" }} }}, ctx);
 const resDeny = await handler({{ toolName: "bash", input: {{ command: "rm -rf /" }} }}, ctx);
 console.log(JSON.stringify({{
@@ -434,6 +466,12 @@ console.log(JSON.stringify({{
   resReadOutside,
   resWriteHome,
   resWriteSymlinkDir,
+  resReadAtAbs,
+  resWriteAtHome,
+  resReadAtRel,
+  resReadFileUri,
+  resPowershellDeny,
+  resUnknownTool,
   resSafe: resSafe ?? null,
   resDeny,
 }}));
@@ -459,6 +497,13 @@ console.log(JSON.stringify({{
     assert out["resReadOutside"]["block"] is True
     assert out["resWriteHome"]["block"] is True
     assert out["resWriteSymlinkDir"]["block"] is True
+    assert out["resReadAtAbs"]["block"] is True
+    assert out["resWriteAtHome"]["block"] is True
+    assert out["resReadAtRel"]["block"] is True
+    assert out["resReadFileUri"]["block"] is True
+    assert out["resPowershellDeny"]["block"] is True
+    assert "CATASTROPHIC" in out["resPowershellDeny"]["reason"]
+    assert out["resUnknownTool"]["block"] is True
     assert out["resSafe"] is None
     assert out["resDeny"]["block"] is True
     assert "CATASTROPHIC" in out["resDeny"]["reason"]
@@ -517,3 +562,65 @@ async def test_f9_early_ipc_client_disconnect_releases_pending_approval_slot(
         await asyncio.sleep(0.05)
 
         assert gatekeeper.pending_count == 0
+
+
+@pytest.mark.asyncio
+async def test_f3_and_f4_agy_plugin_preflight_and_non_dict_hook_json(tmp_path: Path) -> None:
+    from nova.domain.errors import CodingRunnerError
+
+    hook_script = REPO_ROOT / "src" / "nova" / "plugins" / "agy_gatekeeper" / "pre_tool_hook.py"
+    plugin_dir = hook_script.parent
+    live_like_env = {
+        **os.environ,
+        "NOVA_GATEKEEPER_SOCKET": "/tmp/nonexistent-nova-gk2.sock",
+        "NOVA_GATEKEEPER_TOKEN": "tok",
+    }
+
+    for scalar_or_list_stdin in ("[]", "null", '"just-a-string"', "123"):
+        proc = await asyncio.create_subprocess_exec(
+            sys.executable,
+            str(hook_script),
+            cwd=str(plugin_dir),
+            env=live_like_env,
+            stdin=asyncio.subprocess.PIPE,
+            stdout=asyncio.subprocess.PIPE,
+        )
+        out_b, _ = await proc.communicate(scalar_or_list_stdin.encode("utf-8"))
+        assert proc.returncode == 0
+        parsed = json.loads(out_b.decode("utf-8"))
+        assert parsed["decision"] == "deny"
+
+    fake_agy_missing = tmp_path / "fake_agy_missing_plugin.py"
+    await asyncio.to_thread(
+        fake_agy_missing.write_text,
+        """
+import json, sys
+if sys.argv[1:4] == ["plugin", "list", "--json"]:
+    print(json.dumps([{"name": "other-plugin", "enabled": True}]))
+    raise SystemExit(0)
+print(json.dumps({"event": "init", "conversation_id": "c-x"}))
+""",
+        "utf-8",
+    )
+    missing_adapter = AntigravityCLIAdapter(
+        AntigravityRunnerConfig(
+            executable=sys.executable,
+            extra_leading_args=(str(fake_agy_missing),),
+            gatekeeper_ipc_env={
+                "NOVA_GATEKEEPER_SOCKET": "/tmp/synt.sock",
+                "NOVA_GATEKEEPER_TOKEN": "synt-tok",
+            },
+        )
+    )
+    with pytest.raises(CodingRunnerError) as exc_info:
+        _ = [
+            ev
+            async for ev in missing_adapter.execute(
+                CodingTaskRequest(
+                    correlation_id="c-miss",
+                    workspace_path=str(tmp_path),
+                    prompt="check",
+                )
+            )
+        ]
+    assert exc_info.value.code == "GATEKEEPER_PLUGIN_MISSING"

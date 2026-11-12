@@ -55,11 +55,16 @@ def main() -> int:
 
     try:
         raw_stdin = sys.stdin.read()
-        hook_input: dict[str, Any] = json.loads(raw_stdin) if raw_stdin.strip() else {}
+        parsed_stdin: Any = json.loads(raw_stdin) if raw_stdin.strip() else {}
     except json.JSONDecodeError:
         _emit("deny", "GATEKEEPER_INVALID_HOOK_INPUT: Malformed PreToolUse JSON on stdin.")
         return 0
 
+    if not isinstance(parsed_stdin, dict):
+        _emit("deny", "GATEKEEPER_INVALID_HOOK_INPUT: Expected JSON object on stdin.")
+        return 0
+
+    hook_input: dict[str, Any] = parsed_stdin
     tool_call = hook_input.get("toolCall")
     raw_args = tool_call.get("args") if isinstance(tool_call, dict) else None
     tool_args: dict[str, Any] = raw_args if isinstance(raw_args, dict) else {}
@@ -101,11 +106,16 @@ def main() -> int:
 
     raw_resp = b"".join(chunks).split(b"\n", 1)[0].strip()
     try:
-        parsed_resp: dict[str, Any] = json.loads(raw_resp.decode("utf-8"))
+        parsed_any: Any = json.loads(raw_resp.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError):
         _emit("deny", "GATEKEEPER_INVALID_IPC_RESPONSE: Malformed decision (fail-closed).")
         return 0
 
+    if not isinstance(parsed_any, dict):
+        _emit("deny", "GATEKEEPER_INVALID_IPC_RESPONSE: Expected JSON object (fail-closed).")
+        return 0
+
+    parsed_resp: dict[str, Any] = parsed_any
     if parsed_resp.get("allowed") is True:
         _emit("allow")
     else:
@@ -114,5 +124,16 @@ def main() -> int:
     return 0
 
 
+def _entrypoint() -> int:
+    try:
+        return main()
+    except Exception:
+        _emit(
+            "deny",
+            "GATEKEEPER_HOOK_INTERNAL_ERROR: Unexpected hook failure (fail-closed).",
+        )
+        return 0
+
+
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(_entrypoint())

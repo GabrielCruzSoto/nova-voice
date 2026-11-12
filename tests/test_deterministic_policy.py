@@ -116,7 +116,13 @@ def test_ac2_catastrophic_commands_return_hard_deny(
         ("./aigile harness clean", "AIGILE_MUTATING_SUBCOMMAND"),
         ("cat ../../etc/passwd", "OUTSIDE_WORKSPACE_PATH"),
         ("pytest -c/tmp/outside_pyproject.toml", "OUTSIDE_WORKSPACE_PATH"),
+        ("pytest -qc/tmp/outside_pyproject.toml", "OUTSIDE_WORKSPACE_PATH"),
+        ("pytest -qc../outside.ini", "OUTSIDE_WORKSPACE_PATH"),
+        ("pytest -qc~/.bashrc", "OUTSIDE_WORKSPACE_PATH"),
         ("pytest -o testpaths=/tmp/outside_tests", "OUTSIDE_WORKSPACE_PATH"),
+        ("mypy @/etc/passwd", "OUTSIDE_WORKSPACE_PATH"),
+        ("pytest @args.txt", "RESPONSE_FILE_EXPANSION"),
+        ("pytest --flag=@args.txt", "RESPONSE_FILE_EXPANSION"),
         ("ls /etc", "OUTSIDE_WORKSPACE_PATH"),
         ("ls ~/Desktop", "OUTSIDE_WORKSPACE_PATH"),
         ("python3 -c 'print(1)'", "UNLISTED_COMMAND"),
@@ -149,7 +155,12 @@ def test_symlink_escape_inside_workspace_escalates(
     direct_cwd_link.symlink_to(outside_file)
 
     policy = DeterministicCommandPolicy()
-    for cmd in ("cat src/linked.txt", "cat escape_in_cwd.txt"):
+    for cmd in (
+        "cat src/linked.txt",
+        "cat escape_in_cwd.txt",
+        "pytest -cescape_in_cwd.txt",
+        "pytest -qcescape_in_cwd.txt",
+    ):
         decision = policy.evaluate(
             command=cmd,
             cwd=str(workspace_dir),

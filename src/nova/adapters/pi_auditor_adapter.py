@@ -124,9 +124,9 @@ class PiAuditorAdapter:
         with self._cache_lock:
             return len(self._cache)
 
-    def _make_cache_key(self, workspace_path: str, redacted_command: str) -> str:
+    def _make_cache_key(self, workspace_path: str, rule_id: str, redacted_command: str) -> str:
         digest = hashlib.sha256(
-            f"{workspace_path}\x00{redacted_command}".encode()
+            f"{workspace_path}\x00{rule_id}\x00{redacted_command}".encode()
         ).hexdigest()
         return f"nova:security:auditor:assessment:{digest}"
 
@@ -158,9 +158,11 @@ class PiAuditorAdapter:
     async def audit(self, request: CommandAuditInput) -> CommandAuditResult:
         """Analyze dubious shell command in isolated tool-less mode with fail-closed fallback."""
         redacted_cmd = redact_sensitive_text(request.command)
-        cache_key = self._make_cache_key(request.workspace_path, redacted_cmd)
+        cache_key = self._make_cache_key(request.workspace_path, request.rule_id, redacted_cmd)
         cached = self._get_cached(cache_key)
         if cached is not None:
+            if _RISK_ORDER[request.risk_hint] > _RISK_ORDER[cached.risk_level]:
+                return cached.model_copy(update={"risk_level": request.risk_hint})
             return cached
 
         payload = json.dumps(

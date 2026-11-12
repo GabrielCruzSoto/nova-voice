@@ -1,10 +1,12 @@
 /**
  * Nova SecurityGatekeeper Extension for Pi Agent (Tier 1).
  *
- * 1. Confines non-bash file tools (`read`, `write`, `edit`, `ls`, `find`, `grep`, etc.)
- *    strictly within `realpath(ctx.cwd)` (BR-3, F3).
- * 2. Intercepts pre-execution `bash` tool calls and authorizes them over Nova's
- *    authenticated AF_UNIX JSONL gatekeeper socket (`NOVA_GATEKEEPER_SOCKET`).
+ * 1. Confines approved workspace file tools (`read`, `write`, `edit`, `ls`, `find`, `grep`)
+ *    strictly within `realpath(ctx.cwd)` after applying Pi's exact path normalizations
+ *    (Unicode spaces, leading `@` prefixes, `~` expansion, `file://` URIs, and NFD/quote variants).
+ * 2. Intercepts pre-execution shell tools (`bash`, `powershell`, etc.) and authorizes them over
+ *    Nova's authenticated AF_UNIX JSONL gatekeeper socket (`NOVA_GATEKEEPER_SOCKET`).
+ * 3. Blocks unknown or untrusted non-file tools fail-closed when gatekeeper mode is active.
  */
 
 import * as crypto from "node:crypto";
@@ -12,6 +14,7 @@ import * as fs from "node:fs";
 import * as net from "node:net";
 import * as os from "node:os";
 import * as path from "node:path";
+import { fileURLToPath } from "node:url";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 
 interface GatekeeperIPCResponse {
@@ -23,6 +26,12 @@ interface GatekeeperIPCResponse {
 
 const IPC_TIMEOUT_MS = 280_000;
 const MAX_IPC_FRAME_BYTES = 65_536;
+const UNICODE_SPACES_RE = /[\u00A0\u2000-\u200A\u202F\u205F\u3000]/g;
+
+const SHELL_TOOLS = new Set(["bash", "powershell", "sh", "zsh", "cmd"]);
+const SAFE_FILE_TOOLS = new Set(["read", "write", "edit", "ls", "find", "grep"]);
+const MANDATORY_PATH_TOOLS = new Set(["read", "write", "edit"]);
+
 const PATH_ARGUMENT_KEYS = [
   "path",
   "filePath",
@@ -44,12 +53,22 @@ function expandHome(rawPath: string): string {
   return rawPath;
 }
 
-function resolveCandidateRealpath(rawPath: string, baseDir: string): string | null {
-  const expanded = expandHome(rawPath.trim());
-  if (!expanded) {
-    return baseDir;
+function normalizePiPath(rawPath: string): string | null {
+  let normalized = rawPath.replace(UNICODE_SPACES_RE, " ").trim();
+  while (normalized.startsWith("@")) {
+    normalized = normalized.slice(1).replace(UNICODE_SPACES_RE, " ").trim();
   }
-  const absolute = path.resolve(baseDir, expanded);
+  if (/^file:/i.test(normalized)) {
+    try {
+      normalized = fileURLToPath(normalized);
+    } catch {
+      return null;
+    }
+  }
+  return expandHome(normalized);
+}
+
+function resolveAbsoluteRealpath(absolute: string): string | null {
   let current = absolute;
   const trailingSegments: string[] = [];
 
@@ -92,14 +111,48 @@ function isInsideWorkspace(candidateReal: string, workspaceReal: string): boolea
   return candidateReal.startsWith(prefix);
 }
 
+function isPathConfinedToWorkspace(rawPath: string, workspaceReal: string): boolean {
+  const normalized = normalizePiPath(rawPath);
+  if (normalized === null) {
+    return false;
+  }
+  if (!normalized) {
+    return true;
+  }
+
+  const baseAbsolute = path.resolve(workspaceReal, normalized);
+  const variants = new Set<string>([
+    baseAbsolute,
+    baseAbsolute.normalize("NFD"),
+    baseAbsolute.replace(/'/g, "\u2019"),
+    baseAbsolute.normalize("NFD").replace(/'/g, "\u2019"),
+  ]);
+
+  for (const variant of variants) {
+    const resolved = resolveAbsoluteRealpath(variant);
+    if (!resolved || !isInsideWorkspace(resolved, workspaceReal)) {
+      return false;
+    }
+  }
+  return true;
+}
+
+function isUnsafeGlobPattern(pattern: string): boolean {
+  const trimmed = pattern.replace(UNICODE_SPACES_RE, " ").trim();
+  return (
+    trimmed.includes("..") ||
+    trimmed.startsWith("/") ||
+    trimmed.startsWith("~") ||
+    trimmed.startsWith("@") ||
+    /^file:/i.test(trimmed)
+  );
+}
+
 function checkFileToolConfinement(
+  toolName: string,
   input: Record<string, unknown> | undefined,
   cwd: string,
 ): { block: true; reason: string } | undefined {
-  if (!input) {
-    return undefined;
-  }
-
   let workspaceReal: string;
   try {
     workspaceReal = fs.realpathSync(cwd);
@@ -110,13 +163,44 @@ function checkFileToolConfinement(
     };
   }
 
+  if (MANDATORY_PATH_TOOLS.has(toolName)) {
+    if (!input || typeof input.path !== "string" || !input.path.trim()) {
+      return {
+        block: true,
+        reason: `GATEKEEPER_MISSING_FILE_PATH: Tool '${toolName}' requires a non-empty string path.`,
+      };
+    }
+  }
+
+  if (!input) {
+    return undefined;
+  }
+
+  if (toolName === "find" && typeof input.pattern === "string" && isUnsafeGlobPattern(input.pattern)) {
+    return {
+      block: true,
+      reason: `GATEKEEPER_OUTSIDE_WORKSPACE_GLOB: Glob '${input.pattern}' may escape workspace.`,
+    };
+  }
+  if (toolName === "grep" && typeof input.glob === "string" && isUnsafeGlobPattern(input.glob)) {
+    return {
+      block: true,
+      reason: `GATEKEEPER_OUTSIDE_WORKSPACE_GLOB: Glob '${input.glob}' may escape workspace.`,
+    };
+  }
+
   for (const key of PATH_ARGUMENT_KEYS) {
     const val = input[key];
-    if (typeof val !== "string" || !val.trim()) {
+    if (val === undefined) {
       continue;
     }
-    const candidateReal = resolveCandidateRealpath(val, workspaceReal);
-    if (!candidateReal || !isInsideWorkspace(candidateReal, workspaceReal)) {
+    if (typeof val !== "string") {
+      return {
+        block: true,
+        reason: `GATEKEEPER_INVALID_FILE_PATH: Argument '${key}' must be a string.`,
+      };
+    }
+    if (!isPathConfinedToWorkspace(val, workspaceReal)) {
       return {
         block: true,
         reason: `GATEKEEPER_OUTSIDE_WORKSPACE_FILE: File path '${val}' escapes active workspace.`,
@@ -212,24 +296,48 @@ export default function (pi: ExtensionAPI) {
       return undefined;
     }
 
-    if (event.toolName !== "bash") {
-      return checkFileToolConfinement(
-        event.input as Record<string, unknown> | undefined,
+    const inputObj = event.input as Record<string, unknown> | undefined;
+    const hasShellCommandField =
+      inputObj !== undefined &&
+      (inputObj.command !== undefined || inputObj.CommandLine !== undefined);
+
+    if (SHELL_TOOLS.has(event.toolName) || hasShellCommandField) {
+      const rawCommand = inputObj?.command ?? inputObj?.CommandLine;
+      if (typeof rawCommand !== "string") {
+        return {
+          block: true,
+          reason: "GATEKEEPER_INVALID_COMMAND: Shell execution tool requires string command.",
+        };
+      }
+      const authSecret = process.env.NOVA_GATEKEEPER_TOKEN ?? "";
+      const decision = await queryGatekeeperSocket(
+        socketPath,
+        authSecret,
+        rawCommand,
         ctx.cwd,
       );
+      if (decision.allowed === true) {
+        if (event.toolName !== "bash" && decision.verdict !== "approved_by_human") {
+          return {
+            block: true,
+            reason: `GATEKEEPER_NON_BASH_SHELL: Non-bash shell '${event.toolName}' cannot bypass POSIX Layer 1 without explicit human approval.`,
+          };
+        }
+        return undefined;
+      }
+      return {
+        block: true,
+        reason: decision.reason ?? "Blocked by Nova SecurityGatekeeper.",
+      };
     }
 
-    const authSecret = process.env.NOVA_GATEKEEPER_TOKEN ?? "";
-    const command = typeof event.input?.command === "string" ? event.input.command : "";
-    const decision = await queryGatekeeperSocket(socketPath, authSecret, command, ctx.cwd);
-
-    if (decision.allowed === true) {
-      return undefined;
+    if (SAFE_FILE_TOOLS.has(event.toolName)) {
+      return checkFileToolConfinement(event.toolName, inputObj, ctx.cwd);
     }
 
     return {
       block: true,
-      reason: decision.reason ?? "Blocked by Nova SecurityGatekeeper.",
+      reason: `GATEKEEPER_UNTRUSTED_TOOL: Tool '${event.toolName}' is not in approved workspace file toolset.`,
     };
   });
 }

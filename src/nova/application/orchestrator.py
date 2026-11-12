@@ -74,11 +74,20 @@ async def _closing_async_iter[T](stream: AsyncIterator[T]) -> AsyncIterator[Asyn
                 await res
 
 
-def _log_structured(event_name: str, **fields: str | bool) -> None:
+def _log_structured(
+    event_name: str,
+    *,
+    extra_secrets: tuple[str, ...] = (),
+    **fields: str | bool,
+) -> None:
     """Emit structured JSON log record with sensitive values masked (NFR-3)."""
     safe_payload: dict[str, str | bool] = {"event": event_name}
     for key, val in fields.items():
-        safe_payload[key] = redact_sensitive_text(val) if isinstance(val, str) else val
+        safe_payload[key] = (
+            redact_sensitive_text(val, extra_secrets=extra_secrets)
+            if isinstance(val, str)
+            else val
+        )
     logger.info(json.dumps(safe_payload, ensure_ascii=False, sort_keys=True))
 
 
@@ -148,6 +157,9 @@ class NovaOrchestrator:
     def _redact(self, text: str) -> str:
         return redact_sensitive_text(text, extra_secrets=self._extra_secrets())
 
+    def _log(self, event_name: str, **fields: str | bool) -> None:
+        _log_structured(event_name, extra_secrets=self._extra_secrets(), **fields)
+
     async def select_workspace(
         self,
         query: str,
@@ -164,7 +176,7 @@ class NovaOrchestrator:
             )
         )
         await self._tier1_client.switch_workspace(context.canonical_path)
-        _log_structured(
+        self._log(
             "workspace_selected",
             correlation_id=corr_id,
             workspace_id=context.workspace_id,
@@ -176,6 +188,7 @@ class NovaOrchestrator:
                 summary_text=sanitize_for_voice(
                     f"Proyecto activo cambiado a {context.name}.",
                     fallback="Proyecto activo actualizado.",
+                    extra_secrets=self._extra_secrets(),
                 ),
                 priority="normal",
             )
@@ -197,7 +210,7 @@ class NovaOrchestrator:
             )
 
         tier = classify_complexity(utterance)
-        _log_structured(
+        self._log(
             "utterance_routed",
             correlation_id=corr_id,
             tier=tier,
@@ -209,17 +222,18 @@ class NovaOrchestrator:
             else:
                 await self._run_tier2(utterance, active_ws.canonical_path, corr_id)
         except NovaDomainError as exc:
-            _log_structured(
+            redacted_err = self._redact(exc.sanitized_message)
+            self._log(
                 "runner_failure",
                 correlation_id=corr_id,
                 error_code=exc.code,
-                message=exc.sanitized_message,
+                message=redacted_err,
             )
             await self._event_bus.publish(
                 RunnerFailureEvent(
                     correlation_id=corr_id,
                     error_code=exc.code,
-                    sanitized_message=exc.sanitized_message,
+                    sanitized_message=redacted_err,
                     recoverable=True,
                 )
             )
@@ -235,7 +249,7 @@ class NovaOrchestrator:
 
     async def barge_in(self) -> None:
         """Interrupt active speech/agent turn immediately on user voice activity."""
-        _log_structured("barge_in_triggered")
+        self._log("barge_in_triggered")
         await self._tier1_client.barge_in_abort()
 
     async def resolve_command_approval(

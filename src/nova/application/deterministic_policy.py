@@ -90,8 +90,22 @@ _SAFE_GIT_SUBCOMMANDS: frozenset[str] = frozenset(
     {"status", "diff", "log", "show", "rev-parse"}
 )
 _UNSAFE_GIT_GLOBAL_FLAGS: frozenset[str] = frozenset(
-    {"-c", "--config-env", "--exec-path", "--git-dir", "--work-tree"}
+    {"-c", "-C", "--config-env", "--exec-path", "--git-dir", "--work-tree", "--paginate"}
 )
+_UNSAFE_PYTEST_LONG_FLAGS: frozenset[str] = frozenset(
+    {
+        "--config-file",
+        "--override-ini",
+        "--rootdir",
+        "--confcutdir",
+        "--import-mode",
+        "--basetemp",
+    }
+)
+_UNSAFE_MYPY_LONG_FLAGS: frozenset[str] = frozenset(
+    {"--config-file", "--custom-typeshed-dir", "--cache-dir"}
+)
+_UNSAFE_RUFF_LONG_FLAGS: frozenset[str] = frozenset({"--config", "--cache-dir"})
 _SAFE_AIGILE_PREFIXES: tuple[tuple[str, ...], ...] = (
     ("scan",),
     ("harness", "check"),
@@ -141,28 +155,75 @@ def _is_within_workspace(candidate: Path, workspace_root: Path) -> bool:
 
 
 def _extract_candidate_paths(tokens: list[str]) -> list[str]:
-    """Extract all non-flag arguments plus paths embedded in flags or key=value pairs."""
+    """Extract all non-flag arguments plus paths embedded in single or clustered flags."""
     candidates: list[str] = []
     for token in tokens[1:]:
         if token.startswith("-"):
             if "=" in token:
                 _, rhs = token.split("=", 1)
-                if rhs:
+                if rhs and not rhs.startswith("@"):
                     candidates.append(rhs)
                     if "=" in rhs:
                         candidates.append(rhs.split("=", 1)[1])
             elif len(token) > 2 and token[1] != "-":
-                attached = token[2:]
-                if attached.startswith(("/", "~", ".")) or "/" in attached:
-                    candidates.append(attached)
+                body = token[1:]
+                for idx, ch in enumerate(body):
+                    if ch in {"/", "~", "."}:
+                        candidates.append(body[idx:])
+                        break
+                max_split = min(len(token), 12)
+                for split_idx in range(2, max_split):
+                    suffix = token[split_idx:]
+                    if suffix:
+                        candidates.append(suffix)
             continue
 
-        candidates.append(token)
-        if "=" in token:
-            _, rhs = token.split("=", 1)
-            if rhs:
-                candidates.append(rhs)
+        if not token.startswith("@"):
+            candidates.append(token)
+            if "=" in token:
+                _, rhs = token.split("=", 1)
+                if rhs and not rhs.startswith("@"):
+                    candidates.append(rhs)
     return candidates
+
+
+def _check_response_file_tokens(
+    tokens: list[str],
+    resolved_cwd: Path,
+    workspace_root: Path,
+) -> Layer1Decision | None:
+    """Detect argparse @response-file arguments and escalate (prioritizing path escapes)."""
+    for token in tokens[1:]:
+        at_payload: str | None = None
+        if token.startswith("@"):
+            at_payload = token.lstrip("@")
+        elif token.startswith("-") and "=" in token:
+            _, rhs = token.split("=", 1)
+            if rhs.startswith("@"):
+                at_payload = rhs.lstrip("@")
+
+        if at_payload is None:
+            continue
+
+        if at_payload:
+            expanded = os.path.expanduser(at_payload)
+            candidate = Path(expanded) if os.path.isabs(expanded) else resolved_cwd / expanded
+            if not _is_within_workspace(candidate, workspace_root):
+                return Layer1Decision(
+                    verdict="escalate",
+                    rule_id="OUTSIDE_WORKSPACE_PATH",
+                    risk_hint="high",
+                    reason=(
+                        f"Command references a response file outside workspace: '@{at_payload}'."
+                    ),
+                )
+        return Layer1Decision(
+            verdict="escalate",
+            rule_id="RESPONSE_FILE_EXPANSION",
+            risk_hint="high",
+            reason="CLI @response-file argument expansion requires auditor inspection.",
+        )
+    return None
 
 
 def _check_paths_confined(
@@ -187,7 +248,7 @@ def _evaluate_git_tokens(args: list[str]) -> Layer1Decision:
     idx = 0
     while idx < len(args) and args[idx].startswith("-"):
         flag = args[idx].split("=", 1)[0]
-        if flag in _UNSAFE_GIT_GLOBAL_FLAGS or flag.startswith("-c"):
+        if flag in _UNSAFE_GIT_GLOBAL_FLAGS or flag.startswith(("-c", "-C")):
             return Layer1Decision(
                 verdict="escalate",
                 rule_id="GIT_MUTATING_OR_UNSAFE_FLAG",
@@ -319,6 +380,10 @@ class DeterministicCommandPolicy:
                 reason="No executable token found.",
             )
 
+        response_escape = _check_response_file_tokens(tokens, resolved_cwd, workspace_root)
+        if response_escape is not None:
+            return response_escape
+
         path_escape = _check_paths_confined(tokens, resolved_cwd, workspace_root)
         if path_escape is not None:
             return path_escape
@@ -368,6 +433,9 @@ class DeterministicCommandPolicy:
             return _evaluate_git_tokens(args)
 
         if exe_name in _SIMPLE_ALLOWLIST_BINARIES:
+            unsafe_flag = _check_unsafe_allowlist_flags(exe_name, args)
+            if unsafe_flag is not None:
+                return unsafe_flag
             return Layer1Decision(
                 verdict="allow",
                 rule_id=f"ALLOWLIST_{exe_name.upper()}",
@@ -381,3 +449,41 @@ class DeterministicCommandPolicy:
             risk_hint="medium",
             reason=f"Executable '{exe_name}' is not in Layer 1 allowlist.",
         )
+
+
+def _check_unsafe_allowlist_flags(exe_name: str, args: list[str]) -> Layer1Decision | None:
+    """Escalate config/plugin override flags on allowlisted developer CLIs."""
+    for token in args:
+        if not token.startswith("-"):
+            continue
+        flag_head = token.split("=", 1)[0]
+        if exe_name == "pytest":
+            if flag_head in _UNSAFE_PYTEST_LONG_FLAGS:
+                return Layer1Decision(
+                    verdict="escalate",
+                    rule_id="UNSAFE_TOOL_CONFIG_FLAG",
+                    risk_hint="high",
+                    reason=f"Pytest flag '{flag_head}' overrides config or plugin loading.",
+                )
+            if not token.startswith("--") and any(ch in token[1:] for ch in ("c", "o", "p")):
+                return Layer1Decision(
+                    verdict="escalate",
+                    rule_id="UNSAFE_TOOL_CONFIG_FLAG",
+                    risk_hint="high",
+                    reason=f"Pytest short option '{token}' overrides config or plugins.",
+                )
+        elif exe_name == "mypy" and flag_head in _UNSAFE_MYPY_LONG_FLAGS:
+            return Layer1Decision(
+                verdict="escalate",
+                rule_id="UNSAFE_TOOL_CONFIG_FLAG",
+                risk_hint="high",
+                reason=f"Mypy flag '{flag_head}' overrides configuration boundary.",
+            )
+        elif exe_name == "ruff" and flag_head in _UNSAFE_RUFF_LONG_FLAGS:
+            return Layer1Decision(
+                verdict="escalate",
+                rule_id="UNSAFE_TOOL_CONFIG_FLAG",
+                risk_hint="high",
+                reason=f"Ruff flag '{flag_head}' overrides configuration boundary.",
+            )
+    return None
