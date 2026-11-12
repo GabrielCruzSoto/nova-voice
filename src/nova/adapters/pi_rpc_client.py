@@ -5,8 +5,10 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import os
 import uuid
 from collections.abc import AsyncIterator
+from pathlib import Path
 from types import TracebackType
 from typing import Any
 
@@ -17,6 +19,9 @@ from nova.domain.errors import PiRpcError
 MAX_PENDING_COMMANDS = 32
 MAX_STDERR_BYTES = 16 * 1024
 DEFAULT_MAX_LINE_BYTES = 8 * 1024 * 1024
+PI_GATEKEEPER_EXTENSION_PATH = (
+    Path(__file__).resolve().parents[1] / "extensions" / "pi_gatekeeper.ts"
+)
 
 
 class PiRpcConfig(BaseModel):
@@ -33,6 +38,8 @@ class PiRpcConfig(BaseModel):
     ack_timeout_seconds: float = Field(default=5.0, gt=0.0)
     run_timeout_seconds: float = Field(default=180.0, gt=0.0)
     max_line_bytes: int = Field(default=DEFAULT_MAX_LINE_BYTES, gt=0)
+    gatekeeper_ipc_env: dict[str, str] | None = None
+    enable_gatekeeper_extension: bool = True
 
 
 class _PiRpcResponse(BaseModel):
@@ -95,11 +102,20 @@ class PiRpcClient:
         ]
         if self._config.no_session:
             cmd.append("--no-session")
+        if self._config.gatekeeper_ipc_env and self._config.enable_gatekeeper_extension:
+            cmd.extend(["-e", str(PI_GATEKEEPER_EXTENSION_PATH)])
+
+        child_env = (
+            {**os.environ, **self._config.gatekeeper_ipc_env}
+            if self._config.gatekeeper_ipc_env
+            else None
+        )
 
         try:
             self._process = await asyncio.create_subprocess_exec(
                 *cmd,
                 cwd=self._config.workspace_path,
+                env=child_env,
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
@@ -310,10 +326,32 @@ class PiRpcClient:
                             fut.set_result(resp)
                     continue
 
+                if parsed.get("type") == "extension_ui_request":
+                    await self._cancel_unexpected_ui_dialog(parsed)
+                    continue
+
                 for queue in list(self._event_queues):
                     queue.put_nowait(parsed)
         finally:
             self._fail_all_waiters("Pi RPC stdout stream ended.")
+
+    async def _cancel_unexpected_ui_dialog(self, record: dict[str, Any]) -> None:
+        method = record.get("method")
+        req_id = record.get("id")
+        if (
+            method not in {"select", "confirm", "input", "editor"}
+            or not isinstance(req_id, str)
+            or self._process is None
+            or self._process.stdin is None
+        ):
+            return
+        reply = json.dumps(
+            {"type": "extension_ui_response", "id": req_id, "cancelled": True}
+        )
+        with contextlib.suppress(OSError):
+            async with self._write_lock:
+                self._process.stdin.write((reply + "\n").encode("utf-8"))
+                await self._process.stdin.drain()
 
     async def _stderr_loop(self) -> None:
         proc = self._process

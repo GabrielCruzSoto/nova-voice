@@ -8,6 +8,8 @@ from pathlib import Path
 FORBIDDEN_ADAPTER_IMPORTS = {
     "nova.adapters",
     "nova.adapters.antigravity_adapter",
+    "nova.adapters.gatekeeper_ipc",
+    "nova.adapters.pi_auditor_adapter",
     "nova.adapters.pi_rpc_client",
     "nova.adapters.workspace_resolver",
 }

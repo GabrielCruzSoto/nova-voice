@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import os
 from collections.abc import AsyncIterator
 from typing import Any
 
@@ -35,6 +36,7 @@ class AntigravityRunnerConfig(BaseModel):
     allowed_models: frozenset[str] = ALLOWED_TIER2_MODELS
     timeout_seconds: float = Field(default=300.0, gt=0.0)
     max_line_bytes: int = Field(default=DEFAULT_MAX_LINE_BYTES, gt=0)
+    gatekeeper_ipc_env: dict[str, str] | None = None
 
 
 class _AgyStepUpdate(BaseModel):
@@ -92,10 +94,17 @@ class AntigravityCLIAdapter:
         if request.conversation_id:
             cmd.extend(["--conversation", request.conversation_id])
 
+        child_env = (
+            {**os.environ, **self._config.gatekeeper_ipc_env}
+            if self._config.gatekeeper_ipc_env
+            else None
+        )
+
         try:
             proc = await asyncio.create_subprocess_exec(
                 *cmd,
                 cwd=request.workspace_path,
+                env=child_env,
                 stdin=asyncio.subprocess.DEVNULL,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,

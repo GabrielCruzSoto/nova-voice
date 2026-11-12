@@ -1,0 +1,5 @@
+{
+  "name": "nova-agy-gatekeeper",
+  "version": "1.0.0",
+  "description": "PreToolUse command authorization bridge for Nova SecurityGatekeeper."
+}
