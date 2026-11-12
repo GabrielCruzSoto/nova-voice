@@ -9,3 +9,6 @@ build/
 .coverage
 htmlcov/
 node_modules/
+
+# Local voice models (downloaded, not versioned)
+models/
