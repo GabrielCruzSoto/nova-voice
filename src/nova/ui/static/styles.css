@@ -331,7 +331,7 @@ body {
 }
 
 .nova-voice-badge {
-  color: var(--muted-text-secondary);
+  color: var(--muted-text-primary);
   font-size: 0.74rem;
 }
 
@@ -678,7 +678,7 @@ body {
 }
 
 .chat-input::placeholder {
-  color: var(--muted-text-secondary);
+  color: var(--muted-text-primary);
 }
 
 .composer-actions {

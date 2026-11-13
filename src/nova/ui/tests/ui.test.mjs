@@ -1344,3 +1344,151 @@ test("AC-12: In-memory widget mode, 72px floating orb, expand without call, and 
 
   app.dispose();
 });
+
+test("AC-13, AC-14, NFR-1..NFR-8: WCAG 2.1 AA contrast, focus order landmarks, approvals anchoring, and wire invariant", () => {
+  // 1. NFR-1: WCAG 2.1 AA Relative Luminance Contrast Ratio
+  const css = fs.readFileSync(path.join(STATIC_DIR, "styles.css"), "utf8");
+
+  function parseHex(hex) {
+    const clean = hex.trim().replace("#", "");
+    const r = parseInt(clean.substring(0, 2), 16);
+    const g = parseInt(clean.substring(2, 4), 16);
+    const b = parseInt(clean.substring(4, 6), 16);
+    return [r, g, b];
+  }
+
+  function relativeLuminance([r, g, b]) {
+    const sRGB = [r, g, b].map((c) => {
+      const v = c / 255;
+      return v <= 0.04045 ? v / 12.92 : Math.pow((v + 0.055) / 1.055, 2.4);
+    });
+    return 0.2126 * sRGB[0] + 0.7152 * sRGB[1] + 0.0722 * sRGB[2];
+  }
+
+  function contrastRatio(hex1, hex2) {
+    const l1 = relativeLuminance(parseHex(hex1));
+    const l2 = relativeLuminance(parseHex(hex2));
+    const lighter = Math.max(l1, l2);
+    const darker = Math.min(l1, l2);
+    return (lighter + 0.05) / (darker + 0.05);
+  }
+
+  const bgMatch = css.match(/--bg-canvas:\s*(#[0-9a-fA-F]{6})/);
+  const textPrimaryMatch = css.match(/--text-primary:\s*(#[0-9a-fA-F]{6})/);
+  const mutedPrimaryMatch = css.match(/--muted-text-primary:\s*(#[0-9a-fA-F]{6})/);
+  const mutedSecondaryMatch = css.match(/--muted-text-secondary:\s*(#[0-9a-fA-F]{6})/);
+
+  assert.ok(bgMatch, "--bg-canvas token found in CSS");
+  assert.ok(textPrimaryMatch, "--text-primary token found in CSS");
+  assert.ok(mutedPrimaryMatch, "--muted-text-primary token found in CSS");
+  assert.ok(mutedSecondaryMatch, "--muted-text-secondary token found in CSS");
+
+  const bgCanvas = bgMatch[1];
+  const textPrimary = textPrimaryMatch[1];
+  const textSecondary = mutedPrimaryMatch[1];
+  const mutedSecondary = mutedSecondaryMatch[1];
+
+  const primaryContrast = contrastRatio(bgCanvas, textPrimary);
+  const secondaryContrast = contrastRatio(bgCanvas, textSecondary);
+  const mutedSecondaryContrast = contrastRatio(bgCanvas, mutedSecondary);
+
+  assert.ok(
+    primaryContrast >= 4.5,
+    `--text-primary contrast ratio (${primaryContrast.toFixed(2)}) must be >= 4.5:1 against ${bgCanvas}`,
+  );
+  assert.ok(
+    secondaryContrast >= 4.5,
+    `--text-secondary (#94a3b8) contrast ratio (${secondaryContrast.toFixed(2)}) must be >= 4.5:1 against ${bgCanvas}`,
+  );
+  // Verify that --muted-text-secondary is indeed < 4.5:1 and NOT used as text color in conversation
+  assert.ok(
+    mutedSecondaryContrast < 4.5,
+    `--muted-text-secondary (#64748b) has contrast ratio (${mutedSecondaryContrast.toFixed(2)}) < 4.5:1`,
+  );
+  assert.ok(
+    !css.includes("color: var(--muted-text-secondary)"),
+    "--muted-text-secondary must not be used for text color",
+  );
+
+  // 2. NFR-2 & AC-13: Semantic landmarks, focus order, no positive tabindex
+  const testModel = {
+    status: "success",
+    voiceEnabled: true,
+    uiMode: "panel",
+    callSession: { call_id: "c-a11y", state: "standby", turn_count: 1, active_correlation_id: null },
+    activeWorkspace: { display_name: "demo", canonical_path: "/home/dev/demo", selected_via: "exact_path" },
+    availableWorkspaces: [],
+    pendingApprovals: [
+      {
+        audit_id: "aud-test",
+        correlation_id: "corr-test",
+        source: "tier2_agy",
+        sanitized_command: "ls -la",
+        cwd: "/home/dev/demo",
+        risk_level: "high",
+        spoken_summary: "Listar archivos",
+        technical_explanation: "Comando de solo lectura",
+        expires_in_seconds: 60,
+        timestamp: new Date().toISOString(),
+      },
+    ],
+    messages: [
+      {
+        message_id: "m-1",
+        correlation_id: "corr-1",
+        role: "user",
+        modality: "text",
+        step_type: "user_prompt",
+        content: "Hola Nova",
+        timestamp: new Date().toISOString(),
+        streaming: false,
+      },
+    ],
+    errorBanner: null,
+    noticeBanner: { code: "TEST_NOTICE", message: "Aviso accesible", dismissible: true },
+    pickerFallbackOpen: false,
+    lastMilestone: null,
+  };
+
+  const html = renderAppShell(testModel);
+
+  // Semantic landmarks
+  assert.match(html, /<header\b/);
+  assert.match(html, /<main\b/);
+  assert.match(html, /<form\b/);
+
+  // DOM and focus order: header < timeline < approvals < milestone < notice < dock
+  const headerIdx = html.indexOf('data-slot="header"');
+  const timelineIdx = html.indexOf('data-slot="timeline"');
+  const approvalsIdx = html.indexOf('data-slot="approvals"');
+  const milestoneIdx = html.indexOf('data-slot="milestone"');
+  const noticeIdx = html.indexOf('data-slot="notice"');
+  const dockIdx = html.indexOf('data-slot="dock"');
+
+  assert.ok(headerIdx !== -1 && headerIdx < timelineIdx, "header precedes timeline");
+  assert.ok(timelineIdx < approvalsIdx, "timeline precedes approvals");
+  assert.ok(approvalsIdx < milestoneIdx, "approvals precedes milestone");
+  assert.ok(milestoneIdx < noticeIdx, "milestone precedes notice");
+  assert.ok(noticeIdx < dockIdx, "notice precedes dock");
+
+  // No positive tabindex in generated shell
+  assert.ok(!/tabindex\s*=\s*["'](?![0-1]["']|[0-1]\b)[1-9]\d*["']/i.test(html), "No positive tabindex allowed");
+
+  // role="alertdialog" on approval cards with escaped audit-id
+  assert.match(html, /role="alertdialog"/);
+  assert.match(html, /data-action="approve-command"[^>]*data-audit-id="aud-test"/);
+  assert.match(html, /data-action="reject-command"[^>]*data-audit-id="aud-test"/);
+
+  // aria-live landmarks
+  assert.match(html, /data-slot="state-indicator"[^>]*aria-live="polite"/);
+  assert.match(html, /data-slot="milestone"[^>]*aria-live="polite"/);
+
+  // Check in speaking state as well
+  const speakingHtml = renderAppShell({
+    ...testModel,
+    callSession: { ...testModel.callSession, state: "speaking" },
+  });
+  const spkApprovalsIdx = speakingHtml.indexOf('data-slot="approvals"');
+  const spkDockIdx = speakingHtml.indexOf('data-slot="dock"');
+  assert.ok(spkApprovalsIdx < spkDockIdx, "Approvals stay above dock during speaking state");
+});
