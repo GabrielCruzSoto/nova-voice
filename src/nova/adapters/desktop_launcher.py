@@ -68,6 +68,57 @@ class BrowserProcessProtocol(Protocol):
 
 BrowserSpawner = Callable[..., Awaitable[BrowserProcessProtocol]]
 WhichResolver = Callable[[str], str | None]
+NativeShellProbe = Callable[[], bool]
+
+
+def _default_native_shell_probe() -> bool:
+    """Return True when the Python environment provides a native desktop webview/Qt shell."""
+    return (
+        importlib.util.find_spec("PyQt6.QtWebEngineWidgets") is not None
+        or importlib.util.find_spec("webview") is not None
+    )
+
+
+async def _terminate_browser_process(
+    proc: BrowserProcessProtocol,
+    *,
+    grace_seconds: float = 2.5,
+) -> None:
+    """Signal and reap a spawned UI subprocess (including its session group when detached)."""
+    if getattr(proc, "returncode", None) is not None:
+        return
+
+    pid = getattr(proc, "pid", None)
+    signaled_group = False
+    if isinstance(pid, int) and pid > 0:
+        try:
+            os.killpg(pid, signal.SIGTERM)
+            signaled_group = True
+        except (ProcessLookupError, PermissionError, OSError):
+            signaled_group = False
+
+    if not signaled_group:
+        terminate_fn = getattr(proc, "terminate", None)
+        if callable(terminate_fn):
+            with contextlib.suppress(ProcessLookupError, OSError):
+                terminate_fn()
+
+    try:
+        await asyncio.wait_for(proc.wait(), timeout=grace_seconds)
+        return
+    except TimeoutError:
+        pass
+
+    if isinstance(pid, int) and pid > 0:
+        with contextlib.suppress(ProcessLookupError, PermissionError, OSError):
+            os.killpg(pid, signal.SIGKILL)
+    kill_fn = getattr(proc, "kill", None)
+    if callable(kill_fn):
+        with contextlib.suppress(ProcessLookupError, OSError):
+            kill_fn()
+
+    with contextlib.suppress(Exception):
+        await asyncio.wait_for(proc.wait(), timeout=0.5)
 
 
 class VoiceRuntimePort(Protocol):
@@ -290,6 +341,8 @@ async def open_local_browser_window(
     which_resolver: WhichResolver = shutil.which,
     spawner: BrowserSpawner = _default_browser_spawner,
     reap_tasks: set[asyncio.Task[int]] | None = None,
+    native_shell_available: NativeShellProbe = _default_native_shell_probe,
+    spawned_processes: set[BrowserProcessProtocol] | None = None,
 ) -> bool:
     """Open `url` strictly on loopback using `shell=False` when a graphical display exists."""
     cleaned_url = url.strip()
@@ -319,13 +372,16 @@ async def open_local_browser_window(
         if xdg_bin:
             argv = (xdg_bin, cleaned_url)
     else:
-        xdg_bin = which_resolver("xdg-open")
-        if xdg_bin:
-            argv = (xdg_bin, cleaned_url)
+        if native_shell_available():
+            argv = (sys.executable, "-m", "nova.adapters.desktop_window", cleaned_url)
         else:
-            ff_bin = which_resolver("firefox")
-            if ff_bin:
-                argv = (ff_bin, "--new-window", cleaned_url)
+            xdg_bin = which_resolver("xdg-open")
+            if xdg_bin:
+                argv = (xdg_bin, cleaned_url)
+            else:
+                ff_bin = which_resolver("firefox")
+                if ff_bin:
+                    argv = (ff_bin, "--new-window", cleaned_url)
 
     if argv is None:
         return False
@@ -335,7 +391,12 @@ async def open_local_browser_window(
     except OSError:
         return False
 
+    if spawned_processes is not None:
+        spawned_processes.add(proc)
+
     wait_task = asyncio.create_task(proc.wait())
+    if spawned_processes is not None:
+        wait_task.add_done_callback(lambda _t: spawned_processes.discard(proc))
     if reap_tasks is not None:
         reap_tasks.add(wait_task)
         wait_task.add_done_callback(reap_tasks.discard)
@@ -362,12 +423,14 @@ class NovaDesktopRuntime:
         voice_factory: VoiceRuntimeFactory | None = None,
         browser_spawner: BrowserSpawner = _default_browser_spawner,
         which_resolver: WhichResolver = shutil.which,
+        native_shell_available: NativeShellProbe = _default_native_shell_probe,
     ) -> None:
         self._config = config or NovaDesktopConfig()
         self._folder_picker = folder_picker or GtkFolderPickerAdapter()
         self._voice_factory: VoiceRuntimeFactory = voice_factory or build_default_voice_coordinator
         self._browser_spawner = browser_spawner
         self._which_resolver = which_resolver
+        self._native_shell_available = native_shell_available
 
         self._event_bus = OrchestratorEventBus()
         self._ipc_server: UnixSocketGatekeeperServer | None = None
@@ -377,6 +440,7 @@ class NovaDesktopRuntime:
         self._ui_server: DesktopUiServer | None = None
         self._gatekeeper: SecurityGatekeeper | None = None
         self._reap_tasks: set[asyncio.Task[int]] = set()
+        self._spawned_processes: set[BrowserProcessProtocol] = set()
         self._voice_enabled = False
         self._started = False
 
@@ -567,6 +631,8 @@ class NovaDesktopRuntime:
                     which_resolver=self._which_resolver,
                     spawner=self._browser_spawner,
                     reap_tasks=self._reap_tasks,
+                    native_shell_available=self._native_shell_available,
+                    spawned_processes=self._spawned_processes,
                 )
 
             self._log(
@@ -579,7 +645,15 @@ class NovaDesktopRuntime:
             raise
 
     async def close(self) -> None:
-        """Deterministically close UI server, SSE hub, voice stack, Pi RPC, and IPC socket."""
+        """Close spawned UI processes, UI server, SSE hub, voice stack, Pi RPC, and IPC."""
+        active_procs = list(self._spawned_processes)
+        self._spawned_processes.clear()
+        if active_procs:
+            await asyncio.gather(
+                *(_terminate_browser_process(proc) for proc in active_procs),
+                return_exceptions=True,
+            )
+
         for task in list(self._reap_tasks):
             task.cancel()
         if self._reap_tasks:
