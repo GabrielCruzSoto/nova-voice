@@ -1743,3 +1743,109 @@ test("Live DOM slot patching: Standby dock syncs disabled state and preserves in
 
   app.dispose();
 });
+
+test("NOVA-007 AC-3..AC-9: Clean bevelled N monogram, floating orb standby/active captions & radial equalizer, host minimize hook, and CSS polish", async () => {
+  // 1. AC-5: Zero atom <ellipse> elements in generated and static squircle SVGs
+  const mutedSvg = renderNovaSquircleSvg(56, false);
+  const activeSvg = renderNovaSquircleSvg(64, true);
+  assert.ok(!mutedSvg.includes("<ellipse"), "Muted squircle must not contain crossed atom ellipses");
+  assert.ok(!activeSvg.includes("<ellipse"), "Active squircle must not contain crossed atom ellipses");
+  assert.match(mutedSvg, /#526071/);
+  assert.match(activeSvg, /#00d2ff/);
+  assert.match(activeSvg, /#fffbeb/);
+
+  const staticActiveSvg = fs.readFileSync(path.join(STATIC_DIR, "nova-squircle-icon.svg"), "utf8");
+  const staticMutedSvg = fs.readFileSync(path.join(STATIC_DIR, "nova-squircle-muted.svg"), "utf8");
+  assert.ok(!staticActiveSvg.includes("<ellipse"), "Static active SVG must not contain <ellipse>");
+  assert.ok(!staticMutedSvg.includes("<ellipse"), "Static muted SVG must not contain <ellipse>");
+
+  // 2. AC-3 & AC-4: Floating orb standby caption ("En reposo" / "(Di 'Oye Nova')") and active speech bubble ("¡Oye Nova!" / "Escuchando...")
+  const baseOrbModel = {
+    status: "empty",
+    voiceEnabled: true,
+    uiMode: "orb",
+    callSession: { call_id: "c-orb", state: "standby", turn_count: 0, active_correlation_id: null },
+    activeWorkspace: null,
+    availableWorkspaces: [],
+    pendingApprovals: [],
+    messages: [],
+    errorBanner: null,
+    noticeBanner: null,
+    pickerFallbackOpen: false,
+    lastMilestone: null,
+  };
+
+  const standbyOrbHtml = renderAppShell(baseOrbModel);
+  assert.ok(standbyOrbHtml.includes("En reposo"), "Standby orb must display 'En reposo'");
+  assert.ok(
+    standbyOrbHtml.includes("(Di &#39;Oye Nova&#39;)") || standbyOrbHtml.includes("(Di 'Oye Nova')"),
+    "Standby orb must display \"(Di 'Oye Nova')\"",
+  );
+
+  const expectedActiveSubtitles = {
+    listening: "Escuchando...",
+    thinking: "Pensando...",
+    executing: "Ejecutando...",
+    speaking: "Hablando...",
+  };
+  for (const [st, subtitle] of Object.entries(expectedActiveSubtitles)) {
+    const activeOrbHtml = renderAppShell({
+      ...baseOrbModel,
+      callSession: { ...baseOrbModel.callSession, state: st },
+    });
+    assert.ok(activeOrbHtml.includes("¡Oye Nova!"), `Active orb (${st}) must display '¡Oye Nova!'`);
+    assert.ok(activeOrbHtml.includes(subtitle), `Active orb (${st}) must display '${subtitle}'`);
+    assert.match(activeOrbHtml, /nova-radial-equalizer-svg/, `Active orb (${st}) must include 360 radial equalizer SVG`);
+  }
+
+  // 3. AC-6: Host minimize callback hides native panel without switching internal uiMode or starting call
+  let minimizeCalls = 0;
+  const networkCalls = [];
+  const fakeFetch = async (url) => {
+    networkCalls.push(url);
+    if (url === "/api/state") {
+      return new Response(
+        JSON.stringify({
+          schema_version: "1.3.0",
+          csrf_token: "csrf-007",
+          voice_enabled: true,
+          call_session: { call_id: "c1", state: "standby", turn_count: 0, active_correlation_id: null },
+          active_workspace: null,
+          available_workspaces: [],
+          pending_approvals: [],
+          messages: [],
+        }),
+        { status: 200 },
+      );
+    }
+    if (url === "/api/events") {
+      return new Response(new ReadableStream(), {
+        status: 200,
+        headers: { "Content-Type": "text/event-stream" },
+      });
+    }
+    return new Response(JSON.stringify({ ok: true }), { status: 200 });
+  };
+
+  const hostApp = new DesktopAppController({
+    fetchImpl: fakeFetch,
+    onMinimizeToHost: () => {
+      minimizeCalls += 1;
+    },
+  });
+  await hostApp.start();
+  await new Promise((r) => setTimeout(r, 15));
+  await hostApp.toggleUiMode();
+  assert.equal(minimizeCalls, 1, "onMinimizeToHost must be invoked when minimizing from panel");
+  assert.equal(hostApp.model.uiMode, "panel", "uiMode stays 'panel' so reopening window shows conversation panel");
+  assert.equal(networkCalls.filter((u) => u === "/api/call/start").length, 0, "Zero /api/call/start requests");
+  hostApp.dispose();
+
+  // 4. AC-7, AC-8, AC-9: CSS rules for frameless transparency, active dock orb opacity, sinusoidal animation, and workspace chips
+  const css = fs.readFileSync(path.join(STATIC_DIR, "styles.css"), "utf8");
+  assert.match(css, /data-shell-frameless="true"/, "CSS must support frameless transparent desktop shell");
+  assert.match(css, /\.btn-workspace-option\s*\{/, "CSS must style .btn-workspace-option chips");
+  assert.match(css, /\.nova-wave-svg--dynamic\s+\.nova-sinusoidal-path\s*\{[\s\S]*?animation:/, "Dynamic sinusoidal path must animate");
+  assert.match(css, /\[data-dock-mode="call"\]\s+\.nova-dock-orb:disabled\s*\{[\s\S]*?opacity:\s*1\b/, "Active dock orb must remain at opacity: 1");
+});
+

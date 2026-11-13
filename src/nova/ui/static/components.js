@@ -39,21 +39,37 @@ const CALL_STATE_LABELS = {
         subtitle: "Subsistema de llamada detenido",
     },
 };
+const FLOATING_ORB_SUBTITLES = {
+    standby: "(Di 'Oye Nova')",
+    listening: "Escuchando...",
+    thinking: "Pensando...",
+    executing: "Ejecutando...",
+    speaking: "Hablando...",
+    closed: "(Di 'Oye Nova')",
+};
 export function renderNovaSquircleSvg(size, active) {
     if (!active) {
         return `
       <svg class="nova-squircle-svg nova-squircle-svg--muted" viewBox="0 0 216 216" width="${size}" height="${size}" aria-hidden="true">
-        <rect x="6" y="6" width="204" height="204" rx="54" ry="54" fill="rgba(34, 40, 52, 0.68)" stroke="#526071" stroke-width="2" stroke-opacity="0.5" />
-        <g opacity="0.35">
-          <ellipse cx="108" cy="108" rx="88" ry="34" fill="none" stroke="#526071" stroke-width="1.5" transform="rotate(-30 108 108)" />
-          <ellipse cx="108" cy="108" rx="88" ry="34" fill="none" stroke="#526071" stroke-width="1.5" transform="rotate(35 108 108)" />
-        </g>
-        <path d="M 68 156 L 68 62 L 86 62 L 132 128 L 132 62 L 150 62 L 150 156 L 132 156 L 86 90 L 86 156 Z"
-              fill="#526071" stroke="#64748b" stroke-width="1" stroke-linejoin="round" />
-        <g transform="translate(142, 68)">
-          <circle cx="0" cy="0" r="10" fill="#64748b" opacity="0.25" />
-          <path d="M 0 -14 Q 1 -3 14 0 Q 1 3 0 14 Q -1 3 -14 0 Q -1 -3 0 -14 Z" fill="#94a3b8" opacity="0.6" />
-          <circle cx="0" cy="0" r="2" fill="#cbd5e1" />
+        <defs>
+          <linearGradient id="squircleMutedBg" x1="0%" y1="0%" x2="100%" y2="100%">
+            <stop offset="0%" stop-color="#222938" stop-opacity="0.92" />
+            <stop offset="100%" stop-color="#121722" stop-opacity="0.96" />
+          </linearGradient>
+          <linearGradient id="monogramMutedBevel" x1="0%" y1="0%" x2="100%" y2="100%">
+            <stop offset="0%" stop-color="#7c8b9e" />
+            <stop offset="55%" stop-color="#526071" />
+            <stop offset="100%" stop-color="#3e4a59" />
+          </linearGradient>
+        </defs>
+        <rect x="8" y="8" width="200" height="200" rx="52" ry="52" fill="url(#squircleMutedBg)" stroke="#526071" stroke-width="2.2" stroke-opacity="0.6" />
+        <rect x="14" y="14" width="188" height="188" rx="46" ry="46" fill="none" stroke="#cbd5e1" stroke-opacity="0.08" stroke-width="1" />
+        <path d="M 64 156 L 64 60 L 86 60 L 132 126 L 132 60 L 152 60 L 152 156 L 130 156 L 84 90 L 84 156 Z"
+              fill="url(#monogramMutedBevel)" stroke="#94a3b8" stroke-opacity="0.45" stroke-width="1.2" stroke-linejoin="round" />
+        <g transform="translate(146, 64)">
+          <circle cx="0" cy="0" r="9" fill="#94a3b8" opacity="0.22" />
+          <path d="M 0 -13 Q 1 -2.5 13 0 Q 1 2.5 0 13 Q -1 2.5 -13 0 Q -1 -2.5 0 -13 Z" fill="#cbd5e1" opacity="0.72" />
+          <circle cx="0" cy="0" r="2" fill="#f8fafc" opacity="0.85" />
         </g>
       </svg>
     `.trim();
@@ -62,46 +78,100 @@ export function renderNovaSquircleSvg(size, active) {
     <svg class="nova-squircle-svg nova-squircle-svg--active" viewBox="0 0 216 216" width="${size}" height="${size}" aria-hidden="true">
       <defs>
         <linearGradient id="squircleBgLive" x1="0%" y1="0%" x2="100%" y2="100%">
-          <stop offset="0%" stop-color="#1e2638" />
-          <stop offset="100%" stop-color="#0d1322" />
+          <stop offset="0%" stop-color="#1b2438" />
+          <stop offset="55%" stop-color="#101729" />
+          <stop offset="100%" stop-color="#090d1a" />
         </linearGradient>
         <linearGradient id="squircleBorderLive" x1="0%" y1="0%" x2="100%" y2="100%">
-          <stop offset="0%" stop-color="#7dd3fc" stop-opacity="0.8" />
-          <stop offset="40%" stop-color="#38bdf8" stop-opacity="0.5" />
-          <stop offset="100%" stop-color="#a855f7" stop-opacity="0.7" />
+          <stop offset="0%" stop-color="#7dd3fc" stop-opacity="0.88" />
+          <stop offset="45%" stop-color="#38bdf8" stop-opacity="0.55" />
+          <stop offset="100%" stop-color="#a855f7" stop-opacity="0.85" />
         </linearGradient>
         <linearGradient id="monogramGradLive" x1="0%" y1="100%" x2="100%" y2="0%">
           <stop offset="0%" stop-color="#00d2ff" />
-          <stop offset="45%" stop-color="#6366f1" />
+          <stop offset="48%" stop-color="#6366f1" />
           <stop offset="100%" stop-color="#a855f7" />
         </linearGradient>
         <radialGradient id="starRadialLive" cx="50%" cy="50%" r="50%">
           <stop offset="0%" stop-color="#fffbeb" />
-          <stop offset="35%" stop-color="#fde68a" />
-          <stop offset="70%" stop-color="#f59e0b" stop-opacity="0.8" />
-          <stop offset="100%" stop-color="#f59e0b" stop-opacity="0.8" />
+          <stop offset="38%" stop-color="#fde68a" />
+          <stop offset="75%" stop-color="#f59e0b" stop-opacity="0.7" />
+          <stop offset="100%" stop-color="#f59e0b" stop-opacity="0" />
         </radialGradient>
       </defs>
-      <rect x="6" y="6" width="204" height="204" rx="54" ry="54" fill="url(#squircleBgLive)" stroke="url(#squircleBorderLive)" stroke-width="3" />
-      <g opacity="0.85">
-        <ellipse cx="108" cy="108" rx="88" ry="34" fill="none" stroke="#00d2ff" stroke-width="2" transform="rotate(-30 108 108)" />
-        <circle cx="44" cy="74" r="4.5" fill="#38bdf8" />
-        <circle cx="172" cy="142" r="3.5" fill="#00d2ff" />
-        <ellipse cx="108" cy="108" rx="88" ry="34" fill="none" stroke="#a855f7" stroke-width="2" transform="rotate(35 108 108)" />
-        <circle cx="168" cy="70" r="5" fill="#ec4899" />
-        <circle cx="48" cy="146" r="3.5" fill="#a855f7" />
-      </g>
-      <path d="M 68 156 L 68 62 L 86 62 L 132 128 L 132 62 L 150 62 L 150 156 L 132 156 L 86 90 L 86 156 Z"
-            fill="url(#monogramGradLive)" stroke="#38bdf8" stroke-width="1.5" stroke-linejoin="round" />
-      <path d="M 72 152 L 72 68 L 84 68 L 130 134 L 130 68 L 142 68 L 142 152 L 130 152 L 84 86 L 84 152 Z"
-            fill="none" stroke="#ffffff" stroke-width="1" opacity="0.35" />
-      <g transform="translate(142, 68)">
-        <circle cx="0" cy="0" r="28" fill="url(#starRadialLive)" opacity="0.6" />
-        <path d="M 0 -36 Q 2 -8 36 0 Q 2 8 0 36 Q -2 8 -36 0 Q -2 -8 0 -36 Z" fill="#fffbeb" />
-        <path d="M 0 -20 Q 1.5 -5 20 0 Q 1.5 5 0 20 Q -1.5 5 -20 0 Q -1.5 -5 0 -20 Z" fill="#fde68a" transform="rotate(45)" />
-        <circle cx="0" cy="0" r="4.5" fill="#ffffff" />
+      <rect x="8" y="8" width="200" height="200" rx="52" ry="52" fill="url(#squircleBgLive)" stroke="url(#squircleBorderLive)" stroke-width="3" />
+      <rect x="14" y="14" width="188" height="188" rx="46" ry="46" fill="none" stroke="#ffffff" stroke-opacity="0.1" stroke-width="1.2" />
+      <path d="M 64 156 L 64 60 L 86 60 L 132 126 L 132 60 L 152 60 L 152 156 L 130 156 L 84 90 L 84 156 Z"
+            fill="url(#monogramGradLive)" stroke="#7dd3fc" stroke-width="1.5" stroke-linejoin="round" />
+      <path d="M 69 151 L 69 65 L 84 65 L 131 132 L 131 65 L 147 65"
+            fill="none" stroke="#ffffff" stroke-width="1.2" stroke-linecap="round" stroke-linejoin="round" opacity="0.45" />
+      <g transform="translate(146, 64)">
+        <circle cx="0" cy="0" r="24" fill="url(#starRadialLive)" opacity="0.7" />
+        <path d="M 0 -30 Q 2 -6 30 0 Q 2 6 0 30 Q -2 6 -30 0 Q -2 -6 0 -30 Z" fill="#fffbeb" />
+        <path d="M 0 -16 Q 1.2 -4 16 0 Q 1.2 4 0 16 Q -1.2 4 -16 0 Q -1.2 -4 0 -16 Z" fill="#fde68a" transform="rotate(45)" />
+        <circle cx="0" cy="0" r="4" fill="#ffffff" />
       </g>
     </svg>
+  `.trim();
+}
+const RADIAL_BAR_HEIGHTS = [
+    12, 7, 16, 9, 6, 14, 18, 8, 11, 15, 6, 13,
+    19, 9, 7, 15, 11, 17, 8, 13, 16, 7, 10, 18,
+    8, 14, 11, 6, 17, 10, 15, 8, 13, 18, 9, 11,
+];
+const RADIAL_BAR_COLORS = [
+    "#00d2ff",
+    "#38bdf8",
+    "#6366f1",
+    "#a855f7",
+    "#ec4899",
+];
+export function renderRadialEqualizerSvg() {
+    const cx = 64;
+    const cy = 64;
+    const innerR = 41;
+    const count = RADIAL_BAR_HEIGHTS.length;
+    const bars = [];
+    for (let i = 0; i < count; i += 1) {
+        const angleRad = (i * 2 * Math.PI) / count;
+        const barLen = RADIAL_BAR_HEIGHTS[i] ?? 10;
+        const x1 = (cx + Math.cos(angleRad) * innerR).toFixed(2);
+        const y1 = (cy + Math.sin(angleRad) * innerR).toFixed(2);
+        const x2 = (cx + Math.cos(angleRad) * (innerR + barLen)).toFixed(2);
+        const y2 = (cy + Math.sin(angleRad) * (innerR + barLen)).toFixed(2);
+        const stroke = RADIAL_BAR_COLORS[i % RADIAL_BAR_COLORS.length] ?? "#00d2ff";
+        const groupClass = i % 2 === 0 ? "nova-eq-bar nova-eq-bar--even" : "nova-eq-bar nova-eq-bar--odd";
+        bars.push(`<line class="${groupClass}" x1="${x1}" y1="${y1}" x2="${x2}" y2="${y2}" stroke="${stroke}" stroke-width="2.2" stroke-linecap="round" />`);
+    }
+    return `
+    <svg class="nova-radial-equalizer-svg" viewBox="0 0 128 128" width="128" height="128" aria-hidden="true">
+      <circle cx="64" cy="64" r="39" fill="none" stroke="#00d2ff" stroke-opacity="0.55" stroke-width="1.6" />
+      ${bars.join("")}
+      <g transform="translate(27, 46)">
+        <path d="M 0 -7 Q 0.7 -1.5 7 0 Q 0.7 1.5 0 7 Q -0.7 1.5 -7 0 Q -0.7 -1.5 0 -7 Z" fill="#fffbeb" opacity="0.9" />
+      </g>
+      <g transform="translate(99, 82)">
+        <path d="M 0 -6 Q 0.6 -1.2 6 0 Q 0.6 1.2 0 6 Q -0.6 1.2 -6 0 Q -0.6 -1.2 0 -6 Z" fill="#fde68a" opacity="0.85" />
+      </g>
+    </svg>
+  `.trim();
+}
+function renderFloatingOrbTooltip(callState) {
+    const isStandby = callState === "standby" || callState === "closed";
+    const subtitle = FLOATING_ORB_SUBTITLES[callState] ?? FLOATING_ORB_SUBTITLES.standby;
+    if (isStandby) {
+        return `
+      <div class="nova-orb-tooltip nova-orb-tooltip--standby" aria-hidden="true">
+        <span class="nova-orb-tooltip-title">En reposo</span>
+        <span class="nova-orb-tooltip-sub">${escapeHtml(subtitle)}</span>
+      </div>
+    `.trim();
+    }
+    return `
+    <div class="nova-orb-tooltip nova-orb-tooltip--active" aria-hidden="true">
+      <span class="nova-orb-tooltip-title">¡Oye Nova!</span>
+      <span class="nova-orb-tooltip-sub">${escapeHtml(subtitle)}</span>
+    </div>
   `.trim();
 }
 export function renderNovaReactiveOrb(callState, voiceEnabled) {
@@ -126,7 +196,7 @@ export function renderNovaReactiveOrb(callState, voiceEnabled) {
     >
       <div class="nova-orb-visual" aria-hidden="true">
         <div class="nova-orb-halo"></div>
-        <div class="nova-orb-radial-wave"></div>
+        <div class="nova-orb-radial-wave">${!isStandby ? renderRadialEqualizerSvg() : ""}</div>
         <div class="nova-orb-medallion">
           ${renderNovaSquircleSvg(isStandby ? 56 : 64, !isStandby)}
         </div>
@@ -579,18 +649,24 @@ export function renderAppShell(model) {
     const dockMode = inCall ? "call" : "standby";
     if (uiMode === "orb") {
         const meta = CALL_STATE_LABELS[model.callSession.state] ?? CALL_STATE_LABELS.standby;
+        const radialSvg = inCall ? renderRadialEqualizerSvg() : "";
         return `
       <div class="nova-layout" data-ui-mode="orb" data-call-state="${escapeHtml(model.callSession.state)}">
         <div class="nova-widget-container" data-slot="widget-orb">
-          <button
-            type="button"
-            class="nova-widget-orb-btn"
-            data-action="toggle-ui-mode"
-            data-call-state="${escapeHtml(model.callSession.state)}"
-            aria-label="Estado de Nova: ${escapeHtml(meta.title)}"
-          >
-            ${renderNovaSquircleSvg(48, inCall)}
-          </button>
+          ${renderFloatingOrbTooltip(model.callSession.state)}
+          <div class="nova-widget-orb-shell" data-call-state="${escapeHtml(model.callSession.state)}">
+            <div class="nova-orb-halo" aria-hidden="true"></div>
+            <div class="nova-orb-radial-wave" aria-hidden="true">${radialSvg}</div>
+            <button
+              type="button"
+              class="nova-widget-orb-btn"
+              data-action="toggle-ui-mode"
+              data-call-state="${escapeHtml(model.callSession.state)}"
+              aria-label="Estado de Nova: ${escapeHtml(meta.title)}"
+            >
+              ${renderNovaSquircleSvg(48, inCall)}
+            </button>
+          </div>
         </div>
       </div>
     `.trim();

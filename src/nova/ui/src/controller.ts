@@ -37,6 +37,7 @@ export interface DesktopControllerOptions {
   readonly rootElement?: HTMLElement | null;
   readonly fetchImpl?: FetchLike;
   readonly onRender?: (html: string, model: PresentationalAppModel) => void;
+  readonly onMinimizeToHost?: (() => void) | undefined;
 }
 
 export class DesktopAppController {
@@ -48,6 +49,7 @@ export class DesktopAppController {
   readonly #fetch: FetchLike;
   readonly #root: HTMLElement | null;
   readonly #onRender: ((html: string, model: PresentationalAppModel) => void) | undefined;
+  readonly #onMinimizeToHost: (() => void) | undefined;
 
   #model: PresentationalAppModel = {
     status: "loading",
@@ -73,6 +75,7 @@ export class DesktopAppController {
     this.#root = options.rootElement ?? null;
     this.#fetch = options.fetchImpl ?? ((url, init) => globalThis.fetch(url, init));
     this.#onRender = options.onRender;
+    this.#onMinimizeToHost = options.onMinimizeToHost;
   }
 
   get model(): PresentationalAppModel {
@@ -172,6 +175,10 @@ export class DesktopAppController {
 
   async toggleUiMode(): Promise<void> {
     if (this.#disposed) {
+      return;
+    }
+    if ((this.#model.uiMode ?? "panel") === "panel" && this.#onMinimizeToHost) {
+      this.#onMinimizeToHost();
       return;
     }
     const nextMode = (this.#model.uiMode ?? "panel") === "orb" ? "panel" : "orb";
