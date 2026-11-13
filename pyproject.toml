@@ -42,6 +42,7 @@ changelog_file = "CHANGELOG.md"
 
 [project.scripts]
 nova-desktop = "nova.adapters.desktop_launcher:main"
+nova = "nova.adapters.desktop_launcher:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

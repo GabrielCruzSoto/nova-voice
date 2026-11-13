@@ -621,6 +621,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         description="Nova 100% local voice-assisted agentic desktop UI for Linux (127.0.0.1).",
     )
     parser.add_argument(
+        "--version",
+        action="store_true",
+        default=False,
+        help="Show application version and exit.",
+    )
+    parser.add_argument(
         "--port",
         type=int,
         default=0,
@@ -827,6 +833,16 @@ def main(argv: Sequence[str] | None = None) -> int:
     """CLI entry point for `nova-desktop` and `python -m nova`."""
     parser = build_arg_parser()
     ns = parser.parse_args(list(argv) if argv is not None else None)
+    if ns.version:
+        try:
+            import importlib.metadata
+
+            ver = importlib.metadata.version("nova-voice")
+            sys.stdout.write(f"nova-voice {ver}\n")
+        except Exception:
+            sys.stdout.write("nova-voice unknown\n")
+        sys.stdout.flush()
+        return 0
     try:
         config = config_from_namespace(ns)
         return asyncio.run(run_desktop_daemon(config))
