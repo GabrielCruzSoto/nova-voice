@@ -282,6 +282,26 @@ export function renderApprovalBanner(approvals) {
     })
         .join("\n");
 }
+const ERROR_CATALOG = {
+    WORKSPACE_NOT_FOUND: "No se encontró el proyecto indicado.",
+    WORKSPACE_OUTSIDE_ALLOWED_ROOTS: "El proyecto se encuentra fuera de las carpetas permitidas.",
+    WORKSPACE_AMBIGUOUS: "Se encontraron varios proyectos que coinciden con el nombre.",
+    WORKSPACE_RESOLUTION_TIMEOUT: "Se agotó el tiempo al intentar resolver el proyecto.",
+    UI_VOICE_UNAVAILABLE: "El servicio de voz no está disponible en este momento.",
+    UI_EMPTY_UTTERANCE: "El mensaje no puede estar vacío.",
+    UI_PAYLOAD_TOO_LARGE: "El tamaño del contenido supera el límite permitido.",
+    UI_FORBIDDEN_ORIGIN_OR_CSRF: "La solicitud fue rechazada por seguridad.",
+    ORCHESTRATOR_UNEXPECTED_FAILURE: "Ocurrió un error inesperado al procesar la solicitud.",
+};
+const GENERIC_ERROR_FALLBACK = "Ocurrió un error inesperado al procesar la solicitud.";
+export function resolveHumanNotice(code) {
+    const message = ERROR_CATALOG[code] ?? GENERIC_ERROR_FALLBACK;
+    return {
+        code,
+        message,
+        dismissible: true,
+    };
+}
 const ROLE_BADGE_MAP = {
     user: "Tú",
     assistant: "Nova",
@@ -348,7 +368,8 @@ export function renderChatTimeline(status, messages, errorBanner, activeWorkspac
       </div>
     `.trim();
     }
-    if (status === "empty" || messages.length === 0) {
+    const visibleMessages = messages.filter((msg) => msg.modality !== "error");
+    if (status === "empty" || visibleMessages.length === 0) {
         return `
       <div class="chat-timeline chat-timeline--state" data-view-status="empty">
         ${safeError}
@@ -359,10 +380,13 @@ export function renderChatTimeline(status, messages, errorBanner, activeWorkspac
       </div>
     `.trim();
     }
-    const itemsHtml = messages
+    const itemsHtml = visibleMessages
         .map((msg) => {
         const badge = ROLE_BADGE_MAP[msg.role] ?? msg.role;
         const streamingAttr = msg.streaming ? ' data-streaming="true"' : "";
+        const voiceIconHtml = msg.modality === "voice"
+            ? `<span class="chat-msg-voice-icon" data-modality-icon="voice" role="img" aria-label="Mensaje de voz"><svg viewBox="0 0 24 24" width="14" height="14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="23"/><line x1="8" y1="23" x2="16" y2="23"/></svg></span>`
+            : "";
         return `
         <article
           class="chat-msg chat-msg--${escapeHtml(msg.role)}"
@@ -371,7 +395,7 @@ export function renderChatTimeline(status, messages, errorBanner, activeWorkspac
         >
           <header class="chat-msg-header">
             <span class="chat-msg-author">${escapeHtml(badge)}</span>
-            <span class="chat-msg-meta">${escapeHtml(msg.modality)} · ${escapeHtml(msg.step_type)}</span>
+            ${voiceIconHtml}
           </header>
           <div class="chat-msg-body">${escapeHtml(msg.content)}</div>
         </article>
@@ -589,7 +613,7 @@ export function renderAppShell(model) {
           ${renderApprovalBanner(model.pendingApprovals)}
         </div>
 
-        <div data-slot="milestone">${milestoneHtml}</div>
+        <div data-slot="milestone" aria-live="polite">${milestoneHtml}</div>
 
         ${renderNoticeSlot(model)}
 

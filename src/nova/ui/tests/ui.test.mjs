@@ -10,9 +10,11 @@ import {
   renderApprovalBanner,
   renderCallControls,
   renderChatTimeline,
+  renderNoticeSlot,
   renderNovaReactiveOrb,
   renderNovaSquircleSvg,
   renderSinusoidalWave,
+  resolveHumanNotice,
 } from "../static/components.js";
 import { DesktopAppController } from "../static/controller.js";
 
@@ -935,6 +937,313 @@ test("AC-8: Composer disabled guard with accessible description and backend race
   await app.submitChat("hola");
   assert.equal(app.model.messages.length, msgCountBefore, "Messages array must not grow on 404 failure");
   assert.ok(app.model.noticeBanner !== null || app.model.errorBanner !== null, "Notice banner must be set on 404");
+
+  app.dispose();
+});
+
+test("AC-9: runner_failure and HTTP errors as human notice banner, error catalog, dismiss without network, XSS safety", async () => {
+  // 1. Error catalog check with renderNoticeSlot
+  const knownCodes = [
+    "WORKSPACE_NOT_FOUND",
+    "WORKSPACE_OUTSIDE_ALLOWED_ROOTS",
+    "WORKSPACE_AMBIGUOUS",
+    "WORKSPACE_RESOLUTION_TIMEOUT",
+    "UI_VOICE_UNAVAILABLE",
+    "UI_EMPTY_UTTERANCE",
+    "UI_PAYLOAD_TOO_LARGE",
+    "UI_FORBIDDEN_ORIGIN_OR_CSRF",
+    "ORCHESTRATOR_UNEXPECTED_FAILURE",
+  ];
+  for (const code of [...knownCodes, "X_UNKNOWN_CODE"]) {
+    const banner = resolveHumanNotice(code);
+    assert.ok(banner.message.length > 0, `Message for ${code} must not be empty`);
+    assert.ok(!banner.message.includes(code), `Message for ${code} must not contain raw code`);
+    assert.ok(!/\b[A-Z]{2,}(?:_[A-Z]+)+\b/.test(banner.message), `Message for ${code} must not match raw enum`);
+    if (code === "WORKSPACE_NOT_FOUND") {
+      assert.match(banner.message, /proyecto/i, "WORKSPACE_NOT_FOUND must mention proyecto");
+      assert.ok(!banner.message.includes("Workspace not found"), "Must not contain English backend message");
+    }
+  }
+
+  // 2. Controller SSE runner_failure handling
+  let sseControllerRef = null;
+  const calls = [];
+  const fakeFetch = async (url, init) => {
+    calls.push({ url, method: init?.method });
+    if (url === "/api/state") {
+      return new Response(
+        JSON.stringify({
+          schema_version: "1.3.0",
+          csrf_token: "csrf-ac9",
+          voice_enabled: true,
+          call_session: { call_id: "c1", state: "standby", turn_count: 0, active_correlation_id: null },
+          active_workspace: { display_name: "p1", canonical_path: "/p1", selected_via: "exact_path" },
+          available_workspaces: [],
+          pending_approvals: [],
+          messages: [
+            {
+              message_id: "m-existing",
+              correlation_id: "c-1",
+              role: "user",
+              modality: "text",
+              step_type: "user_prompt",
+              content: "Hola",
+              timestamp: new Date().toISOString(),
+              streaming: false,
+            },
+            {
+              message_id: "m-rehydrated-err",
+              correlation_id: "c-err",
+              role: "assistant",
+              modality: "error",
+              step_type: "error",
+              content: "Should be filtered",
+              timestamp: new Date().toISOString(),
+              streaming: false,
+            },
+          ],
+        }),
+        { status: 200 },
+      );
+    }
+    if (url === "/api/events") {
+      const stream = new ReadableStream({
+        start(controller) {
+          sseControllerRef = controller;
+        },
+      });
+      return new Response(stream, {
+        status: 200,
+        headers: { "Content-Type": "text/event-stream" },
+      });
+    }
+    return new Response(JSON.stringify({ ok: true }), { status: 200 });
+  };
+
+  const renders = [];
+  const app = new DesktopAppController({
+    fetchImpl: fakeFetch,
+    onRender: (renderedHtml, m) => {
+      renders.push({ renderedHtml, m });
+    },
+  });
+  await app.start();
+  await new Promise((r) => setTimeout(r, 20));
+
+  // Initial render: rehydrated modality: "error" message is filtered from timeline and does not create notice
+  const initialHtml = renders[renders.length - 1].renderedHtml;
+  assert.ok(!initialHtml.includes("Should be filtered"), "Rehydrated error message must be filtered from timeline");
+  assert.ok(!initialHtml.includes('role="alert"'), "Rehydrated error must not create notice");
+
+  const initialMsgCount = app.model.messages.length;
+
+  // SSE emits runner_failure
+  const encoder = new TextEncoder();
+  const failureEvent = `event: nova_event\ndata: ${JSON.stringify({
+    seq: 1,
+    event_type: "runner_failure",
+    correlation_id: "corr-fail-1",
+    timestamp: new Date().toISOString(),
+    payload: {
+      error_code: "WORKSPACE_NOT_FOUND",
+      sanitized_message: "Workspace not found",
+      message: {
+        message_id: "msg-err",
+        correlation_id: "corr-fail-1",
+        role: "assistant",
+        modality: "error",
+        step_type: "error",
+        content: "Error in runner",
+        timestamp: new Date().toISOString(),
+        streaming: false,
+      },
+    },
+  })}\n\n`;
+
+  sseControllerRef.enqueue(encoder.encode(failureEvent));
+  await new Promise((r) => setTimeout(r, 20));
+
+  // Messages array does not grow
+  assert.equal(app.model.messages.length, initialMsgCount, "Messages array must not grow on runner_failure");
+
+  // Render contains data-slot="notice" with role="alert" and data-error-code="WORKSPACE_NOT_FOUND"
+  const failureHtml = renders[renders.length - 1].renderedHtml;
+  assert.match(failureHtml, /data-slot="notice"[^>]*\srole="alert"/);
+  assert.match(failureHtml, /data-error-code="WORKSPACE_NOT_FOUND"/);
+  assert.match(failureHtml, /data-action="dismiss-notice"[^>]*aria-label="Cerrar aviso"/);
+  assert.match(failureHtml, /proyecto/i);
+  assert.ok(!failureHtml.includes("Workspace not found"));
+  assert.ok(!failureHtml.includes("Error in runner"));
+
+  // Consecutive error replaces the first
+  const secondFailure = `event: nova_event\ndata: ${JSON.stringify({
+    seq: 2,
+    event_type: "runner_failure",
+    correlation_id: "corr-fail-2",
+    timestamp: new Date().toISOString(),
+    payload: {
+      error_code: "UI_VOICE_UNAVAILABLE",
+      sanitized_message: "Voice unavailable",
+    },
+  })}\n\n`;
+  sseControllerRef.enqueue(encoder.encode(secondFailure));
+  await new Promise((r) => setTimeout(r, 20));
+
+  const secondFailureHtml = renders[renders.length - 1].renderedHtml;
+  assert.match(secondFailureHtml, /data-error-code="UI_VOICE_UNAVAILABLE"/);
+  assert.ok(!secondFailureHtml.includes("WORKSPACE_NOT_FOUND"));
+
+  // Dismiss notice without network calls
+  const fetchCountBeforeDismiss = calls.length;
+  app.dismissNotice();
+  await new Promise((r) => setTimeout(r, 10));
+
+  assert.equal(calls.length, fetchCountBeforeDismiss, "0 network calls when dismissing notice");
+  const dismissedHtml = renders[renders.length - 1].renderedHtml;
+  assert.ok(!dismissedHtml.includes('role="alert"'));
+  assert.ok(!dismissedHtml.includes("UI_VOICE_UNAVAILABLE"));
+
+  // Hostile error code escaping
+  const maliciousNoticeHtml = renderNoticeSlot({
+    ...app.model,
+    noticeBanner: {
+      code: '<script>evil()</script>',
+      message: 'Mensaje seguro',
+      dismissible: true,
+    },
+  });
+  assert.ok(!maliciousNoticeHtml.includes("<script>evil()"));
+  assert.ok(maliciousNoticeHtml.includes("&lt;script&gt;evil()&lt;/script&gt;"));
+
+  app.dispose();
+});
+
+test("AC-10: Timeline without modality meta and discreet voice icon", () => {
+  const messages = [
+    {
+      message_id: "m-txt",
+      correlation_id: "c-1",
+      role: "user",
+      modality: "text",
+      step_type: "user_prompt",
+      content: "Mensaje escrito",
+      timestamp: "2026-11-12T10:00:00Z",
+      streaming: false,
+    },
+    {
+      message_id: "m-voc",
+      correlation_id: "c-2",
+      role: "user",
+      modality: "voice",
+      step_type: "transcription",
+      content: "Mensaje hablado",
+      timestamp: "2026-11-12T10:01:00Z",
+      streaming: false,
+    },
+  ];
+
+  const html = renderChatTimeline("success", messages, null);
+
+  // Must not contain technical meta
+  assert.ok(!html.includes("chat-msg-meta"));
+  assert.ok(!html.includes("text · user_prompt"));
+  assert.ok(!html.includes("voice · transcription"));
+
+  // Voice message has data-modality-icon="voice" with accessible name "Mensaje de voz"
+  assert.match(html, /data-modality-icon="voice"[^>]*aria-label="Mensaje de voz"/);
+
+  // Text message does NOT have data-modality-icon
+  const textMsgMatch = html.match(/<article[^>]+data-modality="text"[\s\S]*?<\/article>/);
+  assert.ok(textMsgMatch, "Text message article found");
+  assert.ok(!textMsgMatch[0].includes("data-modality-icon"), "Text message must not contain data-modality-icon");
+
+  // Semantic landmarks preserved
+  assert.match(html, /role="log"/);
+  assert.match(html, /aria-live="polite"/);
+});
+
+test("AC-11: Voice milestone as ephemeral toast above dock", async () => {
+  let sseControllerRef = null;
+  const fakeFetch = async (url) => {
+    if (url === "/api/state") {
+      return new Response(
+        JSON.stringify({
+          schema_version: "1.3.0",
+          csrf_token: "csrf-ac11",
+          voice_enabled: true,
+          call_session: { call_id: "c1", state: "speaking", turn_count: 1, active_correlation_id: null },
+          active_workspace: { display_name: "p1", canonical_path: "/p1", selected_via: "exact_path" },
+          available_workspaces: [],
+          pending_approvals: [],
+          messages: [],
+        }),
+        { status: 200 },
+      );
+    }
+    if (url === "/api/events") {
+      const stream = new ReadableStream({
+        start(controller) {
+          sseControllerRef = controller;
+        },
+      });
+      return new Response(stream, {
+        status: 200,
+        headers: { "Content-Type": "text/event-stream" },
+      });
+    }
+    return new Response(JSON.stringify({ ok: true }), { status: 200 });
+  };
+
+  const renders = [];
+  const app = new DesktopAppController({
+    fetchImpl: fakeFetch,
+    onRender: (renderedHtml, m) => {
+      renders.push({ renderedHtml, m });
+    },
+  });
+  await app.start();
+  await new Promise((r) => setTimeout(r, 20));
+
+  const encoder = new TextEncoder();
+  // SSE emits voice_milestone
+  const milestoneEvent = `event: nova_event\ndata: ${JSON.stringify({
+    seq: 1,
+    event_type: "voice_milestone",
+    correlation_id: "corr-mile-1",
+    timestamp: new Date().toISOString(),
+    payload: {
+      summary_text: "Listo <b>x</b>",
+    },
+  })}\n\n`;
+  sseControllerRef.enqueue(encoder.encode(milestoneEvent));
+  await new Promise((r) => setTimeout(r, 20));
+
+  const milestoneHtml = renders[renders.length - 1].renderedHtml;
+  assert.match(milestoneHtml, /data-slot="milestone"/);
+  assert.ok(milestoneHtml.includes("Listo &lt;b&gt;x&lt;/b&gt;"));
+  assert.ok(!milestoneHtml.includes("Listo <b>x</b>"));
+
+  // milestone slot is located BEFORE dock slot
+  const milestonePos = milestoneHtml.indexOf('data-slot="milestone"');
+  const dockPos = milestoneHtml.indexOf('data-slot="dock"');
+  assert.ok(milestonePos < dockPos, "Milestone slot must be before dock slot");
+
+  // Call state changes to standby -> milestone toast cleared
+  const standbyEvent = `event: nova_event\ndata: ${JSON.stringify({
+    seq: 2,
+    event_type: "call_state_changed",
+    correlation_id: "corr-mile-2",
+    timestamp: new Date().toISOString(),
+    payload: {
+      state: "standby",
+    },
+  })}\n\n`;
+  sseControllerRef.enqueue(encoder.encode(standbyEvent));
+  await new Promise((r) => setTimeout(r, 20));
+
+  assert.equal(app.model.lastMilestone, null, "lastMilestone must be null in standby");
+  const clearedHtml = renders[renders.length - 1].renderedHtml;
+  assert.ok(!clearedHtml.includes("nova-milestone-toast"));
 
   app.dispose();
 });

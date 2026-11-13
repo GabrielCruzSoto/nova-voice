@@ -16,6 +16,7 @@ import {
   renderNovaSquircleSvg,
   renderSinusoidalWave,
   renderWorkspaceBar,
+  resolveHumanNotice,
 } from "./components.js";
 import type {
   ErrorResponse,
@@ -124,6 +125,13 @@ export class DesktopAppController {
     this.#abortController.abort();
   }
 
+  dismissNotice(): void {
+    if (this.#disposed) {
+      return;
+    }
+    this.#updateModel({ noticeBanner: null, errorBanner: null });
+  }
+
   async submitChat(utterance: string): Promise<void> {
     const trimmed = utterance.trim();
     if (!trimmed || this.#disposed || !this.#model.activeWorkspace) {
@@ -132,11 +140,13 @@ export class DesktopAppController {
     const resp = await this.#postJson("/api/chat", { utterance: trimmed });
     if (!resp.ok) {
       const errBody = await this.#safeParseError(resp);
+      const code = errBody?.error_code ?? "ORCHESTRATOR_UNEXPECTED_FAILURE";
       this.#updateModel({
-        errorBanner: errBody?.message ?? "No se pudo enviar el mensaje.",
+        noticeBanner: resolveHumanNotice(code),
+        errorBanner: null,
       });
-    } else if (this.#model.errorBanner !== null) {
-      this.#updateModel({ errorBanner: null });
+    } else if (this.#model.noticeBanner !== null || this.#model.errorBanner !== null) {
+      this.#updateModel({ noticeBanner: null, errorBanner: null });
     }
   }
 
@@ -152,8 +162,10 @@ export class DesktopAppController {
     const resp = await this.#postJson(`/api/call/${action}`, {});
     if (!resp.ok) {
       const errBody = await this.#safeParseError(resp);
+      const code = errBody?.error_code ?? "ORCHESTRATOR_UNEXPECTED_FAILURE";
       this.#updateModel({
-        errorBanner: errBody?.message ?? `No fue posible ejecutar '${action}'.`,
+        noticeBanner: resolveHumanNotice(code),
+        errorBanner: null,
       });
     }
   }
@@ -189,8 +201,10 @@ export class DesktopAppController {
     const resp = await this.#postJson("/api/workspace/select", { path_or_query: cleaned });
     if (!resp.ok) {
       const errBody = await this.#safeParseError(resp);
+      const code = errBody?.error_code ?? "ORCHESTRATOR_UNEXPECTED_FAILURE";
       this.#updateModel({
-        errorBanner: errBody?.message ?? "No fue posible cambiar de proyecto.",
+        noticeBanner: resolveHumanNotice(code),
+        errorBanner: null,
       });
       return;
     }
@@ -203,6 +217,7 @@ export class DesktopAppController {
         activeWorkspace: data.workspace,
         pickerFallbackOpen: false,
         errorBanner: null,
+        noticeBanner: null,
       });
     }
   }
@@ -225,8 +240,10 @@ export class DesktopAppController {
     }
     if (!resp.ok) {
       const errBody = await this.#safeParseError(resp);
+      const code = errBody?.error_code ?? "ORCHESTRATOR_UNEXPECTED_FAILURE";
       this.#updateModel({
-        errorBanner: errBody?.message ?? "Error al seleccionar carpeta.",
+        noticeBanner: resolveHumanNotice(code),
+        errorBanner: null,
       });
       return;
     }
@@ -239,6 +256,7 @@ export class DesktopAppController {
         activeWorkspace: data.workspace,
         pickerFallbackOpen: false,
         errorBanner: null,
+        noticeBanner: null,
       });
     }
   }
@@ -397,6 +415,7 @@ export class DesktopAppController {
       const nextState = (p["state"] as PresentationalAppModel["callSession"]["state"]) ?? "standby";
       const turnCount =
         typeof p["turn_count"] === "number" ? p["turn_count"] : this.#model.callSession.turn_count;
+      const clearMilestone = nextState === "standby" || nextState === "closed";
       this.#updateModel({
         callSession: {
           call_id: String(p["call_id"] ?? this.#model.callSession.call_id),
@@ -404,6 +423,7 @@ export class DesktopAppController {
           turn_count: turnCount,
           active_correlation_id: env.correlation_id,
         },
+        ...(clearMilestone ? { lastMilestone: null } : {}),
       });
       this.#resetSleepTimer();
       return;
@@ -461,7 +481,13 @@ export class DesktopAppController {
       return;
     }
 
-    if (env.event_type === "runner_failure" || env.event_type === "command_blocked") {
+    if (env.event_type === "runner_failure") {
+      const errorCode = String(p["error_code"] ?? "ORCHESTRATOR_UNEXPECTED_FAILURE");
+      this.#updateModel({ noticeBanner: resolveHumanNotice(errorCode) });
+      return;
+    }
+
+    if (env.event_type === "command_blocked") {
       const nested = p["message"] as UiChatMessage | undefined;
       if (nested) {
         this.#appendMessage(nested);
@@ -607,6 +633,8 @@ export class DesktopAppController {
           if (canonicalPath) {
             void this.selectWorkspace(canonicalPath);
           }
+        } else if (action === "dismiss-notice") {
+          this.dismissNotice();
         } else if (action === "approve-command") {
           const auditId = target.dataset["auditId"] ?? "";
           void this.resolveApproval(auditId, true);
