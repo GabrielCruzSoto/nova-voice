@@ -3,7 +3,7 @@
  * Holds CSRF token strictly in private JS memory, manages SSE + fetch lifecycle via
  * AbortController, and delegates rendering to pure components.ts functions.
  */
-import { escapeHtml, renderAppShell, renderApprovalBanner, renderCallControls, renderChatTimeline, renderNovaReactiveOrb, renderNovaSquircleSvg, renderSinusoidalWave, renderWorkspaceBar, } from "./components.js";
+import { escapeHtml, renderAppShell, renderApprovalBanner, renderChatTimeline, renderDock, renderNoticeSlot, renderWorkspaceBar, resolveHumanNotice, } from "./components.js";
 const MAX_CLIENT_MESSAGES = 200;
 export class DesktopAppController {
     #csrfToken = "";
@@ -28,8 +28,10 @@ export class DesktopAppController {
         pendingApprovals: [],
         messages: [],
         errorBanner: null,
+        noticeBanner: null,
         pickerFallbackOpen: false,
         lastMilestone: null,
+        uiMode: "panel",
     };
     constructor(options = {}) {
         this.#root = options.rootElement ?? null;
@@ -83,32 +85,66 @@ export class DesktopAppController {
         this.#csrfToken = "";
         this.#abortController.abort();
     }
+    dismissNotice() {
+        if (this.#disposed) {
+            return;
+        }
+        this.#updateModel({ noticeBanner: null, errorBanner: null });
+    }
     async submitChat(utterance) {
         const trimmed = utterance.trim();
-        if (!trimmed || this.#disposed) {
+        if (!trimmed || this.#disposed || !this.#model.activeWorkspace) {
             return;
         }
         const resp = await this.#postJson("/api/chat", { utterance: trimmed });
         if (!resp.ok) {
             const errBody = await this.#safeParseError(resp);
+            const code = errBody?.error_code ?? "ORCHESTRATOR_UNEXPECTED_FAILURE";
             this.#updateModel({
-                errorBanner: errBody?.message ?? "No se pudo enviar el mensaje.",
+                noticeBanner: resolveHumanNotice(code),
+                errorBanner: null,
             });
         }
-        else if (this.#model.errorBanner !== null) {
-            this.#updateModel({ errorBanner: null });
+        else if (this.#model.noticeBanner !== null || this.#model.errorBanner !== null) {
+            this.#updateModel({ noticeBanner: null, errorBanner: null });
         }
     }
     async triggerCallAction(action) {
         if (this.#disposed) {
             return;
         }
+        const inCall = this.#model.callSession.state !== "standby" && this.#model.callSession.state !== "closed";
+        if (action === "barge-in" && (!inCall || !this.#model.voiceEnabled)) {
+            return;
+        }
         const resp = await this.#postJson(`/api/call/${action}`, {});
         if (!resp.ok) {
             const errBody = await this.#safeParseError(resp);
+            const code = errBody?.error_code ?? "ORCHESTRATOR_UNEXPECTED_FAILURE";
             this.#updateModel({
-                errorBanner: errBody?.message ?? `No fue posible ejecutar '${action}'.`,
+                noticeBanner: resolveHumanNotice(code),
+                errorBanner: null,
             });
+        }
+    }
+    async toggleUiMode() {
+        if (this.#disposed) {
+            return;
+        }
+        const nextMode = (this.#model.uiMode ?? "panel") === "orb" ? "panel" : "orb";
+        this.#updateModel({ uiMode: nextMode });
+    }
+    async handleEscapeKey() {
+        if (this.#disposed) {
+            return;
+        }
+        const inCall = this.#model.callSession.state !== "standby" && this.#model.callSession.state !== "closed";
+        if (inCall) {
+            await this.triggerCallAction("barge-in");
+            return;
+        }
+        if ((this.#model.uiMode ?? "panel") === "orb") {
+            this.#updateModel({ uiMode: "panel" });
         }
     }
     async selectWorkspace(pathOrQuery) {
@@ -119,8 +155,10 @@ export class DesktopAppController {
         const resp = await this.#postJson("/api/workspace/select", { path_or_query: cleaned });
         if (!resp.ok) {
             const errBody = await this.#safeParseError(resp);
+            const code = errBody?.error_code ?? "ORCHESTRATOR_UNEXPECTED_FAILURE";
             this.#updateModel({
-                errorBanner: errBody?.message ?? "No fue posible cambiar de proyecto.",
+                noticeBanner: resolveHumanNotice(code),
+                errorBanner: null,
             });
             return;
         }
@@ -130,6 +168,7 @@ export class DesktopAppController {
                 activeWorkspace: data.workspace,
                 pickerFallbackOpen: false,
                 errorBanner: null,
+                noticeBanner: null,
             });
         }
     }
@@ -151,8 +190,10 @@ export class DesktopAppController {
         }
         if (!resp.ok) {
             const errBody = await this.#safeParseError(resp);
+            const code = errBody?.error_code ?? "ORCHESTRATOR_UNEXPECTED_FAILURE";
             this.#updateModel({
-                errorBanner: errBody?.message ?? "Error al seleccionar carpeta.",
+                noticeBanner: resolveHumanNotice(code),
+                errorBanner: null,
             });
             return;
         }
@@ -162,6 +203,7 @@ export class DesktopAppController {
                 activeWorkspace: data.workspace,
                 pickerFallbackOpen: false,
                 errorBanner: null,
+                noticeBanner: null,
             });
         }
     }
@@ -308,6 +350,7 @@ export class DesktopAppController {
         if (env.event_type === "call_state_changed") {
             const nextState = p["state"] ?? "standby";
             const turnCount = typeof p["turn_count"] === "number" ? p["turn_count"] : this.#model.callSession.turn_count;
+            const clearMilestone = nextState === "standby" || nextState === "closed";
             this.#updateModel({
                 callSession: {
                     call_id: String(p["call_id"] ?? this.#model.callSession.call_id),
@@ -315,6 +358,7 @@ export class DesktopAppController {
                     turn_count: turnCount,
                     active_correlation_id: env.correlation_id,
                 },
+                ...(clearMilestone ? { lastMilestone: null } : {}),
             });
             this.#resetSleepTimer();
             return;
@@ -366,7 +410,12 @@ export class DesktopAppController {
             this.#appendMessage(msg);
             return;
         }
-        if (env.event_type === "runner_failure" || env.event_type === "command_blocked") {
+        if (env.event_type === "runner_failure") {
+            const errorCode = String(p["error_code"] ?? "ORCHESTRATOR_UNEXPECTED_FAILURE");
+            this.#updateModel({ noticeBanner: resolveHumanNotice(errorCode) });
+            return;
+        }
+        if (env.event_type === "command_blocked") {
             const nested = p["message"];
             if (nested) {
                 this.#appendMessage(nested);
@@ -419,18 +468,23 @@ export class DesktopAppController {
         if (!this.#root) {
             return;
         }
-        if (!this.#shellMounted) {
+        if (!this.#shellMounted || this.#model.uiMode === "orb") {
             this.#root.innerHTML = fullHtml;
-            this.#shellMounted = true;
+            this.#shellMounted = this.#model.uiMode !== "orb";
             return;
         }
-        const wsSlot = this.#root.querySelector('[data-slot="workspace-bar"]');
-        if (wsSlot) {
-            wsSlot.innerHTML = renderWorkspaceBar(this.#model.activeWorkspace, this.#model.availableWorkspaces, this.#model.pickerFallbackOpen);
+        const headerSlot = this.#root.querySelector('[data-slot="header"]');
+        if (headerSlot) {
+            headerSlot.innerHTML = renderWorkspaceBar(this.#model.activeWorkspace, this.#model.availableWorkspaces, this.#model.pickerFallbackOpen, this.#model.callSession.state);
         }
-        const orbSlot = this.#root.querySelector('[data-slot="orb"]');
-        if (orbSlot) {
-            orbSlot.innerHTML = renderNovaReactiveOrb(this.#model.callSession.state, this.#model.voiceEnabled);
+        const timelineSlot = this.#root.querySelector('[data-slot="timeline"]');
+        if (timelineSlot) {
+            timelineSlot.innerHTML = renderChatTimeline(this.#model.status, this.#model.messages, this.#model.errorBanner, this.#model.activeWorkspace, this.#model.availableWorkspaces);
+            timelineSlot.scrollTop = timelineSlot.scrollHeight;
+        }
+        const approvalsSlot = this.#root.querySelector('[data-slot="approvals"]');
+        if (approvalsSlot) {
+            approvalsSlot.innerHTML = renderApprovalBanner(this.#model.pendingApprovals);
         }
         const milestoneSlot = this.#root.querySelector('[data-slot="milestone"]');
         if (milestoneSlot) {
@@ -438,45 +492,45 @@ export class DesktopAppController {
                 ? `<p class="nova-milestone-toast" aria-live="polite">${escapeHtml(this.#model.lastMilestone)}</p>`
                 : "";
         }
-        const controlsSlot = this.#root.querySelector('[data-slot="call-controls"]');
-        if (controlsSlot) {
-            controlsSlot.innerHTML = renderCallControls(this.#model.callSession.state, this.#model.voiceEnabled);
+        const noticeSlot = this.#root.querySelector('[data-slot="notice"]');
+        if (noticeSlot) {
+            noticeSlot.outerHTML = renderNoticeSlot(this.#model);
         }
-        const approvalsSlot = this.#root.querySelector('[data-slot="approvals"]');
-        if (approvalsSlot) {
-            approvalsSlot.innerHTML = renderApprovalBanner(this.#model.pendingApprovals);
-        }
-        const timelineSlot = this.#root.querySelector('[data-slot="timeline"]');
-        if (timelineSlot) {
-            timelineSlot.innerHTML = renderChatTimeline(this.#model.status, this.#model.messages, this.#model.errorBanner);
-            timelineSlot.scrollTop = timelineSlot.scrollHeight;
-        }
-        const waveSlot = this.#root.querySelector('[data-slot="wave"]');
-        if (waveSlot) {
-            waveSlot.innerHTML = renderSinusoidalWave(this.#model.callSession.state);
-        }
-        const headerSlot = this.#root.querySelector('[data-slot="panel-header"]');
-        if (headerSlot) {
-            const isStandby = this.#model.callSession.state === "standby" || this.#model.callSession.state === "closed";
-            const uiMode = this.#model.uiMode ?? "panel";
-            headerSlot.innerHTML = `
-        <div class="panel-header-brand">
-          ${renderNovaSquircleSvg(32, !isStandby)}
-          <span class="panel-brand-text">NOVA</span>
-          ${isStandby
-                ? `<span class="panel-standby-badge">EN REPOSO <span class="status-dot status-dot--off"></span></span>`
-                : `<span class="status-dot status-dot--on" title="Conectado y escuchando"></span>`}
-        </div>
-        <button
-          type="button"
-          class="btn-toggle-view"
-          data-action="toggle-ui-mode"
-          title="Alternar entre panel y orbe flotante"
-          aria-label="Alternar vista compacta de orbe"
-        >
-          ${uiMode === "orb" ? "Ampliar panel" : "Modo widget"}
-        </button>
-      `.trim();
+        const inCall = this.#model.callSession.state !== "standby" && this.#model.callSession.state !== "closed";
+        const dockSlot = this.#root.querySelector('[data-slot="dock"]');
+        if (dockSlot) {
+            const currentDockMode = dockSlot.dataset["dockMode"];
+            const targetDockMode = inCall ? "call" : "standby";
+            if (currentDockMode !== targetDockMode) {
+                dockSlot.dataset["dockMode"] = targetDockMode;
+                dockSlot.innerHTML = renderDock(this.#model);
+            }
+            else if (targetDockMode === "call") {
+                dockSlot.innerHTML = renderDock(this.#model);
+            }
+            else {
+                const inputEl = dockSlot.querySelector("#nova-chat-input");
+                const preservedValue = inputEl ? inputEl.value : undefined;
+                const preservedSelectionStart = inputEl ? inputEl.selectionStart : undefined;
+                const preservedSelectionEnd = inputEl ? inputEl.selectionEnd : undefined;
+                dockSlot.innerHTML = renderDock(this.#model);
+                if (preservedValue !== undefined) {
+                    const restoredInput = dockSlot.querySelector("#nova-chat-input");
+                    if (restoredInput) {
+                        restoredInput.value = preservedValue;
+                        if (typeof preservedSelectionStart === "number" &&
+                            typeof preservedSelectionEnd === "number" &&
+                            typeof restoredInput.setSelectionRange === "function") {
+                            try {
+                                restoredInput.setSelectionRange(preservedSelectionStart, preservedSelectionEnd);
+                            }
+                            catch {
+                                // Ignore in headless / test environments
+                            }
+                        }
+                    }
+                }
+            }
         }
         const layoutEl = this.#root.querySelector(".nova-layout");
         if (layoutEl) {
@@ -497,12 +551,7 @@ export class DesktopAppController {
             }
             const action = target.dataset["action"];
             if (action === "toggle-ui-mode") {
-                if (this.#model.callSession.state === "standby" ||
-                    this.#model.callSession.state === "closed") {
-                    void this.triggerCallAction("start");
-                }
-                const nextMode = (this.#model.uiMode ?? "panel") === "orb" ? "panel" : "orb";
-                this.#updateModel({ uiMode: nextMode });
+                void this.toggleUiMode();
             }
             else if (action === "call-start") {
                 void this.triggerCallAction("start");
@@ -515,6 +564,15 @@ export class DesktopAppController {
             }
             else if (action === "pick-native") {
                 void this.pickNativeWorkspace();
+            }
+            else if (action === "select-workspace-option") {
+                const canonicalPath = target.dataset["canonicalPath"] ?? "";
+                if (canonicalPath) {
+                    void this.selectWorkspace(canonicalPath);
+                }
+            }
+            else if (action === "dismiss-notice") {
+                this.dismissNotice();
             }
             else if (action === "approve-command") {
                 const auditId = target.dataset["auditId"] ?? "";
@@ -546,7 +604,7 @@ export class DesktopAppController {
         }, { signal: sig });
         root.addEventListener("keydown", (ev) => {
             if (ev.key === "Escape") {
-                void this.triggerCallAction("barge-in");
+                void this.handleEscapeKey();
                 return;
             }
             const target = ev.target;

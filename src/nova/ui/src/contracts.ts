@@ -105,6 +105,12 @@ export interface ErrorResponse {
   readonly correlation_id: string;
 }
 
+export interface UiNoticeBanner {
+  readonly code: string;
+  readonly message: string;
+  readonly dismissible: boolean;
+}
+
 export interface PresentationalAppModel {
   readonly status: ViewStatus;
   readonly voiceEnabled: boolean;
@@ -114,8 +120,9 @@ export interface PresentationalAppModel {
   readonly pendingApprovals: readonly UiApprovalItem[];
   readonly messages: readonly UiChatMessage[];
   readonly errorBanner: string | null;
+  readonly noticeBanner?: UiNoticeBanner | null;
   readonly pickerFallbackOpen: boolean;
   readonly lastMilestone: string | null;
-  readonly uiMode?: "orb" | "panel";
+  readonly uiMode: "panel" | "orb";
   readonly isStandby?: boolean;
 }
