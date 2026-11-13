@@ -56,9 +56,12 @@ TAGS_BEFORE="$(git tag -l 'v*')"
 # 6. Locate cz executable
 CZ_BIN=""
 root="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
+common_dir="$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null || true)"
 
 if [[ -x "${root}/.venv/bin/cz" ]]; then
   CZ_BIN="${root}/.venv/bin/cz"
+elif [[ -n "${common_dir}" && -x "$(dirname "${common_dir}")/.venv/bin/cz" ]]; then
+  CZ_BIN="$(dirname "${common_dir}")/.venv/bin/cz"
 elif [[ -n "${VIRTUAL_ENV:-}" && -x "${VIRTUAL_ENV}/bin/cz" ]]; then
   CZ_BIN="${VIRTUAL_ENV}/bin/cz"
 elif command -v cz >/dev/null 2>&1; then

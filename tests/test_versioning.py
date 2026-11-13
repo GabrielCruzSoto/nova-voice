@@ -152,11 +152,16 @@ def test_bump_version_valid_branch_creates_single_conventional_commit_without_ta
         check=True,
     ).stdout
 
+    import sys
+    env = dict(subprocess.os.environ)  # type: ignore[attr-defined]
+    env["PATH"] = f"{Path(sys.executable).parent}:{env.get('PATH', '')}"
+
     res = subprocess.run(
         ["bash", str(_BUMP_VERSION_SH)],
         cwd=version_git_repo,
         capture_output=True,
         text=True,
+        env=env,
     )
     assert res.returncode == 0, f"Bump failed: {res.stdout}\n{res.stderr}"
 

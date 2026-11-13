@@ -4,9 +4,9 @@
 from __future__ import annotations
 
 import json
-from pathlib import Path
 import sys
 import tomllib
+from pathlib import Path
 
 
 def main() -> int:
@@ -54,11 +54,14 @@ def main() -> int:
         if root_package_version != project_version:
             sys.stderr.write(
                 f"check-version-consistency: package-lock.json packages[''] version "
-                f"'{root_package_version}' diverges from pyproject.toml version '{project_version}'\n"
+                f"'{root_package_version}' diverges from "
+                f"pyproject.toml version '{project_version}'\n"
             )
             return 1
 
-    sys.stdout.write(f"check-version-consistency: All version declarations match {project_version}.\n")
+    sys.stdout.write(
+        f"check-version-consistency: All version declarations match {project_version}.\n"
+    )
     return 0
 
 

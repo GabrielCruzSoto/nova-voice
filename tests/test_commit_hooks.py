@@ -111,15 +111,22 @@ def test_commit_msg_hook_validation_scenarios(temp_git_repo: Path) -> None:
     # Switch to feature branch
     subprocess.run(["git", "checkout", "-b", "feature/NOVA-001"], cwd=temp_git_repo, check=True)
 
+    import sys
+
+    venv_bin = str(Path(sys.executable).parent)
+
     # Helper to attempt a commit
     def try_commit(msg: str) -> tuple[int, str]:
         (temp_git_repo / "dummy.txt").write_text(f"content {msg}\n")
         subprocess.run(["git", "add", "dummy.txt"], cwd=temp_git_repo, check=True)
+        env = dict(os.environ)
+        env["PATH"] = f"{venv_bin}:{env.get('PATH', '')}"
         r = subprocess.run(
             ["git", "commit", "-m", msg],
             cwd=temp_git_repo,
             capture_output=True,
             text=True,
+            env=env,
         )
         return r.returncode, r.stdout + r.stderr
 

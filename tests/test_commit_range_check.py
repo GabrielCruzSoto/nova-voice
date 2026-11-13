@@ -38,6 +38,10 @@ def test_pr_commit_range_valid_commits_and_valid_title(pr_git_repo: Path) -> Non
         ["git", "commit", "-m", "fix(ui): handle empty chat timeline"], cwd=pr_git_repo, check=True
     )
 
+    env = dict(subprocess.os.environ)  # type: ignore[attr-defined]
+    import sys
+    env["PATH"] = f"{Path(sys.executable).parent}:{env.get('PATH', '')}"
+
     # Valid range and valid title
     res = subprocess.run(
         [
@@ -51,6 +55,7 @@ def test_pr_commit_range_valid_commits_and_valid_title(pr_git_repo: Path) -> Non
         cwd=pr_git_repo,
         capture_output=True,
         text=True,
+        env=env,
     )
     assert res.returncode == 0, (
         f"Expected 0, got {res.returncode}. Output:\n{res.stdout}\n{res.stderr}"
@@ -81,6 +86,10 @@ def test_pr_commit_range_invalid_commit_fails_with_sha(pr_git_repo: Path) -> Non
         check=True,
     ).stdout.strip()
 
+    import sys
+    env = dict(subprocess.os.environ)  # type: ignore[attr-defined]
+    env["PATH"] = f"{Path(sys.executable).parent}:{env.get('PATH', '')}"
+
     res = subprocess.run(
         [
             "bash",
@@ -93,6 +102,7 @@ def test_pr_commit_range_invalid_commit_fails_with_sha(pr_git_repo: Path) -> Non
         cwd=pr_git_repo,
         capture_output=True,
         text=True,
+        env=env,
     )
     assert res.returncode != 0
     combined = res.stdout + res.stderr
@@ -106,6 +116,10 @@ def test_pr_commit_range_invalid_title_fails(pr_git_repo: Path) -> None:
     subprocess.run(["git", "add", "f1.txt"], cwd=pr_git_repo, check=True)
     subprocess.run(["git", "commit", "-m", "feat(core): valid commit"], cwd=pr_git_repo, check=True)
 
+    import sys
+    env = dict(subprocess.os.environ)  # type: ignore[attr-defined]
+    env["PATH"] = f"{Path(sys.executable).parent}:{env.get('PATH', '')}"
+
     res = subprocess.run(
         [
             "bash",
@@ -118,6 +132,7 @@ def test_pr_commit_range_invalid_title_fails(pr_git_repo: Path) -> None:
         cwd=pr_git_repo,
         capture_output=True,
         text=True,
+        env=env,
     )
     assert res.returncode != 0
     combined = res.stdout + res.stderr
