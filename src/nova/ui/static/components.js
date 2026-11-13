@@ -585,7 +585,6 @@ export function renderAppShell(model) {
           <button
             type="button"
             class="nova-widget-orb-btn"
-            data-slot="widget-orb"
             data-action="toggle-ui-mode"
             data-call-state="${escapeHtml(model.callSession.state)}"
             aria-label="Estado de Nova: ${escapeHtml(meta.title)}"

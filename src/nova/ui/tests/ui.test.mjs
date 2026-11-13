@@ -1492,3 +1492,254 @@ test("AC-13, AC-14, NFR-1..NFR-8: WCAG 2.1 AA contrast, focus order landmarks, a
   const spkDockIdx = speakingHtml.indexOf('data-slot="dock"');
   assert.ok(spkApprovalsIdx < spkDockIdx, "Approvals stay above dock during speaking state");
 });
+
+test("Live DOM slot patching: Standby dock syncs disabled state and preserves input draft", async () => {
+  function createStubDom() {
+    function createNode(tag = "div", attrs = {}) {
+      const el = {
+        tagName: tag.toUpperCase(),
+        attributes: { ...attrs },
+        dataset: {},
+        children: [],
+        _value: "",
+        _innerHTML: "",
+        scrollTop: 0,
+        scrollHeight: 100,
+        get value() {
+          return this._value;
+        },
+        set value(v) {
+          this._value = String(v);
+        },
+        get disabled() {
+          return "disabled" in this.attributes;
+        },
+        set disabled(v) {
+          if (v) this.attributes["disabled"] = "";
+          else delete this.attributes["disabled"];
+        },
+        getAttribute(name) {
+          return this.attributes[name] ?? null;
+        },
+        setAttribute(name, val) {
+          this.attributes[name] = String(val);
+          if (name.startsWith("data-")) {
+            const camel = name.slice(5).replace(/-([a-z])/g, (_, c) => c.toUpperCase());
+            this.dataset[camel] = String(val);
+          }
+        },
+        removeAttribute(name) {
+          delete this.attributes[name];
+          if (name.startsWith("data-")) {
+            const camel = name.slice(5).replace(/-([a-z])/g, (_, c) => c.toUpperCase());
+            delete this.dataset[camel];
+          }
+        },
+        focus() {},
+        setSelectionRange(s, e) {
+          this.selectionStart = s;
+          this.selectionEnd = e;
+        },
+      };
+
+      for (const [k, v] of Object.entries(attrs)) {
+        if (k.startsWith("data-")) {
+          const camel = k.slice(5).replace(/-([a-z])/g, (_, c) => c.toUpperCase());
+          el.dataset[camel] = v;
+        }
+      }
+      return el;
+    }
+
+    function matches(el, sel) {
+      if (sel.startsWith("#")) {
+        return el.attributes["id"] === sel.slice(1);
+      }
+      if (sel.startsWith(".")) {
+        const cls = el.attributes["class"] ?? "";
+        return cls.split(/\s+/).includes(sel.slice(1));
+      }
+      if (sel.startsWith("[") && sel.endsWith("]")) {
+        const inner = sel.slice(1, -1);
+        const eqIdx = inner.indexOf("=");
+        if (eqIdx === -1) {
+          return inner in el.attributes;
+        }
+        const attr = inner.slice(0, eqIdx);
+        const val = inner.slice(eqIdx + 1).replace(/^["']|["']$/g, "");
+        return el.attributes[attr] === val;
+      }
+      return el.tagName.toLowerCase() === sel.toLowerCase();
+    }
+
+    function query(node, sel) {
+      for (const child of node.children) {
+        if (matches(child, sel)) {
+          return child;
+        }
+        const found = query(child, sel);
+        if (found) return found;
+      }
+      return null;
+    }
+
+    function parseHtml(html) {
+      const rootNode = createNode("div");
+      const stack = [rootNode];
+      const tagRegex = /<(\/?[a-zA-Z0-9-]+)([^>]*)>/g;
+
+      let match;
+      while ((match = tagRegex.exec(html)) !== null) {
+        const fullTag = match[1];
+        const attrString = match[2];
+
+        if (fullTag.startsWith("/")) {
+          const closeTag = fullTag.slice(1).toUpperCase();
+          if (stack.length > 1 && stack[stack.length - 1].tagName === closeTag) {
+            stack.pop();
+          }
+        } else {
+          const openTag = fullTag;
+          const attrs = {};
+          const attrRegex = /([a-zA-Z0-9-]+)(?:=(?:"([^"]*)"|'([^']*)'|([^\s>]+)))?/g;
+          let attrMatch;
+          while ((attrMatch = attrRegex.exec(attrString)) !== null) {
+            const key = attrMatch[1];
+            const val = attrMatch[2] ?? attrMatch[3] ?? attrMatch[4] ?? "";
+            attrs[key] = val;
+          }
+          const el = createNode(openTag, attrs);
+          stack[stack.length - 1].children.push(el);
+
+          const isSelfClosing = attrString.trim().endsWith("/");
+          const voidTags = ["input", "img", "br", "hr", "meta", "line", "path", "circle", "rect", "polygon"];
+          if (!isSelfClosing && !voidTags.includes(openTag.toLowerCase())) {
+            stack.push(el);
+          }
+        }
+      }
+
+      function wire(node) {
+        node.querySelector = (sel) => query(node, sel);
+        Object.defineProperty(node, "innerHTML", {
+          get() {
+            return this._innerHTML;
+          },
+          set(newHtml) {
+            this._innerHTML = newHtml;
+            const parsed = parseHtml(newHtml);
+            this.children = parsed.children;
+          },
+          configurable: true,
+        });
+        for (const c of node.children) {
+          wire(c);
+        }
+        return node;
+      }
+
+      wire(rootNode);
+      rootNode._innerHTML = html;
+      return rootNode;
+    }
+
+    const root = createNode("div");
+    root.addEventListener = () => {};
+    root.querySelector = (sel) => query(root, sel);
+    Object.defineProperty(root, "innerHTML", {
+      get() {
+        return this._innerHTML;
+      },
+      set(newHtml) {
+        this._innerHTML = newHtml;
+        const parsed = parseHtml(newHtml);
+        this.children = parsed.children;
+      },
+      configurable: true,
+    });
+
+    return root;
+  }
+
+  const rootStub = createStubDom();
+  let sseControllerRef = null;
+  const encoder = new TextEncoder();
+
+  const fakeFetch = async (url) => {
+    if (url === "/api/state") {
+      return new Response(
+        JSON.stringify({
+          schema_version: "1.3.0",
+          csrf_token: "csrf-live-dom",
+          voice_enabled: true,
+          call_session: { call_id: "c-live", state: "standby", turn_count: 0, active_correlation_id: null },
+          active_workspace: { display_name: "demo", canonical_path: "/home/dev/demo", selected_via: "exact_path" },
+          available_workspaces: [],
+          pending_approvals: [],
+          messages: [],
+        }),
+        { status: 200 },
+      );
+    }
+    if (url === "/api/events") {
+      const stream = new ReadableStream({
+        start(controller) {
+          sseControllerRef = controller;
+        },
+      });
+      return new Response(stream, {
+        status: 200,
+        headers: { "Content-Type": "text/event-stream" },
+      });
+    }
+    return new Response(JSON.stringify({ ok: true }), { status: 200 });
+  };
+
+  const app = new DesktopAppController({
+    rootElement: rootStub,
+    fetchImpl: fakeFetch,
+  });
+
+  await app.start();
+  await new Promise((r) => setTimeout(r, 20));
+
+  // 1. After start() and state resolution, live DOM must have enabled input, send button, and dock orb
+  const inputEl = rootStub.querySelector("#nova-chat-input");
+  const sendBtn = rootStub.querySelector(".btn-send");
+  const orbBtn = rootStub.querySelector(".nova-dock-orb");
+
+  assert.ok(inputEl, "#nova-chat-input must exist in live DOM");
+  assert.ok(sendBtn, ".btn-send must exist in live DOM");
+  assert.ok(orbBtn, ".nova-dock-orb must exist in live DOM");
+
+  assert.equal(inputEl.disabled, false, "Live DOM chat input must be enabled once activeWorkspace is set");
+  assert.equal(sendBtn.disabled, false, "Live DOM send button must be enabled once activeWorkspace is set");
+  assert.equal(orbBtn.disabled, false, "Live DOM dock orb must be enabled when voiceEnabled is true and in standby");
+
+  // 2. User writes a draft in the textarea
+  inputEl.value = "Texto borrador del usuario";
+
+  // 3. SSE event arrives (chat_stream while in standby)
+  const streamEvent = `event: nova_event\ndata: ${JSON.stringify({
+    seq: 1,
+    event_type: "chat_stream",
+    correlation_id: "corr-live-1",
+    timestamp: new Date().toISOString(),
+    payload: {
+      message_id: "msg-stream-1",
+      delta: "Hola desde stream",
+      source: "tier1_pi",
+      step_type: "agent_response",
+    },
+  })}\n\n`;
+
+  sseControllerRef.enqueue(encoder.encode(streamEvent));
+  await new Promise((r) => setTimeout(r, 20));
+
+  // 4. Assert that input.value is PRESERVED after render
+  const afterStreamInput = rootStub.querySelector("#nova-chat-input");
+  assert.ok(afterStreamInput, "#nova-chat-input must exist after SSE stream update");
+  assert.equal(afterStreamInput.value, "Texto borrador del usuario", "User draft must be preserved during live DOM updates in standby");
+
+  app.dispose();
+});

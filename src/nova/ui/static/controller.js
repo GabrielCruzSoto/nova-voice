@@ -505,6 +505,32 @@ export class DesktopAppController {
                 dockSlot.dataset["dockMode"] = targetDockMode;
                 dockSlot.innerHTML = renderDock(this.#model);
             }
+            else if (targetDockMode === "call") {
+                dockSlot.innerHTML = renderDock(this.#model);
+            }
+            else {
+                const inputEl = dockSlot.querySelector("#nova-chat-input");
+                const preservedValue = inputEl ? inputEl.value : undefined;
+                const preservedSelectionStart = inputEl ? inputEl.selectionStart : undefined;
+                const preservedSelectionEnd = inputEl ? inputEl.selectionEnd : undefined;
+                dockSlot.innerHTML = renderDock(this.#model);
+                if (preservedValue !== undefined) {
+                    const restoredInput = dockSlot.querySelector("#nova-chat-input");
+                    if (restoredInput) {
+                        restoredInput.value = preservedValue;
+                        if (typeof preservedSelectionStart === "number" &&
+                            typeof preservedSelectionEnd === "number" &&
+                            typeof restoredInput.setSelectionRange === "function") {
+                            try {
+                                restoredInput.setSelectionRange(preservedSelectionStart, preservedSelectionEnd);
+                            }
+                            catch {
+                                // Ignore in headless / test environments
+                            }
+                        }
+                    }
+                }
+            }
         }
         const layoutEl = this.#root.querySelector(".nova-layout");
         if (layoutEl) {
