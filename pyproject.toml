@@ -53,6 +53,7 @@ nova = [
     "ui/static/*",
     "extensions/*.ts",
     "plugins/agy_gatekeeper/*",
+    "config/*.json",
 ]
 
 [tool.pytest.ini_options]
