@@ -5,6 +5,7 @@ Priority: optional
 Architecture: amd64
 Maintainer: Gabriel Cruz Soto <dev@nova.local>
 Depends: python3 (>= 3.12), python3 (<< 3.13), python3-venv, python3-gi, gir1.2-gtk-3.0, pipewire-bin | pulseaudio-utils, xdg-utils
+Recommends: python3-pyqt6, python3-pyqt6.qtwebengine, python3-pyqt6.qtsvg, libgtk-4-1, libcairo2
 Installed-Size: __INSTALLED_SIZE_KB__
 Description: Nova local voice-assisted agentic desktop orchestrator
  Nova provides a hybrid local desktop voice assistant and terminal orchestrator

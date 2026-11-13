@@ -1,4 +1,6 @@
+.venv
 .venv/
+venv
 venv/
 __pycache__/
 *.py[cod]
@@ -8,6 +10,7 @@ dist/
 build/
 .coverage
 htmlcov/
+node_modules
 node_modules/
 
 # Local voice models (downloaded, not versioned)

@@ -212,3 +212,54 @@ def test_op4_voice_milestone_enforces_25_word_budget_and_pydantic_validation() -
         step_type="agent_response",
     )
     assert chat_ev.source == "tier1_pi"
+
+
+async def test_ac9_list_available_workspaces_excludes_technical_artifact_directories(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "Proyectos"
+    real_repo = root / "nova-platform"
+    nested_group = root / "org-services"
+    nested_repo = nested_group / "billing-api"
+    real_repo.mkdir(parents=True)
+    nested_repo.mkdir(parents=True)
+
+    # Create technical/artifact folders both at root depth=1 and nested depth=2
+    ignored_names = (
+        "__pycache__",
+        "node_modules",
+        "venv",
+        "env",
+        "dist",
+        "build",
+        "target",
+        "coverage",
+        "htmlcov",
+        ".venv",
+    )
+    for name in ignored_names:
+        (root / name).mkdir(parents=True, exist_ok=True)
+        (nested_group / name).mkdir(parents=True, exist_ok=True)
+    (real_repo / ".git").mkdir(parents=True, exist_ok=True)
+
+    resolver = LocalWorkspaceResolver(allowed_roots=[root])
+    available = await resolver.list_available_workspaces()
+    listed_names = [display_name for display_name, _ in available]
+
+    assert "nova-platform" in listed_names
+    assert "org-services" in listed_names
+    assert "billing-api" in listed_names
+    for ignored in ignored_names:
+        assert ignored not in listed_names, f"Technical folder {ignored!r} must be excluded"
+
+    # Explicit exact_path selection within allowed_roots remains permitted
+    explicit_dist = root / "dist"
+    ctx = await resolver.resolve(
+        ResolveWorkspaceRequest(
+            correlation_id="corr-exact-dist",
+            query=str(explicit_dist),
+            mode="exact_path",
+        )
+    )
+    assert ctx.canonical_path == str(explicit_dist.resolve())
+

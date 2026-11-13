@@ -1,21 +1,25 @@
 <svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 216 216" width="216" height="216">
-  <!-- Muted Squircle Base -->
-  <rect x="6" y="6" width="204" height="204" rx="54" ry="54" fill="rgba(34, 40, 52, 0.68)" stroke="#526071" stroke-width="2" stroke-opacity="0.5" />
+  <defs>
+    <linearGradient id="mutedSquircleBg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#222938" stop-opacity="0.92" />
+      <stop offset="100%" stop-color="#121722" stop-opacity="0.96" />
+    </linearGradient>
+    <linearGradient id="mutedMonogramBevel" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#7c8b9e" />
+      <stop offset="50%" stop-color="#526071" />
+      <stop offset="100%" stop-color="#3e4a59" />
+    </linearGradient>
+  </defs>
 
-  <!-- Muted Subtle Orbits -->
-  <g opacity="0.35">
-    <ellipse cx="108" cy="108" rx="88" ry="34" fill="none" stroke="#526071" stroke-width="1.5" transform="rotate(-30 108 108)" />
-    <ellipse cx="108" cy="108" rx="88" ry="34" fill="none" stroke="#526071" stroke-width="1.5" transform="rotate(35 108 108)" />
-  </g>
+  <rect x="8" y="8" width="200" height="200" rx="52" ry="52" fill="url(#mutedSquircleBg)" stroke="#526071" stroke-width="2.2" stroke-opacity="0.6" />
+  <rect x="14" y="14" width="188" height="188" rx="46" ry="46" fill="none" stroke="#cbd5e1" stroke-opacity="0.08" stroke-width="1" />
 
-  <!-- Muted N Monogram -->
-  <path d="M 68 156 L 68 62 L 86 62 L 132 128 L 132 62 L 150 62 L 150 156 L 132 156 L 86 90 L 86 156 Z"
-        fill="#526071" stroke="#64748b" stroke-width="1" stroke-linejoin="round" />
+  <path d="M 64 156 L 64 60 L 86 60 L 132 126 L 132 60 L 152 60 L 152 156 L 130 156 L 84 90 L 84 156 Z"
+        fill="url(#mutedMonogramBevel)" stroke="#94a3b8" stroke-opacity="0.45" stroke-width="1.2" stroke-linejoin="round" />
 
-  <!-- Muted Minimal Star -->
-  <g transform="translate(142, 68)">
-    <circle cx="0" cy="0" r="10" fill="#64748b" opacity="0.25" />
-    <path d="M 0 -14 Q 1 -3 14 0 Q 1 3 0 14 Q -1 3 -14 0 Q -1 -3 0 -14 Z" fill="#94a3b8" opacity="0.6" />
-    <circle cx="0" cy="0" r="2" fill="#cbd5e1" />
+  <g transform="translate(146, 64)">
+    <circle cx="0" cy="0" r="9" fill="#94a3b8" opacity="0.22" />
+    <path d="M 0 -13 Q 1 -2.5 13 0 Q 1 2.5 0 13 Q -1 2.5 -13 0 Q -1 -2.5 0 -13 Z" fill="#cbd5e1" opacity="0.72" />
+    <circle cx="0" cy="0" r="2" fill="#f8fafc" opacity="0.85" />
   </g>
 </svg>

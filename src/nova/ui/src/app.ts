@@ -12,7 +12,22 @@ function bootstrapNovaDesktop(): void {
   if (!root) {
     return;
   }
-  const controller = new DesktopAppController({ rootElement: root });
+  const isFramelessShell = window.location.hash === "#desktop-shell";
+  if (isFramelessShell) {
+    document.documentElement.setAttribute("data-shell-frameless", "true");
+  }
+
+  const controller = new DesktopAppController({
+    rootElement: root,
+    onMinimizeToHost: isFramelessShell
+      ? () => {
+          document.title = "Nova::HIDE_PANEL";
+          window.setTimeout(() => {
+            document.title = "Nova";
+          }, 60);
+        }
+      : undefined,
+  });
   void controller.start();
 
   window.addEventListener(

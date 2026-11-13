@@ -427,3 +427,103 @@ async def test_ac6_python_m_nova_cli_starts_and_exits_cleanly_on_sigterm(
     # Socket file inside sock_dir must be cleaned up on graceful shutdown
     remaining_sockets = _list_sockets(sock_dir)
     assert remaining_sockets == []
+
+
+async def test_ac1_auto_preference_prefers_native_shell_and_falls_back() -> None:
+    spawned: list[tuple[str, ...]] = []
+
+    class _DummyProc:
+        async def wait(self) -> int:
+            return 0
+
+    async def _fake_spawner(*argv: str) -> _DummyProc:
+        spawned.append(argv)
+        return _DummyProc()
+
+    # 1. When native desktop shell is available, preference="auto" launches desktop_window
+    opened_native = await open_local_browser_window(
+        "http://127.0.0.1:8765",
+        preference="auto",
+        env={"WAYLAND_DISPLAY": "wayland-0"},
+        which_resolver=lambda name: f"/usr/bin/{name}",
+        spawner=_fake_spawner,
+        native_shell_available=lambda: True,
+    )
+    assert opened_native is True
+    assert list(spawned[-1]) == [
+        sys.executable,
+        "-m",
+        "nova.adapters.desktop_window",
+        "http://127.0.0.1:8765",
+    ]
+
+    # 2. When native shell is unavailable, preference="auto" falls back to xdg-open -> firefox
+    opened_fallback = await open_local_browser_window(
+        "http://127.0.0.1:8765",
+        preference="auto",
+        env={"WAYLAND_DISPLAY": "wayland-0"},
+        which_resolver=lambda name: "/usr/bin/xdg-open" if name == "xdg-open" else None,
+        spawner=_fake_spawner,
+        native_shell_available=lambda: False,
+    )
+    assert opened_fallback is True
+    assert list(spawned[-1]) == ["/usr/bin/xdg-open", "http://127.0.0.1:8765"]
+
+
+async def test_ac10_runtime_close_terminates_and_reaps_spawned_ui_subprocess_without_orphans(
+    tmp_path: Path,
+) -> None:
+    pid_file = tmp_path / "ui_child.pid"
+    sleeper_script = tmp_path / "fake_ui_sleeper.py"
+    sleeper_script.write_text(
+        textwrap.dedent(
+            f"""
+            import os, pathlib, time
+            pathlib.Path({str(pid_file)!r}).write_text(str(os.getpid()), encoding="utf-8")
+            time.sleep(60)
+            """
+        ),
+        encoding="utf-8",
+    )
+
+    async def _real_detached_spawner(*_argv: str) -> asyncio.subprocess.Process:
+        return await asyncio.create_subprocess_exec(
+            sys.executable,
+            str(sleeper_script),
+            stdin=asyncio.subprocess.DEVNULL,
+            stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.DEVNULL,
+            start_new_session=True,
+        )
+
+    cfg = NovaDesktopConfig(
+        port=0,
+        allowed_roots=(str(tmp_path),),
+        open_browser=True,
+        browser_preference="webview",
+        enable_voice=False,
+        ipc_runtime_dir=str(tmp_path / "sock"),
+    )
+
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setenv("WAYLAND_DISPLAY", "wayland-0")
+        async with NovaDesktopRuntime(cfg, browser_spawner=_real_detached_spawner):
+            for _ in range(50):
+                if _path_exists(pid_file):
+                    break
+                await asyncio.sleep(0.05)
+            assert _path_exists(pid_file), "Fake UI child must have started and written its PID"
+            child_pid = int(pid_file.read_text(encoding="utf-8").strip())
+            # Process is alive while runtime is active
+            os.kill(child_pid, 0)
+
+    try:
+        # Immediately after runtime.close(), the detached UI child process must be dead (no orphan)
+        with pytest.raises(ProcessLookupError):
+            os.kill(child_pid, 0)
+    finally:
+        try:
+            os.kill(child_pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+

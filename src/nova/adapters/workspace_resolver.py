@@ -20,6 +20,19 @@ from nova.domain.models import ResolveWorkspaceRequest, WorkspaceContext, Worksp
 
 MAX_SCAN_ENTRIES = 500
 MAX_SCAN_DEPTH = 2
+IGNORED_WORKSPACE_DIRS: frozenset[str] = frozenset(
+    {
+        "__pycache__",
+        "node_modules",
+        "venv",
+        "env",
+        "dist",
+        "build",
+        "target",
+        "coverage",
+        "htmlcov",
+    }
+)
 
 
 def _normalize_slug(text: str) -> str:
@@ -284,7 +297,7 @@ class LocalWorkspaceResolver:
         for entry in entries:
             if scanned >= MAX_SCAN_ENTRIES:
                 break
-            if entry.name.startswith("."):
+            if entry.name.startswith(".") or entry.name.lower() in IGNORED_WORKSPACE_DIRS:
                 continue
             try:
                 if not entry.is_dir(follow_symlinks=False):

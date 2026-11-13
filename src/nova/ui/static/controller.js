@@ -14,6 +14,7 @@ export class DesktopAppController {
     #fetch;
     #root;
     #onRender;
+    #onMinimizeToHost;
     #model = {
         status: "loading",
         voiceEnabled: false,
@@ -37,6 +38,7 @@ export class DesktopAppController {
         this.#root = options.rootElement ?? null;
         this.#fetch = options.fetchImpl ?? ((url, init) => globalThis.fetch(url, init));
         this.#onRender = options.onRender;
+        this.#onMinimizeToHost = options.onMinimizeToHost;
     }
     get model() {
         return this.#model;
@@ -129,6 +131,10 @@ export class DesktopAppController {
     }
     async toggleUiMode() {
         if (this.#disposed) {
+            return;
+        }
+        if ((this.#model.uiMode ?? "panel") === "panel" && this.#onMinimizeToHost) {
+            this.#onMinimizeToHost();
             return;
         }
         const nextMode = (this.#model.uiMode ?? "panel") === "orb" ? "panel" : "orb";
