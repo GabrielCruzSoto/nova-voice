@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# Debian post-removal script for nova-voice.
+set -euo pipefail
+
+if [[ "${1:-}" == "purge" ]]; then
+  # Remove global package directory only; user files in $HOME are never touched
+  rm -rf /opt/nova
+fi
+
+if command -v update-desktop-database >/dev/null 2>&1; then
+  update-desktop-database /usr/share/applications || true
+fi
+
+exit 0

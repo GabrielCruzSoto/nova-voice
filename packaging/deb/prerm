@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+# Debian pre-removal script for nova-voice.
+set -euo pipefail
+
+if [[ "${1:-}" == "remove" || "${1:-}" == "upgrade" || "${1:-}" == "deconfigure" ]]; then
+  if [[ -d /opt/nova/venv ]]; then
+    find /opt/nova/venv -type f -name "*.pyc" -delete 2>/dev/null || true
+    find /opt/nova/venv -type d -name "__pycache__" -delete 2>/dev/null || true
+  fi
+fi
+
+exit 0
