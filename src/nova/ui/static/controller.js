@@ -3,7 +3,7 @@
  * Holds CSRF token strictly in private JS memory, manages SSE + fetch lifecycle via
  * AbortController, and delegates rendering to pure components.ts functions.
  */
-import { escapeHtml, renderAppShell, renderApprovalBanner, renderCallControls, renderChatTimeline, renderNovaReactiveOrb, renderNovaSquircleSvg, renderSinusoidalWave, renderWorkspaceBar, } from "./components.js";
+import { escapeHtml, renderAppShell, renderApprovalBanner, renderChatTimeline, renderDock, renderNoticeSlot, renderWorkspaceBar, } from "./components.js";
 const MAX_CLIENT_MESSAGES = 200;
 export class DesktopAppController {
     #csrfToken = "";
@@ -28,8 +28,10 @@ export class DesktopAppController {
         pendingApprovals: [],
         messages: [],
         errorBanner: null,
+        noticeBanner: null,
         pickerFallbackOpen: false,
         lastMilestone: null,
+        uiMode: "panel",
     };
     constructor(options = {}) {
         this.#root = options.rootElement ?? null;
@@ -419,18 +421,23 @@ export class DesktopAppController {
         if (!this.#root) {
             return;
         }
-        if (!this.#shellMounted) {
+        if (!this.#shellMounted || this.#model.uiMode === "orb") {
             this.#root.innerHTML = fullHtml;
-            this.#shellMounted = true;
+            this.#shellMounted = this.#model.uiMode !== "orb";
             return;
         }
-        const wsSlot = this.#root.querySelector('[data-slot="workspace-bar"]');
-        if (wsSlot) {
-            wsSlot.innerHTML = renderWorkspaceBar(this.#model.activeWorkspace, this.#model.availableWorkspaces, this.#model.pickerFallbackOpen);
+        const headerSlot = this.#root.querySelector('[data-slot="header"]');
+        if (headerSlot) {
+            headerSlot.innerHTML = renderWorkspaceBar(this.#model.activeWorkspace, this.#model.availableWorkspaces, this.#model.pickerFallbackOpen, this.#model.callSession.state);
         }
-        const orbSlot = this.#root.querySelector('[data-slot="orb"]');
-        if (orbSlot) {
-            orbSlot.innerHTML = renderNovaReactiveOrb(this.#model.callSession.state, this.#model.voiceEnabled);
+        const timelineSlot = this.#root.querySelector('[data-slot="timeline"]');
+        if (timelineSlot) {
+            timelineSlot.innerHTML = renderChatTimeline(this.#model.status, this.#model.messages, this.#model.errorBanner);
+            timelineSlot.scrollTop = timelineSlot.scrollHeight;
+        }
+        const approvalsSlot = this.#root.querySelector('[data-slot="approvals"]');
+        if (approvalsSlot) {
+            approvalsSlot.innerHTML = renderApprovalBanner(this.#model.pendingApprovals);
         }
         const milestoneSlot = this.#root.querySelector('[data-slot="milestone"]');
         if (milestoneSlot) {
@@ -438,45 +445,19 @@ export class DesktopAppController {
                 ? `<p class="nova-milestone-toast" aria-live="polite">${escapeHtml(this.#model.lastMilestone)}</p>`
                 : "";
         }
-        const controlsSlot = this.#root.querySelector('[data-slot="call-controls"]');
-        if (controlsSlot) {
-            controlsSlot.innerHTML = renderCallControls(this.#model.callSession.state, this.#model.voiceEnabled);
+        const noticeSlot = this.#root.querySelector('[data-slot="notice"]');
+        if (noticeSlot) {
+            noticeSlot.outerHTML = renderNoticeSlot(this.#model);
         }
-        const approvalsSlot = this.#root.querySelector('[data-slot="approvals"]');
-        if (approvalsSlot) {
-            approvalsSlot.innerHTML = renderApprovalBanner(this.#model.pendingApprovals);
-        }
-        const timelineSlot = this.#root.querySelector('[data-slot="timeline"]');
-        if (timelineSlot) {
-            timelineSlot.innerHTML = renderChatTimeline(this.#model.status, this.#model.messages, this.#model.errorBanner);
-            timelineSlot.scrollTop = timelineSlot.scrollHeight;
-        }
-        const waveSlot = this.#root.querySelector('[data-slot="wave"]');
-        if (waveSlot) {
-            waveSlot.innerHTML = renderSinusoidalWave(this.#model.callSession.state);
-        }
-        const headerSlot = this.#root.querySelector('[data-slot="panel-header"]');
-        if (headerSlot) {
-            const isStandby = this.#model.callSession.state === "standby" || this.#model.callSession.state === "closed";
-            const uiMode = this.#model.uiMode ?? "panel";
-            headerSlot.innerHTML = `
-        <div class="panel-header-brand">
-          ${renderNovaSquircleSvg(32, !isStandby)}
-          <span class="panel-brand-text">NOVA</span>
-          ${isStandby
-                ? `<span class="panel-standby-badge">EN REPOSO <span class="status-dot status-dot--off"></span></span>`
-                : `<span class="status-dot status-dot--on" title="Conectado y escuchando"></span>`}
-        </div>
-        <button
-          type="button"
-          class="btn-toggle-view"
-          data-action="toggle-ui-mode"
-          title="Alternar entre panel y orbe flotante"
-          aria-label="Alternar vista compacta de orbe"
-        >
-          ${uiMode === "orb" ? "Ampliar panel" : "Modo widget"}
-        </button>
-      `.trim();
+        const inCall = this.#model.callSession.state !== "standby" && this.#model.callSession.state !== "closed";
+        const dockSlot = this.#root.querySelector('[data-slot="dock"]');
+        if (dockSlot) {
+            const currentDockMode = dockSlot.dataset["dockMode"];
+            const targetDockMode = inCall ? "call" : "standby";
+            if (currentDockMode !== targetDockMode) {
+                dockSlot.dataset["dockMode"] = targetDockMode;
+                dockSlot.innerHTML = renderDock(this.#model);
+            }
         }
         const layoutEl = this.#root.querySelector(".nova-layout");
         if (layoutEl) {

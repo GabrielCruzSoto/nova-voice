@@ -166,7 +166,8 @@ export function renderCallControls(
   voiceEnabled: boolean,
 ): string {
   const inCall = callState !== "standby" && callState !== "closed";
-  const disabledAttr = voiceEnabled ? "" : ' disabled aria-disabled="true"';
+  const canBargeIn = voiceEnabled && inCall;
+  const bargeInDisabledAttr = canBargeIn ? "" : ' disabled aria-disabled="true"';
   const startDisabled = !voiceEnabled || inCall ? ' disabled aria-disabled="true"' : "";
   const endDisabled = !voiceEnabled || !inCall ? ' disabled aria-disabled="true"' : "";
 
@@ -182,7 +183,7 @@ export function renderCallControls(
       <button
         type="button"
         class="btn btn--warning"
-        data-action="call-barge-in"${disabledAttr}
+        data-action="call-barge-in"${bargeInDisabledAttr}
       >
         Interrumpir (Esc)
       </button>
@@ -201,17 +202,19 @@ export function renderWorkspaceBar(
   active: UiWorkspaceView | null,
   options: readonly UiWorkspaceOption[],
   pickerFallbackOpen: boolean,
+  callState: CallSessionState = "standby",
 ): string {
-  const activeName = active ? escapeHtml(active.display_name) : "Sin proyecto seleccionado";
-  const activePath = active
-    ? escapeHtml(active.canonical_path)
-    : "Selecciona una carpeta dentro de tus raíces permitidas";
-  const currentCanonical = active?.canonical_path ?? "";
+  const safeState = escapeHtml(callState);
+  const stateMeta = CALL_STATE_LABELS[callState] ?? CALL_STATE_LABELS.standby;
+
+  const chipHtml = active
+    ? `<span class="workspace-chip" title="${escapeHtml(active.canonical_path)}">${escapeHtml(active.display_name)}</span>`
+    : `<span class="workspace-chip workspace-chip--empty">Sin proyecto</span>`;
 
   const optionItems = options
     .map((opt) => {
-      const selected = opt.canonical_path === currentCanonical ? " selected" : "";
-      return `<option value="${escapeHtml(opt.canonical_path)}"${selected}>${escapeHtml(opt.display_name)} — ${escapeHtml(opt.canonical_path)}</option>`;
+      const selected = active && opt.canonical_path === active.canonical_path ? " selected" : "";
+      return `<option value="${escapeHtml(opt.canonical_path)}" title="${escapeHtml(opt.canonical_path)}"${selected}>${escapeHtml(opt.display_name)}</option>`;
     })
     .join("");
 
@@ -223,12 +226,12 @@ export function renderWorkspaceBar(
     <div class="workspace-bar">
       <div class="workspace-identity">
         <span class="workspace-brand">NOVA</span>
-        <div class="workspace-meta">
-          <strong class="workspace-name">${activeName}</strong>
-          <code class="workspace-path">${activePath}</code>
+        <div data-slot="state-indicator" role="status" aria-live="polite" class="nova-state-indicator">
+          <span class="nova-state-pill" data-state="${safeState}">${escapeHtml(stateMeta.title)}</span>
         </div>
       </div>
-      <div class="workspace-actions">
+      <div class="workspace-selection">
+        ${chipHtml}
         <label class="sr-only" for="nova-workspace-select">Cambiar proyecto activo</label>
         <select
           id="nova-workspace-select"
@@ -236,7 +239,7 @@ export function renderWorkspaceBar(
           data-action="select-workspace-dropdown"
           aria-label="Catálogo de proyectos permitidos"
         >
-          <option value="">Seleccionar proyecto del catálogo…</option>
+          <option value="">Seleccionar proyecto…</option>
           ${optionItems}
         </select>
         <button
@@ -245,6 +248,17 @@ export function renderWorkspaceBar(
           data-action="pick-native"
         >
           Abrir carpeta…
+        </button>
+      </div>
+      <div class="workspace-view-actions">
+        <button
+          type="button"
+          class="btn-toggle-view"
+          data-action="toggle-ui-mode"
+          title="Modo widget"
+          aria-label="Modo widget"
+        >
+          Modo widget
         </button>
       </div>
       ${fallbackNote}
@@ -448,74 +462,163 @@ export function renderComposerForm(): string {
   `.trim();
 }
 
+export function renderNoticeSlot(model: PresentationalAppModel): string {
+  if (model.noticeBanner) {
+    const dismissBtn = model.noticeBanner.dismissible
+      ? `<button type="button" class="btn-dismiss" data-action="dismiss-notice" aria-label="Cerrar aviso">Cerrar</button>`
+      : "";
+    return `
+      <div class="nova-notice-container" data-slot="notice" role="alert" data-error-code="${escapeHtml(model.noticeBanner.code)}">
+        <span class="notice-message">${escapeHtml(model.noticeBanner.message)}</span>
+        ${dismissBtn}
+      </div>
+    `.trim();
+  }
+  if (model.errorBanner) {
+    return `
+      <div class="nova-notice-container" data-slot="notice" role="alert">
+        <span class="notice-message">${escapeHtml(model.errorBanner)}</span>
+      </div>
+    `.trim();
+  }
+  return `<div class="nova-notice-container" data-slot="notice"></div>`;
+}
+
+export function renderDock(model: PresentationalAppModel): string {
+  const inCall = model.callSession.state !== "standby" && model.callSession.state !== "closed";
+
+  const orbDisabled = !model.voiceEnabled || inCall;
+  const orbDisabledAttrs = orbDisabled ? ' disabled aria-disabled="true"' : "";
+  const orbHtml = `
+    <button
+      type="button"
+      class="nova-dock-orb"
+      data-action="call-start"
+      aria-label="Iniciar llamada"
+      ${orbDisabledAttrs}
+    >
+      ${renderNovaSquircleSvg(40, inCall)}
+    </button>
+  `.trim();
+
+  if (!inCall) {
+    const hasWorkspace = model.activeWorkspace !== null;
+    const inputDisabledAttr = !hasWorkspace ? ' disabled' : "";
+    const describedByAttr = !hasWorkspace ? ' aria-describedby="composer-no-workspace-hint"' : "";
+    const submitDisabledAttr = !hasWorkspace ? ' disabled' : "";
+
+    return `
+      <div class="nova-dock-content nova-dock-content--standby">
+        ${orbHtml}
+        <form class="chat-composer" data-action="chat-form">
+          <label class="sr-only" for="nova-chat-input">Pregúntale a Nova…</label>
+          <div class="composer-pill-wrapper">
+            <textarea
+              id="nova-chat-input"
+              name="utterance"
+              class="chat-input"
+              rows="1"
+              maxlength="16000"
+              placeholder="Pregúntale a Nova…"
+              required${inputDisabledAttr}${describedByAttr}
+            ></textarea>
+            ${!hasWorkspace ? `<span id="composer-no-workspace-hint" class="sr-only">Selecciona un proyecto para chatear</span>` : ""}
+            <div class="composer-actions">
+              <button type="submit" class="btn-icon btn-send" title="Enviar mensaje" aria-label="Enviar"${submitDisabledAttr}>
+                <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <line x1="22" y1="2" x2="11" y2="13" />
+                  <polygon points="22 2 15 22 11 13 2 9 22 2" />
+                </svg>
+              </button>
+            </div>
+          </div>
+        </form>
+      </div>
+    `.trim();
+  }
+
+  const bargeInDisabled = !model.voiceEnabled || !inCall;
+  const bargeInAttrs = bargeInDisabled ? ' disabled aria-disabled="true"' : "";
+  const endDisabled = !model.voiceEnabled || !inCall;
+  const endAttrs = endDisabled ? ' disabled aria-disabled="true"' : "";
+
+  return `
+    <div class="nova-dock-content nova-dock-content--call">
+      ${orbHtml}
+      <div class="nova-dock-wave">
+        ${renderSinusoidalWave(model.callSession.state)}
+      </div>
+      <div class="nova-dock-call-actions">
+        <button
+          type="button"
+          class="btn btn--warning btn-barge-in"
+          data-action="call-barge-in"${bargeInAttrs}
+        >
+          Interrumpir (Esc)
+        </button>
+        <button
+          type="button"
+          class="btn btn--ghost btn-call-end"
+          data-action="call-end"${endAttrs}
+        >
+          Colgar
+        </button>
+      </div>
+    </div>
+  `.trim();
+}
+
 export function renderAppShell(model: PresentationalAppModel): string {
+  const uiMode = model.uiMode ?? "panel";
+  const inCall = model.callSession.state !== "standby" && model.callSession.state !== "closed";
+  const dockMode = inCall ? "call" : "standby";
+
+  if (uiMode === "orb") {
+    const meta = CALL_STATE_LABELS[model.callSession.state] ?? CALL_STATE_LABELS.standby;
+    return `
+      <div class="nova-layout" data-ui-mode="orb" data-call-state="${escapeHtml(model.callSession.state)}">
+        <div class="nova-widget-container" data-slot="widget-orb">
+          <button
+            type="button"
+            class="nova-widget-orb-btn"
+            data-action="toggle-ui-mode"
+            data-call-state="${escapeHtml(model.callSession.state)}"
+            aria-label="Estado de Nova: ${escapeHtml(meta.title)}"
+          >
+            ${renderNovaSquircleSvg(48, inCall)}
+          </button>
+        </div>
+      </div>
+    `.trim();
+  }
+
   const milestoneHtml = model.lastMilestone
     ? `<p class="nova-milestone-toast" aria-live="polite">${escapeHtml(model.lastMilestone)}</p>`
     : "";
-  const isStandby = model.callSession.state === "standby" || model.callSession.state === "closed";
-  const uiMode = model.uiMode ?? "panel";
 
   return `
-    <div class="nova-layout" data-ui-mode="${escapeHtml(uiMode)}" data-call-state="${escapeHtml(model.callSession.state)}">
-      <!-- Semantic Accessible Top/Header -->
-      <header class="nova-header" data-slot="workspace-bar">
-        ${renderWorkspaceBar(model.activeWorkspace, model.availableWorkspaces, model.pickerFallbackOpen)}
+    <div class="nova-layout" data-ui-mode="panel" data-call-state="${escapeHtml(model.callSession.state)}">
+      <header class="nova-header" data-slot="header">
+        ${renderWorkspaceBar(model.activeWorkspace, model.availableWorkspaces, model.pickerFallbackOpen, model.callSession.state)}
       </header>
 
-      <!-- Main Shell Area: Contains the Floating Orb & Minimalist Side Panel -->
-      <div class="nova-workspace-grid">
-        <!-- Aside Landmark (Holds Floating Reactive Orb & Voice Session Controls) -->
-        <aside class="nova-sidebar" aria-label="Panel de llamada y estado de Nova">
-          <div data-slot="orb">
-            ${renderNovaReactiveOrb(model.callSession.state, model.voiceEnabled)}
-          </div>
-          <div data-slot="milestone">${milestoneHtml}</div>
-          <div data-slot="call-controls">
-            ${renderCallControls(model.callSession.state, model.voiceEnabled)}
-          </div>
-        </aside>
+      <main class="nova-main" aria-label="Historial de conversación y aprobaciones">
+        <div class="nova-timeline-scroll" data-slot="timeline">
+          ${renderChatTimeline(model.status, model.messages, model.errorBanner)}
+        </div>
 
-        <!-- Main Landmark (Minimalist Side Panel 340px for GNOME Glassmorphic Experience) -->
-        <main class="nova-main" aria-label="Historial de conversación y aprobaciones">
-          <!-- Minimalist Panel Header -->
-          <div class="panel-header-minimal" data-slot="panel-header">
-            <div class="panel-header-brand">
-              ${renderNovaSquircleSvg(32, !isStandby)}
-              <span class="panel-brand-text">NOVA</span>
-              ${isStandby
-                ? `<span class="panel-standby-badge">EN REPOSO <span class="status-dot status-dot--off"></span></span>`
-                : `<span class="status-dot status-dot--on" title="Conectado y escuchando"></span>`}
-            </div>
-            <button
-              type="button"
-              class="btn-toggle-view"
-              data-action="toggle-ui-mode"
-              title="Alternar entre panel y orbe flotante"
-              aria-label="Alternar vista compacta de orbe"
-            >
-              ${uiMode === "orb" ? "Ampliar panel" : "Modo widget"}
-            </button>
-          </div>
+        <div class="nova-approvals-slot" data-slot="approvals">
+          ${renderApprovalBanner(model.pendingApprovals)}
+        </div>
 
-          <!-- Central Wave Container -->
-          <div class="panel-wave-slot" data-slot="wave">
-            ${renderSinusoidalWave(model.callSession.state)}
-          </div>
+        <div data-slot="milestone">${milestoneHtml}</div>
 
-          <!-- Pending Security Gatekeeper Approvals -->
-          <div data-slot="approvals">
-            ${renderApprovalBanner(model.pendingApprovals)}
-          </div>
+        ${renderNoticeSlot(model)}
 
-          <!-- Conversational Timeline -->
-          <div class="nova-timeline-scroll" data-slot="timeline">
-            ${renderChatTimeline(model.status, model.messages, model.errorBanner)}
-          </div>
-
-          <!-- Composer Pill -->
-          ${renderComposerForm()}
-        </main>
-      </div>
+        <div class="nova-dock" data-slot="dock" data-dock-mode="${dockMode}">
+          ${renderDock(model)}
+        </div>
+      </main>
     </div>
   `.trim();
 }

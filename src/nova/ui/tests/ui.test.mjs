@@ -117,11 +117,137 @@ test("AC-5 & NFR-4: Semantic WCAG 2.1 AA landmarks, labels, and alertdialog Secu
   });
 
   assert.match(fullShell, /<header\b/);
-  assert.match(fullShell, /<aside\b/);
+  assert.doesNotMatch(fullShell, /<aside\b/);
   assert.match(fullShell, /<main\b/);
   assert.match(fullShell, /<form\b/);
   assert.match(fullShell, /<label[^>]+for="nova-chat-input"/);
   assert.match(fullShell, /<label[^>]+for="nova-workspace-select"/);
+});
+
+test("AC-1 & AC-2: Single-column layout without sidebar and unified header with project chip & state indicator", () => {
+  const model = {
+    status: "success",
+    voiceEnabled: true,
+    uiMode: "panel",
+    callSession: {
+      call_id: "call-1",
+      state: "standby",
+      turn_count: 0,
+      active_correlation_id: null,
+    },
+    activeWorkspace: {
+      display_name: "alpha",
+      canonical_path: "/home/dev/Proyectos/alpha",
+      selected_via: "exact_path",
+    },
+    availableWorkspaces: [
+      { display_name: "alpha", canonical_path: "/home/dev/Proyectos/alpha" },
+      { display_name: "beta", canonical_path: "/home/dev/Proyectos/beta" },
+    ],
+    pendingApprovals: [
+      {
+        audit_id: "aud-1",
+        correlation_id: "corr-1",
+        source: "tier2_agy",
+        sanitized_command: "ls",
+        cwd: "/home/dev/Proyectos/alpha",
+        risk_level: "high",
+        spoken_summary: "Listar archivos",
+        technical_explanation: "Comando de lectura",
+        expires_in_seconds: 60,
+        timestamp: "2026-11-13T00:00:00Z",
+      },
+    ],
+    messages: [
+      {
+        message_id: "msg-1",
+        correlation_id: "corr-1",
+        role: "user",
+        modality: "text",
+        step_type: "user_prompt",
+        content: "Hola",
+        timestamp: "2026-11-13T00:00:00Z",
+        streaming: false,
+      },
+    ],
+    errorBanner: "Aviso de prueba",
+    noticeBanner: {
+      code: "TEST_ERROR",
+      message: "Aviso de prueba",
+      dismissible: true,
+    },
+    pickerFallbackOpen: false,
+    lastMilestone: null,
+  };
+
+  const html = renderAppShell(model);
+
+  assert.ok(!html.includes("nova-sidebar"), "Must not contain nova-sidebar");
+  assert.ok(!html.includes("<aside"), "Must not contain <aside");
+  assert.ok(!html.includes("nova-workspace-grid"), "Must not contain nova-workspace-grid");
+  assert.ok(!html.includes("panel-header-minimal"), "Must not contain panel-header-minimal");
+
+  const headerIdx = html.indexOf('data-slot="header"');
+  const timelineIdx = html.indexOf('data-slot="timeline"');
+  const approvalsIdx = html.indexOf('data-slot="approvals"');
+  const noticeIdx = html.indexOf('data-slot="notice"');
+  const dockIdx = html.indexOf('data-slot="dock"');
+
+  assert.ok(headerIdx !== -1, "header slot present");
+  assert.ok(timelineIdx !== -1, "timeline slot present");
+  assert.ok(approvalsIdx !== -1, "approvals slot present");
+  assert.ok(noticeIdx !== -1, "notice slot present");
+  assert.ok(dockIdx !== -1, "dock slot present");
+
+  assert.ok(headerIdx < timelineIdx, "header < timeline");
+  assert.ok(timelineIdx < approvalsIdx, "timeline < approvals");
+  assert.ok(approvalsIdx < noticeIdx, "approvals < notice");
+  assert.ok(noticeIdx < dockIdx, "notice < dock");
+
+  const css = fs.readFileSync(path.join(STATIC_DIR, "styles.css"), "utf8");
+  assert.doesNotMatch(css, /\.nova-sidebar\b/);
+  assert.doesNotMatch(css, /grid-template-columns:\s*300px\s+1fr/);
+  assert.match(css, /--conversation-max-width:\s*720px/);
+  assert.match(css, /--header-height:\s*56px/);
+  assert.match(css, /max-width:\s*var\(--conversation-max-width\)/);
+  assert.match(css, /margin-inline:\s*auto/);
+
+  const states = ["standby", "listening", "thinking", "executing", "speaking", "closed"];
+  const CALL_TITLES = {
+    standby: "En reposo",
+    listening: "¡Oye Nova! Escuchando…",
+    thinking: "Procesando",
+    executing: "Ejecutando",
+    speaking: "Respondiendo",
+    closed: "Sesión cerrada",
+  };
+
+  for (const st of states) {
+    const stModel = { ...model, callSession: { ...model.callSession, state: st } };
+    const stHtml = renderAppShell(stModel);
+
+    const novaMatches = stHtml.match(/>\s*NOVA\s*</g) || [];
+    assert.equal(novaMatches.length, 1, `Expected exactly 1 visible NOVA text, found ${novaMatches.length} in state ${st}`);
+
+    const indicatorMatches = stHtml.match(/data-slot="state-indicator"/g) || [];
+    assert.equal(indicatorMatches.length, 1);
+    assert.match(stHtml, /data-slot="state-indicator"[^>]*role="status"[^>]*aria-live="polite"/);
+    assert.ok(stHtml.includes(CALL_TITLES[st]), `Missing state title ${CALL_TITLES[st]}`);
+
+    assert.ok(!stHtml.includes("panel-standby-badge"));
+    const pillMatches = stHtml.match(/class="[^"]*nova-state-pill[^"]*"/g) || [];
+    assert.equal(pillMatches.length, 1, `Expected at most 1 nova-state-pill, got ${pillMatches.length}`);
+
+    const headerHtml = stHtml.slice(stHtml.indexOf('data-slot="header"'), stHtml.indexOf("</header>"));
+    assert.ok(headerHtml.includes("alpha"), "Header shows chip alpha");
+    const headerTextOnly = headerHtml.replace(/<[^>]+>/g, " ");
+    assert.ok(!headerTextOnly.includes("/home/dev/Proyectos/"), "Header text nodes must not contain canonical path");
+
+    assert.match(headerHtml, /<option\s+value="\/home\/dev\/Proyectos\/alpha"\s+title="\/home\/dev\/Proyectos\/alpha"[^>]*>alpha<\/option>/);
+    assert.match(headerHtml, /id="nova-workspace-select"/);
+    assert.match(headerHtml, /data-action="select-workspace-dropdown"/);
+    assert.match(headerHtml, /<label[^>]+for="nova-workspace-select"/);
+  }
 });
 
 test("AC-1, AC-4, AC-5 & frontend-web#3,9: DesktopAppController keeps CSRF in memory only, handles SSE events, 503 picker fallback, 404 approval race, and AbortController cleanup", async () => {
@@ -301,7 +427,8 @@ test("Visual Identity & GNOME Specification: design tokens, squircle SVGs, sinus
   assert.match(css, /--brand-electric-blue:\s*#00d2ff/i);
   assert.match(css, /--brand-nova-violet:\s*#a855f7/i);
   assert.match(css, /--glass-orb-bg-inactive:\s*rgba\(\s*34,\s*40,\s*52,\s*0\.68\s*\)/);
-  assert.match(css, /--side-panel-width:\s*340px/);
+  assert.match(css, /--conversation-max-width:\s*720px/);
+  assert.match(css, /--header-height:\s*56px/);
   assert.match(css, /--wake-transition:\s*280ms cubic-bezier/);
 
   // Standby squircle is muted

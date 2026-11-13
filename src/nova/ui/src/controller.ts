@@ -10,6 +10,8 @@ import {
   renderApprovalBanner,
   renderCallControls,
   renderChatTimeline,
+  renderDock,
+  renderNoticeSlot,
   renderNovaReactiveOrb,
   renderNovaSquircleSvg,
   renderSinusoidalWave,
@@ -60,8 +62,10 @@ export class DesktopAppController {
     pendingApprovals: [],
     messages: [],
     errorBanner: null,
+    noticeBanner: null,
     pickerFallbackOpen: false,
     lastMilestone: null,
+    uiMode: "panel",
   };
 
   constructor(options: DesktopControllerOptions = {}) {
@@ -488,42 +492,19 @@ export class DesktopAppController {
     if (!this.#root) {
       return;
     }
-    if (!this.#shellMounted) {
+    if (!this.#shellMounted || this.#model.uiMode === "orb") {
       this.#root.innerHTML = fullHtml;
-      this.#shellMounted = true;
+      this.#shellMounted = this.#model.uiMode !== "orb";
       return;
     }
-    const wsSlot = this.#root.querySelector<HTMLElement>('[data-slot="workspace-bar"]');
-    if (wsSlot) {
-      wsSlot.innerHTML = renderWorkspaceBar(
+    const headerSlot = this.#root.querySelector<HTMLElement>('[data-slot="header"]');
+    if (headerSlot) {
+      headerSlot.innerHTML = renderWorkspaceBar(
         this.#model.activeWorkspace,
         this.#model.availableWorkspaces,
         this.#model.pickerFallbackOpen,
-      );
-    }
-    const orbSlot = this.#root.querySelector<HTMLElement>('[data-slot="orb"]');
-    if (orbSlot) {
-      orbSlot.innerHTML = renderNovaReactiveOrb(
         this.#model.callSession.state,
-        this.#model.voiceEnabled,
       );
-    }
-    const milestoneSlot = this.#root.querySelector<HTMLElement>('[data-slot="milestone"]');
-    if (milestoneSlot) {
-      milestoneSlot.innerHTML = this.#model.lastMilestone
-        ? `<p class="nova-milestone-toast" aria-live="polite">${escapeHtml(this.#model.lastMilestone)}</p>`
-        : "";
-    }
-    const controlsSlot = this.#root.querySelector<HTMLElement>('[data-slot="call-controls"]');
-    if (controlsSlot) {
-      controlsSlot.innerHTML = renderCallControls(
-        this.#model.callSession.state,
-        this.#model.voiceEnabled,
-      );
-    }
-    const approvalsSlot = this.#root.querySelector<HTMLElement>('[data-slot="approvals"]');
-    if (approvalsSlot) {
-      approvalsSlot.innerHTML = renderApprovalBanner(this.#model.pendingApprovals);
     }
     const timelineSlot = this.#root.querySelector<HTMLElement>('[data-slot="timeline"]');
     if (timelineSlot) {
@@ -534,33 +515,30 @@ export class DesktopAppController {
       );
       timelineSlot.scrollTop = timelineSlot.scrollHeight;
     }
-    const waveSlot = this.#root.querySelector<HTMLElement>('[data-slot="wave"]');
-    if (waveSlot) {
-      waveSlot.innerHTML = renderSinusoidalWave(this.#model.callSession.state);
+    const approvalsSlot = this.#root.querySelector<HTMLElement>('[data-slot="approvals"]');
+    if (approvalsSlot) {
+      approvalsSlot.innerHTML = renderApprovalBanner(this.#model.pendingApprovals);
     }
-    const headerSlot = this.#root.querySelector<HTMLElement>('[data-slot="panel-header"]');
-    if (headerSlot) {
-      const isStandby =
-        this.#model.callSession.state === "standby" || this.#model.callSession.state === "closed";
-      const uiMode = this.#model.uiMode ?? "panel";
-      headerSlot.innerHTML = `
-        <div class="panel-header-brand">
-          ${renderNovaSquircleSvg(32, !isStandby)}
-          <span class="panel-brand-text">NOVA</span>
-          ${isStandby
-            ? `<span class="panel-standby-badge">EN REPOSO <span class="status-dot status-dot--off"></span></span>`
-            : `<span class="status-dot status-dot--on" title="Conectado y escuchando"></span>`}
-        </div>
-        <button
-          type="button"
-          class="btn-toggle-view"
-          data-action="toggle-ui-mode"
-          title="Alternar entre panel y orbe flotante"
-          aria-label="Alternar vista compacta de orbe"
-        >
-          ${uiMode === "orb" ? "Ampliar panel" : "Modo widget"}
-        </button>
-      `.trim();
+    const milestoneSlot = this.#root.querySelector<HTMLElement>('[data-slot="milestone"]');
+    if (milestoneSlot) {
+      milestoneSlot.innerHTML = this.#model.lastMilestone
+        ? `<p class="nova-milestone-toast" aria-live="polite">${escapeHtml(this.#model.lastMilestone)}</p>`
+        : "";
+    }
+    const noticeSlot = this.#root.querySelector<HTMLElement>('[data-slot="notice"]');
+    if (noticeSlot) {
+      noticeSlot.outerHTML = renderNoticeSlot(this.#model);
+    }
+    const inCall =
+      this.#model.callSession.state !== "standby" && this.#model.callSession.state !== "closed";
+    const dockSlot = this.#root.querySelector<HTMLElement>('[data-slot="dock"]');
+    if (dockSlot) {
+      const currentDockMode = dockSlot.dataset["dockMode"];
+      const targetDockMode = inCall ? "call" : "standby";
+      if (currentDockMode !== targetDockMode) {
+        dockSlot.dataset["dockMode"] = targetDockMode;
+        dockSlot.innerHTML = renderDock(this.#model);
+      }
     }
     const layoutEl = this.#root.querySelector<HTMLElement>(".nova-layout");
     if (layoutEl) {
