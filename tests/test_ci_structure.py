@@ -73,10 +73,15 @@ def test_pr_workflow_structure_and_security() -> None:
     with_args = upload_step.get("with", {})
     assert with_args.get("retention-days") == 7 or with_args.get("retention-days") == "7"
 
-    # 5. Check timeouts and SHA pinning across all jobs
+    # 5. Check timeouts, step timeouts, and SHA pinning across all jobs
     sha40_re = re.compile(r"^[a-zA-Z0-9_-]+/[a-zA-Z0-9_-]+@[0-9a-f]{40}$")
     raw_content = pr_yml.read_text(encoding="utf-8")
     assert "secrets." not in raw_content or "secrets.GITHUB_TOKEN" in raw_content
+
+    # Verified action SHAs
+    assert "a26af69be951a213d495a4c3e4e4022e16d87065" in raw_content, (
+        "Must use verified setup-python SHA"
+    )
 
     for jid, job in jobs.items():
         if not isinstance(job, dict):
@@ -86,6 +91,20 @@ def test_pr_workflow_structure_and_security() -> None:
         for step in job.get("steps", []):
             if not isinstance(step, dict):
                 continue
+            assert "timeout-minutes" in step, f"Step in job {jid} missing timeout-minutes: {step}"
+            assert step["timeout-minutes"] <= 15
+            run_script = str(step.get("run", ""))
+            # Anti-script-injection: untrusted context must not be interpolated in run
+            for dangerous in (
+                "${{ github.event.pull_request.title",
+                "${{ github.head_ref",
+                "${{ github.base_ref",
+                "${{ github.event.pull_request.base.sha",
+                "${{ github.event.pull_request.head.sha",
+            ):
+                assert dangerous not in run_script, (
+                    f"Script injection hazard in job {jid}: {dangerous} found in run: {run_script}"
+                )
             uses = step.get("uses")
             if uses:
                 assert sha40_re.match(uses.split("#")[0].strip()), (
@@ -98,6 +117,11 @@ def test_release_workflow_structure_and_security() -> None:
     assert rel_yml.is_file(), "release.yml must exist"
 
     data = _read_yaml(rel_yml)
+    raw_content = rel_yml.read_text(encoding="utf-8")
+    assert "a26af69be951a213d495a4c3e4e4022e16d87065" in raw_content, (
+        "Must use verified setup-python SHA"
+    )
+    assert "extract-release-notes.py" in raw_content, "Must use extract-release-notes.py script"
 
     # 1. Triggered on push to master
     on_triggers = data.get("on") if "on" in data else data.get(True)
@@ -122,6 +146,14 @@ def test_release_workflow_structure_and_security() -> None:
     assert isinstance(rel_job, dict)
     assert rel_job.get("permissions") == {"contents": "write"}
     assert "timeout-minutes" in rel_job
+    assert rel_job["timeout-minutes"] <= 30
+
+    for step in rel_job.get("steps", []):
+        if not isinstance(step, dict):
+            continue
+        assert "timeout-minutes" in step, f"Step in release job missing timeout-minutes: {step}"
+        run_script = str(step.get("run", ""))
+        assert "${{ github.sha" not in run_script, "github.sha should be passed via env"
 
 
 def test_ruleset_structure_and_status_checks() -> None:
