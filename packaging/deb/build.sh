@@ -82,7 +82,12 @@ if command -v npm >/dev/null 2>&1; then
     export PATH="${WORKSPACE_ROOT}/repositories/nova/node_modules/.bin:${PATH}"
   fi
   echo "Compiling UI TypeScript assets..."
-  npm run build:ui || true
+  npm run build:ui
+fi
+
+if [[ ! -f "${REPO_ROOT}/src/nova/ui/static/app.js" ]]; then
+  echo "build.sh error: UI asset '${REPO_ROOT}/src/nova/ui/static/app.js' was not generated." >&2
+  exit 1
 fi
 
 # 4. Locate Pip
@@ -132,9 +137,13 @@ echo "Installing runtime dependencies and nova-voice..."
 echo "Cleaning byte-code, models, and build host references..."
 find "${STAGING_DIR}" -type f -name "*.pyc" -delete
 find "${STAGING_DIR}" -type d -name "__pycache__" -delete
-find "${STAGING_DIR}" -type f -name "*.onnx" -delete
-find "${STAGING_DIR}" -type f -name "*.bin" -delete
 find "${STAGING_DIR}" -type f -name "direct_url.json" -delete
+
+# Ensure /opt/nova/models is absent and standalone voice models are excluded
+rm -rf "${STAGING_DIR}/opt/nova/models" "${STAGING_DIR}/models"
+find "${STAGING_DIR}" -maxdepth 4 -name "silero_vad.onnx" -delete 2>/dev/null || true
+find "${STAGING_DIR}" -name "oye_nova.onnx" -delete 2>/dev/null || true
+find "${STAGING_DIR}" -name "es_ES-davefx-medium*" -delete 2>/dev/null || true
 
 # Sanitize pyvenv.cfg
 cat > "${VENV_TARGET}/pyvenv.cfg" << 'EOF'

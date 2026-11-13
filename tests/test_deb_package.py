@@ -110,9 +110,14 @@ def test_deb_contents_listing_no_models_no_pycache(built_deb_packages: dict[str,
     r = subprocess.run(["dpkg-deb", "-c", str(pr_deb)], capture_output=True, text=True, check=True)
     listing = r.stdout
 
-    # No onnx or bin model files
-    assert ".onnx" not in listing
-    assert not re.search(r"/models/[^/]+\.bin", listing)
+    # No standalone downloaded models or models directory
+    assert "opt/nova/models" not in listing
+    assert "oye_nova.onnx" not in listing
+    assert "es_ES-davefx-medium" not in listing
+    assert not re.search(r"/opt/nova/[^/]*\.onnx", listing)
+
+    # Internal library assets (faster-whisper VAD) must remain intact
+    assert "faster_whisper/assets/silero_vad_v6.onnx" in listing
 
     # No __pycache__ or *.pyc
     assert "__pycache__" not in listing
