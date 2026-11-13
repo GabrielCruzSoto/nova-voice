@@ -1,4 +1,4 @@
-# Nova Workspace — Especificación de Arquitectura de Asistente de Voz Agéntico
+# Nova Voice — Especificación de Arquitectura de Asistente de Voz Agéntico
 
 ## 1. Visión del Sistema y Alcance por Fases
 
@@ -21,6 +21,9 @@
 
 ## 2. Identidad y Parámetros Técnicos Base
 
+* **Nombre del Producto:** `Nova Voice`
+* **Repositorio:** `nova-voice`
+* **Comando CLI:** `nova`
 * **Nombre del Workspace:** `Nova Workspace`
 * **ID de Proyecto:** `nova-workspace`
 * **Namespace:** `nova`

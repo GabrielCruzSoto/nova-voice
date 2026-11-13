@@ -1,0 +1,73 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 216 216" width="216" height="216">
+  <defs>
+    <!-- Background Squircle Gradient -->
+    <linearGradient id="squircleBg" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#1e2638" />
+      <stop offset="100%" stop-color="#0d1322" />
+    </linearGradient>
+
+    <!-- Bezel Border Gradient -->
+    <linearGradient id="squircleBorder" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#7dd3fc" stop-opacity="0.6" />
+      <stop offset="40%" stop-color="#38bdf8" stop-opacity="0.3" />
+      <stop offset="100%" stop-color="#a855f7" stop-opacity="0.5" />
+    </linearGradient>
+
+    <!-- N Monogram Gradient -->
+    <linearGradient id="monogramGrad" x1="0%" y1="100%" x2="100%" y2="0%">
+      <stop offset="0%" stop-color="#00d2ff" />
+      <stop offset="45%" stop-color="#6366f1" />
+      <stop offset="100%" stop-color="#a855f7" />
+    </linearGradient>
+
+    <!-- Glow Filter -->
+    <filter id="starGlow" x="-50%" y="-50%" width="200%" height="200%">
+      <feGaussianBlur in="SourceGraphic" stdDeviation="6" result="blur" />
+      <feMerge>
+        <feMergeNode in="blur" />
+        <feMergeNode in="SourceGraphic" />
+      </feMerge>
+    </filter>
+
+    <radialGradient id="starRadial" cx="50%" cy="50%" r="50%">
+      <stop offset="0%" stop-color="#fffbeb" />
+      <stop offset="35%" stop-color="#fde68a" />
+      <stop offset="70%" stop-color="#f59e0b" stop-opacity="0.8" />
+      <stop offset="100%" stop-color="#f59e0b" stop-opacity="0" />
+    </radialGradient>
+  </defs>
+
+  <!-- Squircle Base with 26% radius (rx=56, ry=56 on 216x216) -->
+  <rect x="6" y="6" width="204" height="204" rx="54" ry="54" fill="url(#squircleBg)" stroke="url(#squircleBorder)" stroke-width="3" />
+
+  <!-- Cosmic Orbits -->
+  <g opacity="0.85">
+    <ellipse cx="108" cy="108" rx="88" ry="34" fill="none" stroke="#00d2ff" stroke-width="2" transform="rotate(-30 108 108)" />
+    <circle cx="44" cy="74" r="4.5" fill="#38bdf8" />
+    <circle cx="172" cy="142" r="3.5" fill="#00d2ff" />
+
+    <ellipse cx="108" cy="108" rx="88" ry="34" fill="none" stroke="#a855f7" stroke-width="2" transform="rotate(35 108 108)" />
+    <circle cx="168" cy="70" r="5" fill="#ec4899" />
+    <circle cx="48" cy="146" r="3.5" fill="#a855f7" />
+  </g>
+
+  <!-- N Monogram Structure -->
+  <path d="M 68 156 L 68 62 L 86 62 L 132 128 L 132 62 L 150 62 L 150 156 L 132 156 L 86 90 L 86 156 Z"
+        fill="url(#monogramGrad)" stroke="#38bdf8" stroke-width="1.5" stroke-linejoin="round" />
+
+  <!-- Inner N Highlight -->
+  <path d="M 72 152 L 72 68 L 84 68 L 130 134 L 130 68 L 142 68 L 142 152 L 130 152 L 84 86 L 84 152 Z"
+        fill="none" stroke="#ffffff" stroke-width="1" opacity="0.35" />
+
+  <!-- Nova Star on Top-Right of N -->
+  <g transform="translate(142, 68)" filter="url(#starGlow)">
+    <!-- Star Halo -->
+    <circle cx="0" cy="0" r="28" fill="url(#starRadial)" opacity="0.6" />
+    <!-- 4-point Primary Star Rays -->
+    <path d="M 0 -36 Q 2 -8 36 0 Q 2 8 0 36 Q -2 8 -36 0 Q -2 -8 0 -36 Z" fill="#fffbeb" />
+    <!-- 4-point Secondary Diagonal Rays -->
+    <path d="M 0 -20 Q 1.5 -5 20 0 Q 1.5 5 0 20 Q -1.5 5 -20 0 Q -1.5 -5 0 -20 Z" fill="#fde68a" transform="rotate(45)" />
+    <!-- Core Center -->
+    <circle cx="0" cy="0" r="4.5" fill="#ffffff" />
+  </g>
+</svg>

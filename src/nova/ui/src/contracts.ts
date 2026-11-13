@@ -116,4 +116,6 @@ export interface PresentationalAppModel {
   readonly errorBanner: string | null;
   readonly pickerFallbackOpen: boolean;
   readonly lastMilestone: string | null;
+  readonly uiMode?: "orb" | "panel";
+  readonly isStandby?: boolean;
 }

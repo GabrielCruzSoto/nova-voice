@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# Debian post-installation script for nova-voice.
+set -euo pipefail
+
+if [[ "${1:-}" == "configure" ]]; then
+  if [[ -x /opt/nova/venv/bin/python3 ]]; then
+    /opt/nova/venv/bin/python3 -m compileall -q /opt/nova/venv/lib/python3.12/site-packages/nova 2>/dev/null || true
+  fi
+  if command -v update-desktop-database >/dev/null 2>&1; then
+    update-desktop-database /usr/share/applications || true
+  fi
+fi
+
+exit 0

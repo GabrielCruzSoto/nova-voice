@@ -54,7 +54,7 @@ from nova.domain.ports import FolderPickerPort
 
 logger = logging.getLogger("nova.desktop_launcher")
 
-BrowserPreference = Literal["auto", "xdg-open", "firefox"]
+BrowserPreference = Literal["auto", "xdg-open", "firefox", "webview", "window"]
 TtsEngineChoice = Literal["kokoro", "piper"]
 
 _LOOPBACK_BROWSER_URL_RE = re.compile(r"^http://127\.0\.0\.1:[1-9][0-9]{0,4}/?$")
@@ -308,7 +308,9 @@ async def open_local_browser_window(
         return False
 
     argv: tuple[str, ...] | None = None
-    if preference == "firefox":
+    if preference in ("webview", "window"):
+        argv = (sys.executable, "-m", "nova.adapters.desktop_window", cleaned_url)
+    elif preference == "firefox":
         ff_bin = which_resolver("firefox")
         if ff_bin:
             argv = (ff_bin, "--new-window", cleaned_url)
@@ -619,6 +621,12 @@ def build_arg_parser() -> argparse.ArgumentParser:
         description="Nova 100% local voice-assisted agentic desktop UI for Linux (127.0.0.1).",
     )
     parser.add_argument(
+        "--version",
+        action="store_true",
+        default=False,
+        help="Show application version and exit.",
+    )
+    parser.add_argument(
         "--port",
         type=int,
         default=0,
@@ -643,9 +651,9 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--browser",
-        choices=("auto", "xdg-open", "firefox"),
+        choices=("auto", "xdg-open", "firefox", "webview", "window"),
         default="auto",
-        help="Browser launcher preference when opening the local UI.",
+        help="Browser or native desktop window launcher preference when opening the local UI.",
     )
     parser.add_argument(
         "--no-voice",
@@ -731,13 +739,152 @@ def build_arg_parser() -> argparse.ArgumentParser:
         default=os.environ.get("NOVA_PIPER_MODEL"),
         help="Local Piper ONNX voice model file path.",
     )
+    parser.add_argument(
+        "--models-dir",
+        default=os.environ.get("NOVA_MODELS_DIR"),
+        help="Directory containing voice models for priority resolution.",
+    )
+    parser.add_argument(
+        "--download-models",
+        action="store_true",
+        default=False,
+        help="Download and verify required voice models then exit.",
+    )
+    parser.add_argument(
+        "--dest",
+        default=None,
+        help="Destination directory for --download-models.",
+    )
+    parser.add_argument(
+        "--import",
+        dest="import_dir",
+        default=None,
+        help="Directory containing local voice models to import.",
+    )
+    parser.add_argument(
+        "--import-wakeword",
+        default=None,
+        help="Local wake-word model path to import.",
+    )
     return parser
+
+
+def resolve_model_path(
+    filename: str,
+    explicit_param: str | None = None,
+    models_dir: str | None = None,
+    source_root: Path | None = None,
+) -> Path | None:
+    """Resolve a voice model path evaluating canonical 6-step precedence (OP-2, AC-12)."""
+    # Step 1: Explicit parameter for the model
+    if explicit_param:
+        explicit_path = Path(explicit_param).expanduser().resolve()
+        if explicit_path.is_file():
+            return explicit_path
+
+    # Step 2: --models-dir CLI flag
+    if models_dir is not None:
+        md_path = Path(models_dir).expanduser().resolve()
+        if not md_path.is_dir():
+            raise ValueError(f"Models directory not found: {models_dir}")
+        candidate = md_path / filename
+        if candidate.is_file():
+            return candidate
+
+    # Step 3: NOVA_MODELS_DIR environment variable
+    env_models_dir = os.environ.get("NOVA_MODELS_DIR")
+    if env_models_dir:
+        env_path = Path(env_models_dir).expanduser().resolve()
+        if not env_path.is_dir():
+            raise ValueError(f"NOVA_MODELS_DIR directory not found: {env_models_dir}")
+        candidate = env_path / filename
+        if candidate.is_file():
+            return candidate
+
+    # Step 4: User data directory (~/.local/share/nova/models or $XDG_DATA_HOME/nova/models)
+    xdg_data = os.environ.get("XDG_DATA_HOME")
+    user_models_dir = (
+        Path(xdg_data) / "nova" / "models"
+        if xdg_data
+        else Path.home() / ".local" / "share" / "nova" / "models"
+    )
+    user_candidate = user_models_dir / filename
+    if user_candidate.is_file():
+        return user_candidate
+
+    # Step 5: Global system installation (/opt/nova/models)
+    sys_candidate = Path("/opt/nova/models") / filename
+    if sys_candidate.is_file():
+        return sys_candidate
+
+    # Step 6: Source development checkout (<source_root>/models)
+    running_in_packaged_venv = sys.prefix.startswith("/opt/nova") or str(
+        Path(__file__).resolve()
+    ).startswith("/opt/nova")
+    if not running_in_packaged_venv:
+        dev_root = source_root
+        if dev_root is None:
+            for parent in Path(__file__).resolve().parents:
+                if (parent / "pyproject.toml").is_file() or (parent / ".git").is_dir():
+                    dev_root = parent
+                    break
+        if dev_root is not None and (
+            (dev_root / "pyproject.toml").is_file() or (dev_root / ".git").is_dir()
+        ):
+            src_candidate = dev_root / "models" / filename
+            if src_candidate.is_file():
+                return src_candidate
+
+    return None
 
 
 def config_from_namespace(ns: argparse.Namespace) -> NovaDesktopConfig:
     """Convert parsed CLI namespace into a validated `NovaDesktopConfig`."""
     roots = tuple(ns.allowed_roots) if ns.allowed_roots else _default_allowed_roots()
+    models_dir = getattr(ns, "models_dir", None)
+
     wake_models = tuple(ns.wakeword_models) if ns.wakeword_models else ()
+    if not wake_models:
+        resolved_ww = resolve_model_path(
+            "oye_nova.onnx",
+            explicit_param=os.environ.get("NOVA_WAKEWORD_MODEL"),
+            models_dir=models_dir,
+        )
+        if resolved_ww is not None:
+            wake_models = (str(resolved_ww),)
+
+    vad_model = ns.silero_vad_model
+    resolved_vad = resolve_model_path(
+        "silero_vad.onnx",
+        explicit_param=vad_model,
+        models_dir=models_dir,
+    )
+    if resolved_vad is not None:
+        vad_model = str(resolved_vad)
+
+    tts_engine = ns.tts_engine
+    piper_model = ns.piper_model
+    resolved_piper = resolve_model_path(
+        "es_ES-davefx-medium.onnx",
+        explicit_param=piper_model,
+        models_dir=models_dir,
+    )
+    if resolved_piper is not None:
+        piper_model = str(resolved_piper)
+        if tts_engine == "kokoro" and not ns.kokoro_model:
+            tts_engine = "piper"
+
+    piper_bin = ns.piper_binary
+    if piper_bin == "piper" and shutil.which("piper") is None:
+        venv_piper = Path(sys.executable).parent / "piper"
+        if venv_piper.is_file() and os.access(venv_piper, os.X_OK):
+            piper_bin = str(venv_piper)
+
+    whisper_model = ns.whisper_model
+    whisper_dev = ns.whisper_device
+    if whisper_dev == "cuda" and not shutil.which("nvidia-smi"):
+        whisper_dev = "cpu"
+
     return NovaDesktopConfig(
         port=int(ns.port),
         allowed_roots=roots,
@@ -752,14 +899,14 @@ def config_from_namespace(ns: argparse.Namespace) -> NovaDesktopConfig:
         agy_executable=ns.agy_executable,
         tier2_model=ns.tier2_model,
         wakeword_models=wake_models,
-        silero_vad_model_path=ns.silero_vad_model,
-        whisper_model=ns.whisper_model,
-        whisper_device=ns.whisper_device,
-        tts_engine=ns.tts_engine,
+        silero_vad_model_path=vad_model,
+        whisper_model=whisper_model,
+        whisper_device=whisper_dev,
+        tts_engine=tts_engine,
         kokoro_model_path=ns.kokoro_model,
         kokoro_voices_path=ns.kokoro_voices,
-        piper_binary=ns.piper_binary,
-        piper_model_path=ns.piper_model,
+        piper_binary=piper_bin,
+        piper_model_path=piper_model,
     )
 
 
@@ -792,6 +939,25 @@ def main(argv: Sequence[str] | None = None) -> int:
     """CLI entry point for `nova-desktop` and `python -m nova`."""
     parser = build_arg_parser()
     ns = parser.parse_args(list(argv) if argv is not None else None)
+    if ns.version:
+        try:
+            import importlib.metadata
+
+            ver = importlib.metadata.version("nova-voice")
+            sys.stdout.write(f"nova-voice {ver}\n")
+        except Exception:
+            sys.stdout.write("nova-voice unknown\n")
+        sys.stdout.flush()
+        return 0
+    if getattr(ns, "download_models", False):
+        from nova.adapters.models_downloader import download_models
+
+        dest = ns.dest or (Path.home() / ".local" / "share" / "nova" / "models")
+        return download_models(
+            dest=dest,
+            import_dir=getattr(ns, "import_dir", None),
+            import_wakeword=getattr(ns, "import_wakeword", None),
+        )
     try:
         config = config_from_namespace(ns)
         return asyncio.run(run_desktop_daemon(config))

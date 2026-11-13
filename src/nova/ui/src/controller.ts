@@ -11,6 +11,8 @@ import {
   renderCallControls,
   renderChatTimeline,
   renderNovaReactiveOrb,
+  renderNovaSquircleSvg,
+  renderSinusoidalWave,
   renderWorkspaceBar,
 } from "./components.js";
 import type {
@@ -39,6 +41,7 @@ export class DesktopAppController {
   #abortController = new AbortController();
   #disposed = false;
   #shellMounted = false;
+  #sleepTimer: ReturnType<typeof setTimeout> | null = null;
   readonly #fetch: FetchLike;
   readonly #root: HTMLElement | null;
   readonly #onRender: ((html: string, model: PresentationalAppModel) => void) | undefined;
@@ -109,6 +112,10 @@ export class DesktopAppController {
       return;
     }
     this.#disposed = true;
+    if (this.#sleepTimer) {
+      clearTimeout(this.#sleepTimer);
+      this.#sleepTimer = null;
+    }
     this.#csrfToken = "";
     this.#abortController.abort();
   }
@@ -366,6 +373,7 @@ export class DesktopAppController {
           active_correlation_id: env.correlation_id,
         },
       });
+      this.#resetSleepTimer();
       return;
     }
 
@@ -446,6 +454,25 @@ export class DesktopAppController {
   #appendMessage(msg: UiChatMessage): void {
     const next = [...this.#model.messages, msg].slice(-MAX_CLIENT_MESSAGES);
     this.#updateModel({ status: "success", messages: next });
+    this.#resetSleepTimer();
+  }
+
+  #resetSleepTimer(): void {
+    if (this.#sleepTimer) {
+      clearTimeout(this.#sleepTimer);
+      this.#sleepTimer = null;
+    }
+    const state = this.#model.callSession.state;
+    if (state !== "standby" && state !== "closed") {
+      this.#sleepTimer = setTimeout(() => {
+        if (this.#disposed) {
+          return;
+        }
+        if (this.#model.callSession.state !== "standby" && this.#model.callSession.state !== "closed") {
+          void this.triggerCallAction("end");
+        }
+      }, 12000);
+    }
   }
 
   #updateModel(patch: Partial<PresentationalAppModel>): void {
@@ -507,6 +534,39 @@ export class DesktopAppController {
       );
       timelineSlot.scrollTop = timelineSlot.scrollHeight;
     }
+    const waveSlot = this.#root.querySelector<HTMLElement>('[data-slot="wave"]');
+    if (waveSlot) {
+      waveSlot.innerHTML = renderSinusoidalWave(this.#model.callSession.state);
+    }
+    const headerSlot = this.#root.querySelector<HTMLElement>('[data-slot="panel-header"]');
+    if (headerSlot) {
+      const isStandby =
+        this.#model.callSession.state === "standby" || this.#model.callSession.state === "closed";
+      const uiMode = this.#model.uiMode ?? "panel";
+      headerSlot.innerHTML = `
+        <div class="panel-header-brand">
+          ${renderNovaSquircleSvg(32, !isStandby)}
+          <span class="panel-brand-text">NOVA</span>
+          ${isStandby
+            ? `<span class="panel-standby-badge">EN REPOSO <span class="status-dot status-dot--off"></span></span>`
+            : `<span class="status-dot status-dot--on" title="Conectado y escuchando"></span>`}
+        </div>
+        <button
+          type="button"
+          class="btn-toggle-view"
+          data-action="toggle-ui-mode"
+          title="Alternar entre panel y orbe flotante"
+          aria-label="Alternar vista compacta de orbe"
+        >
+          ${uiMode === "orb" ? "Ampliar panel" : "Modo widget"}
+        </button>
+      `.trim();
+    }
+    const layoutEl = this.#root.querySelector<HTMLElement>(".nova-layout");
+    if (layoutEl) {
+      layoutEl.dataset["uiMode"] = this.#model.uiMode ?? "panel";
+      layoutEl.dataset["callState"] = this.#model.callSession.state;
+    }
   }
 
   #bindDomEvents(): void {
@@ -524,7 +584,16 @@ export class DesktopAppController {
           return;
         }
         const action = target.dataset["action"];
-        if (action === "call-start") {
+        if (action === "toggle-ui-mode") {
+          if (
+            this.#model.callSession.state === "standby" ||
+            this.#model.callSession.state === "closed"
+          ) {
+            void this.triggerCallAction("start");
+          }
+          const nextMode = (this.#model.uiMode ?? "panel") === "orb" ? "panel" : "orb";
+          this.#updateModel({ uiMode: nextMode });
+        } else if (action === "call-start") {
           void this.triggerCallAction("start");
         } else if (action === "call-end") {
           void this.triggerCallAction("end");

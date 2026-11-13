@@ -10,6 +10,8 @@ import {
   renderApprovalBanner,
   renderChatTimeline,
   renderNovaReactiveOrb,
+  renderNovaSquircleSvg,
+  renderSinusoidalWave,
 } from "../static/components.js";
 import { DesktopAppController } from "../static/controller.js";
 
@@ -292,4 +294,37 @@ test("AC-1, AC-4, AC-5 & frontend-web#3,9: DesktopAppController keeps CSRF in me
   assert.equal(streamSignal.aborted, false);
   app.dispose();
   assert.equal(streamSignal.aborted, true);
+});
+
+test("Visual Identity & GNOME Specification: design tokens, squircle SVGs, sinusoidal waves and 0% GPU standby", () => {
+  const css = fs.readFileSync(path.join(STATIC_DIR, "styles.css"), "utf8");
+  assert.match(css, /--brand-electric-blue:\s*#00d2ff/i);
+  assert.match(css, /--brand-nova-violet:\s*#a855f7/i);
+  assert.match(css, /--glass-orb-bg-inactive:\s*rgba\(\s*34,\s*40,\s*52,\s*0\.68\s*\)/);
+  assert.match(css, /--side-panel-width:\s*340px/);
+  assert.match(css, /--wake-transition:\s*280ms cubic-bezier/);
+
+  // Standby squircle is muted
+  const mutedSquircle = renderNovaSquircleSvg(56, false);
+  assert.match(mutedSquircle, /nova-squircle-svg--muted/);
+  assert.match(mutedSquircle, /#526071/);
+
+  // Active squircle has cosmic gradient and star
+  const activeSquircle = renderNovaSquircleSvg(64, true);
+  assert.match(activeSquircle, /nova-squircle-svg--active/);
+  assert.match(activeSquircle, /#00d2ff/);
+  assert.match(activeSquircle, /#fffbeb/);
+
+  // Sinusoidal wave: dynamic when active, flat line when standby
+  const activeWave = renderSinusoidalWave("listening");
+  assert.match(activeWave, /nova-wave-svg--dynamic/);
+  assert.match(activeWave, /nova-sinusoidal-path/);
+
+  const standbyWave = renderSinusoidalWave("standby");
+  assert.match(standbyWave, /nova-wave-svg--flat/);
+  assert.match(standbyWave, /stroke="rgba\(100, 116, 139, 0\.40\)"/);
+
+  // Tray symbolic icon exists
+  const traySvgPath = path.join(STATIC_DIR, "nova-gnome-tray-symbolic.svg");
+  assert.ok(fs.existsSync(traySvgPath));
 });

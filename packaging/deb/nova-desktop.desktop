@@ -1,0 +1,10 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Nova Desktop
+Comment=Voice-assisted local agentic orchestrator for Linux
+Exec=/usr/bin/nova-desktop
+Icon=utilities-terminal
+Terminal=false
+Categories=Utility;Development;AudioVideo;
+StartupNotify=true
