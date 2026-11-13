@@ -1,0 +1,162 @@
+name: PR Quality & Package Checks
+
+on:
+  pull_request:
+    branches:
+      - develop
+      - "release/**"
+      - master
+
+permissions:
+  contents: read
+
+jobs:
+  python-quality:
+    name: Python Quality & Tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@0b93645e9fea7318edeed2796c01f3c817febcb9  # v5.3.0
+        with:
+          python-version: "3.12"
+          cache: "pip"
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libgirepository1.0-dev python3-gi gir1.2-gtk-3.0
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e ".[dev]"
+
+      - name: Lint with Ruff
+        run: ruff check src tests
+
+      - name: Type check with Mypy
+        run: mypy --strict src tests
+
+      - name: Run Python tests
+        run: pytest -q
+
+  ui-quality:
+    name: UI Typecheck & Tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+
+      - name: Set up Node.js
+        uses: actions/setup-node@1d0ff469b7ec7b3cb9d8673fde0c81c44821de2a  # v4.2.0
+        with:
+          node-version: "20"
+          cache: "npm"
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Typecheck TypeScript
+        run: npm run typecheck
+
+      - name: Run UI tests
+        run: npm run test:ui
+
+      - name: Build UI bundle
+        run: npm run build:ui
+
+  conventional-commits:
+    name: Conventional Commits
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+        with:
+          fetch-depth: 0
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@0b93645e9fea7318edeed2796c01f3c817febcb9  # v5.3.0
+        with:
+          python-version: "3.12"
+
+      - name: Install commitizen
+        run: pip install "commitizen>=4.19.0"
+
+      - name: Validate PR commits and title
+        run: |
+          bash scripts/check-pr-commits.sh \
+            --range "${{ github.event.pull_request.base.sha }}..${{ github.event.pull_request.head.sha }}" \
+            --title "${{ github.event.pull_request.title }}"
+
+  gitflow-policy:
+    name: Gitflow Branch Policy
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+
+      - name: Validate Gitflow branch pair
+        run: |
+          bash scripts/check-gitflow-policy.sh \
+            --head-ref "${{ github.head_ref }}" \
+            --base-ref "${{ github.base_ref }}"
+
+  version-consistency:
+    name: Version Consistency
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@0b93645e9fea7318edeed2796c01f3c817febcb9  # v5.3.0
+        with:
+          python-version: "3.12"
+
+      - name: Check version consistency across manifests
+        run: python3 scripts/check-version-consistency.py
+
+  build-deb:
+    name: Build Debian Package
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
+
+      - name: Set up Python 3.12
+        uses: actions/setup-python@0b93645e9fea7318edeed2796c01f3c817febcb9  # v5.3.0
+        with:
+          python-version: "3.12"
+
+      - name: Set up Node.js
+        uses: actions/setup-node@1d0ff469b7ec7b3cb9d8673fde0c81c44821de2a  # v4.2.0
+        with:
+          node-version: "20"
+          cache: "npm"
+
+      - name: Install packaging tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends dpkg-dev binutils xz-utils desktop-file-utils
+
+      - name: Install UI dependencies and build UI
+        run: npm ci
+
+      - name: Build Debian package (PR mode)
+        run: bash packaging/deb/build.sh --mode pr
+
+      - name: Upload Debian package artifact
+        uses: actions/upload-artifact@4cec3d8aa04e39d1a68397de0c4cd6fb9dce8ec1  # v4.6.1
+        with:
+          name: nova-voice_${{ github.sha }}_amd64.deb
+          path: dist/*.deb
+          retention-days: 7
