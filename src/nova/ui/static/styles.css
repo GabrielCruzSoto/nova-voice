@@ -188,10 +188,16 @@ html[data-shell-frameless="true"] .nova-layout[data-ui-mode="panel"] {
 }
 
 @media (max-width: 560px) {
+  .nova-header {
+    min-height: var(--header-height);
+    height: auto;
+    padding-block: 0.52rem;
+  }
+
   .workspace-selection {
     flex: 1 1 100%;
     justify-content: space-between;
-    padding-top: 0.25rem;
+    padding-top: 0.3rem;
     border-top: 1px solid rgba(255, 255, 255, 0.05);
   }
 

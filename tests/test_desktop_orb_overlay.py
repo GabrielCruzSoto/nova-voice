@@ -249,3 +249,65 @@ def test_ac10_subscriber_invokes_on_parent_lost_when_reparented_after_disconnect
     assert parent_lost.wait(timeout=2.0) is True
     subscriber.join(timeout=1.0)
     assert not subscriber.is_alive()
+
+
+async def test_f8_subscriber_detects_reparenting_while_sse_stream_stays_idle() -> None:
+    """F8: Subscriber detects parent SIGKILL during SSE idle read timeout without disconnect."""
+    current_ppid = [7777]
+    parent_lost = threading.Event()
+    sse_connected = asyncio.Event()
+    sse_done = asyncio.Event()
+    stop_event = threading.Event()
+
+    async def _idle_sse_handler(
+        reader: asyncio.StreamReader,
+        writer: asyncio.StreamWriter,
+    ) -> None:
+        try:
+            head = await reader.readuntil(b"\r\n\r\n")
+            req = head.decode("latin-1").splitlines()[0]
+            if req.startswith("GET / "):
+                writer.write(
+                    b"HTTP/1.1 200 OK\r\n"
+                    b"Set-Cookie: nova_ui_session=tok-idle; HttpOnly; Path=/\r\n"
+                    b"Content-Length: 2\r\nConnection: close\r\n\r\nOK"
+                )
+                await writer.drain()
+            elif req.startswith("GET /api/state "):
+                body = b'{"voice_enabled":true,"call_session":{}}'
+                writer.write(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\n"
+                    + f"Content-Length: {len(body)}\r\nConnection: close\r\n\r\n".encode("latin-1")
+                    + body
+                )
+                await writer.drain()
+            elif req.startswith("GET /api/events "):
+                writer.write(
+                    b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\n\r\n: ok\n\n"
+                )
+                await writer.drain()
+                sse_connected.set()
+                await sse_done.wait()
+        finally:
+            writer.close()
+
+    server = await asyncio.start_server(_idle_sse_handler, "127.0.0.1", 0)
+    port = server.sockets[0].getsockname()[1]
+    subscriber = LoopbackOrbStateSubscriber(
+        base_url=f"http://127.0.0.1:{port}",
+        stop_event=stop_event,
+        on_state_change=lambda _s, _v: None,
+        on_parent_lost=parent_lost.set,
+        ppid_provider=lambda: current_ppid[0],
+    )
+    subscriber.start()
+    try:
+        await asyncio.wait_for(sse_connected.wait(), timeout=2.0)
+        current_ppid[0] = 1
+        assert await asyncio.to_thread(parent_lost.wait, 1.0) is True
+    finally:
+        stop_event.set()
+        sse_done.set()
+        subscriber.join(timeout=1.0)
+        server.close()
+        await server.wait_closed()

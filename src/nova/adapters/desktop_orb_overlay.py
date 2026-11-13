@@ -309,6 +309,13 @@ class LoopbackOrbStateSubscriber(threading.Thread):
                 try:
                     chunk = sock.recv(4096)
                 except TimeoutError:
+                    if (
+                        self._on_parent_lost is not None
+                        and self._ppid_provider() != self._initial_ppid
+                    ):
+                        self._stop_event.set()
+                        self._on_parent_lost()
+                        return
                     continue
                 if not chunk:
                     return
@@ -336,10 +343,28 @@ class LoopbackOrbStateSubscriber(threading.Thread):
             backoff = min(3.0, backoff * 2.0)
 
 
+_LAYER_SHELL_SONAMES: tuple[str, ...] = (
+    "libgtk4-layer-shell.so.0",
+    "libgtk4-layer-shell.so",
+    "/lib/libgtk4-layer-shell.so",
+)
+
+
+def _load_layer_shell_cdll() -> ctypes.CDLL:
+    """Load `libgtk4-layer-shell` trying standard multiarch SONAMEs before `/lib` fallback."""
+    last_err: OSError | None = None
+    for candidate in _LAYER_SHELL_SONAMES:
+        try:
+            return ctypes.CDLL(candidate, mode=ctypes.RTLD_GLOBAL)
+        except OSError as exc:
+            last_err = exc
+    raise last_err if last_err is not None else OSError("libgtk4-layer-shell unavailable")
+
+
 def _probe_gtk4_layer_shell() -> bool:
     """Return True only when GTK4, Cairo, and `zwlr_layer_shell_v1` are supported."""
     try:
-        layer = ctypes.CDLL("/lib/libgtk4-layer-shell.so", mode=ctypes.RTLD_GLOBAL)
+        layer = _load_layer_shell_cdll()
         gtk = ctypes.CDLL("libgtk-4.so.1", mode=ctypes.RTLD_GLOBAL)
         ctypes.CDLL("libcairo.so.2", mode=ctypes.RTLD_GLOBAL)
         gtk.gtk_init_check.restype = ctypes.c_int
@@ -729,12 +754,18 @@ def _draw_centered_text(
     cairo.cairo_show_text(cr, encoded)
 
 
-def _emit_ipc(action: ShellIpcAction, **extra: str) -> None:
+def _emit_ipc(
+    action: ShellIpcAction,
+    *,
+    stop_event: threading.Event | None = None,
+    **extra: str,
+) -> None:
     try:
         sys.stdout.write(format_shell_ipc_message(action, **extra) + "\n")
         sys.stdout.flush()
     except OSError:
-        pass
+        if stop_event is not None:
+            stop_event.set()
 
 
 def run_orb_overlay(
@@ -751,7 +782,7 @@ def run_orb_overlay(
     if not layer_shell_probe():
         return EXIT_LAYER_SHELL_UNSUPPORTED
 
-    layer = ctypes.CDLL("/lib/libgtk4-layer-shell.so", mode=ctypes.RTLD_GLOBAL)
+    layer = _load_layer_shell_cdll()
     gtk = ctypes.CDLL("libgtk-4.so.1", mode=ctypes.RTLD_GLOBAL)
     gobj = ctypes.CDLL("libgobject-2.0.so.0", mode=ctypes.RTLD_GLOBAL)
     glib = ctypes.CDLL("libglib-2.0.so.0", mode=ctypes.RTLD_GLOBAL)
@@ -804,8 +835,8 @@ def run_orb_overlay(
     layer.gtk_layer_set_layer(win, 2)
     layer.gtk_layer_set_anchor(win, 1, 1)
     layer.gtk_layer_set_anchor(win, 3, 1)
-    layer.gtk_layer_set_margin(win, 1, 20)
-    layer.gtk_layer_set_margin(win, 3, 20)
+    layer.gtk_layer_set_margin(win, 1, 24)
+    layer.gtk_layer_set_margin(win, 3, 24)
     layer.gtk_layer_set_keyboard_mode(win, 0)
 
     prov = gtk.gtk_css_provider_new()
@@ -852,11 +883,11 @@ def run_orb_overlay(
             return
         btn = int(gtk.gtk_gesture_single_get_current_button(gesture))
         if btn == 1:
-            _emit_ipc("toggle_panel")
+            _emit_ipc("toggle_panel", stop_event=stop_event)
         elif btn == 3:
             with state_lock:
                 in_call = current_visual.in_call
-            _emit_ipc("call_end" if in_call else "call_start")
+            _emit_ipc("call_end" if in_call else "call_start", stop_event=stop_event)
 
     c_on_pressed = click_cb_type(_on_pressed)
     gesture = gtk.gtk_gesture_click_new()
@@ -890,7 +921,7 @@ def run_orb_overlay(
         on_parent_lost=stop_event.set,
     )
     subscriber.start()
-    _emit_ipc("ready", backend="gtk4-layer-shell")
+    _emit_ipc("ready", stop_event=stop_event, backend="gtk4-layer-shell")
 
     ctx = glib.g_main_context_default()
     input_region_applied = False

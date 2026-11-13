@@ -156,8 +156,14 @@ export function renderRadialEqualizerSvg() {
     </svg>
   `.trim();
 }
+function isActiveCallState(callState) {
+    return (callState === "listening" ||
+        callState === "thinking" ||
+        callState === "executing" ||
+        callState === "speaking");
+}
 function renderFloatingOrbTooltip(callState) {
-    const isStandby = callState === "standby" || callState === "closed";
+    const isStandby = !isActiveCallState(callState);
     const subtitle = FLOATING_ORB_SUBTITLES[callState] ?? FLOATING_ORB_SUBTITLES.standby;
     if (isStandby) {
         return `
@@ -645,7 +651,7 @@ export function renderDock(model) {
 }
 export function renderAppShell(model) {
     const uiMode = model.uiMode ?? "panel";
-    const inCall = model.callSession.state !== "standby" && model.callSession.state !== "closed";
+    const inCall = isActiveCallState(model.callSession.state);
     const dockMode = inCall ? "call" : "standby";
     if (uiMode === "orb") {
         const meta = CALL_STATE_LABELS[model.callSession.state] ?? CALL_STATE_LABELS.standby;

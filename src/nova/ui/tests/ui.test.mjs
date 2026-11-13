@@ -1861,5 +1861,18 @@ test("NOVA-007 AC-3..AC-9: Clean bevelled N monogram, floating orb standby/activ
     viewActionsIdx > 0 && selectionIdx > viewActionsIdx,
     "Header top row must pair brand+state with view toggle before workspace selector row",
   );
+  assert.match(
+    css,
+    /@media\s*\(max-width:\s*560px\)\s*\{[\s\S]*?\.nova-header\s*\{[\s\S]*?height:\s*auto\b/,
+    "Compact .nova-header must expand height: auto to prevent vertical clipping when wrapped",
+  );
+
+  // 6. Contract §3: Unknown future CallSessionState degrades safely to inactive visual mode
+  const unknownOrbHtml = renderAppShell({
+    ...baseOrbModel,
+    callSession: { ...baseOrbModel.callSession, state: "future_unknown_state" },
+  });
+  assert.ok(unknownOrbHtml.includes("En reposo"), "Unknown future state must degrade safely to inactive caption");
+  assert.ok(!unknownOrbHtml.includes("nova-radial-equalizer-svg"), "Unknown future state must not render active radial equalizer");
 });
 
