@@ -1247,3 +1247,100 @@ test("AC-11: Voice milestone as ephemeral toast above dock", async () => {
 
   app.dispose();
 });
+
+test("AC-12: In-memory widget mode, 72px floating orb, expand without call, and cold-start panel", async () => {
+  const states = ["standby", "listening", "thinking", "executing", "speaking", "closed"];
+
+  // 1. Panel mode header has toggle-ui-mode with "widget"
+  const panelModel = {
+    status: "empty",
+    voiceEnabled: true,
+    uiMode: "panel",
+    callSession: { call_id: "c1", state: "standby", turn_count: 0, active_correlation_id: null },
+    activeWorkspace: null,
+    availableWorkspaces: [],
+    pendingApprovals: [],
+    messages: [],
+    errorBanner: null,
+    noticeBanner: null,
+    pickerFallbackOpen: false,
+    lastMilestone: null,
+  };
+  const panelHtml = renderAppShell(panelModel);
+  assert.match(panelHtml, /<button[^>]+data-action="toggle-ui-mode"[^>]*aria-label="[^"]*widget[^"]*"/i);
+
+  // 2. Orb mode renders only widget-orb across all 6 states
+  for (const st of states) {
+    const orbModel = {
+      ...panelModel,
+      uiMode: "orb",
+      callSession: { ...panelModel.callSession, state: st },
+    };
+    const orbHtml = renderAppShell(orbModel);
+    assert.match(orbHtml, /<div[^>]+data-ui-mode="orb"/);
+    assert.match(orbHtml, /data-slot="widget-orb"/);
+    assert.match(orbHtml, new RegExp(`data-call-state="${st}"`));
+    assert.match(orbHtml, /data-action="toggle-ui-mode"/);
+    assert.ok(!orbHtml.includes('data-slot="header"'));
+    assert.ok(!orbHtml.includes('data-slot="timeline"'));
+    assert.ok(!orbHtml.includes('data-slot="dock"'));
+  }
+
+  // 3. styles.css checks
+  const css = fs.readFileSync(path.join(STATIC_DIR, "styles.css"), "utf8");
+  assert.match(css, /--floating-orb-inactive-size:\s*72px/);
+  assert.match(css, /var\(--floating-orb-inactive-size\)/);
+
+  // 4. Controller interaction: expand does not start a call
+  const calls = [];
+  const fakeFetch = async (url) => {
+    calls.push(url);
+    if (url === "/api/state") {
+      return new Response(
+        JSON.stringify({
+          schema_version: "1.3.0",
+          csrf_token: "csrf-ac12",
+          voice_enabled: true,
+          call_session: { call_id: "c1", state: "standby", turn_count: 0, active_correlation_id: null },
+          active_workspace: null,
+          available_workspaces: [],
+          pending_approvals: [],
+          messages: [],
+        }),
+        { status: 200 },
+      );
+    }
+    if (url === "/api/events") {
+      return new Response(new ReadableStream(), {
+        status: 200,
+        headers: { "Content-Type": "text/event-stream" },
+      });
+    }
+    return new Response(JSON.stringify({ ok: true }), { status: 200 });
+  };
+
+  const app = new DesktopAppController({ fetchImpl: fakeFetch });
+  await app.start();
+  await new Promise((r) => setTimeout(r, 20));
+
+  assert.equal(app.model.uiMode, "panel", "Cold start must default to panel");
+
+  await app.toggleUiMode();
+  assert.equal(app.model.uiMode, "orb", "toggleUiMode switches to orb");
+
+  await app.toggleUiMode();
+  assert.equal(app.model.uiMode, "panel", "toggleUiMode switches back to panel");
+
+  const callStartCalls = calls.filter((u) => u === "/api/call/start");
+  assert.equal(callStartCalls.length, 0, "Expanding must not make calls to /api/call/start");
+
+  // 5. Zero web storage in src/nova/ui/src
+  const srcFiles = fs.readdirSync(SRC_DIR).filter((f) => f.endsWith(".ts"));
+  for (const f of srcFiles) {
+    const content = fs.readFileSync(path.join(SRC_DIR, f), "utf8");
+    assert.ok(!content.includes("localStorage"), `${f} must not contain localStorage`);
+    assert.ok(!content.includes("sessionStorage"), `${f} must not contain sessionStorage`);
+  }
+
+  app.dispose();
+});
