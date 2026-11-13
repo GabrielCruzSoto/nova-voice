@@ -1847,5 +1847,19 @@ test("NOVA-007 AC-3..AC-9: Clean bevelled N monogram, floating orb standby/activ
   assert.match(css, /\.btn-workspace-option\s*\{/, "CSS must style .btn-workspace-option chips");
   assert.match(css, /\.nova-wave-svg--dynamic\s+\.nova-sinusoidal-path\s*\{[\s\S]*?animation:/, "Dynamic sinusoidal path must animate");
   assert.match(css, /\[data-dock-mode="call"\]\s+\.nova-dock-orb:disabled\s*\{[\s\S]*?opacity:\s*1\b/, "Active dock orb must remain at opacity: 1");
+
+  // 5. AC-7: Compact 360px-420px panel header wraps cleanly without overlapping state pill and workspace controls
+  assert.match(css, /\.workspace-bar\s*\{[\s\S]*?flex-wrap:\s*wrap\b/, ".workspace-bar must wrap cleanly in narrow panels");
+  const activePanelHtml = renderAppShell({
+    ...baseOrbModel,
+    uiMode: "panel",
+    callSession: { ...baseOrbModel.callSession, state: "listening" },
+  });
+  const viewActionsIdx = activePanelHtml.indexOf('class="workspace-view-actions"');
+  const selectionIdx = activePanelHtml.indexOf('class="workspace-selection"');
+  assert.ok(
+    viewActionsIdx > 0 && selectionIdx > viewActionsIdx,
+    "Header top row must pair brand+state with view toggle before workspace selector row",
+  );
 });
 

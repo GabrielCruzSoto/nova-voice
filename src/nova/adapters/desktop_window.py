@@ -699,6 +699,7 @@ def _run_pyqt6_shell(
         base_url=base_url,
         stop_event=sse_stop,
         on_state_change=lambda st, ve: _enqueue("orb_state", (st, ve)),
+        on_parent_lost=lambda: _enqueue("signal", None),
     )
     sse_subscriber.start()
 

@@ -12,6 +12,7 @@ import ctypes
 import http.client
 import json
 import math
+import os
 import re
 import signal
 import socket
@@ -209,6 +210,8 @@ class LoopbackOrbStateSubscriber(threading.Thread):
         base_url: str,
         stop_event: threading.Event,
         on_state_change: Callable[[str, bool], None],
+        on_parent_lost: Callable[[], None] | None = None,
+        ppid_provider: Callable[[], int] = os.getppid,
     ) -> None:
         super().__init__(name="nova-orb-sse", daemon=True)
         host, port = validate_loopback_url(base_url)
@@ -216,6 +219,9 @@ class LoopbackOrbStateSubscriber(threading.Thread):
         self._port = port
         self._stop_event = stop_event
         self._on_state_change = on_state_change
+        self._on_parent_lost = on_parent_lost
+        self._ppid_provider = ppid_provider
+        self._initial_ppid = ppid_provider()
         self._voice_enabled = True
 
     def _fetch_bootstrap_cookie_and_state(self) -> str:
@@ -318,6 +324,13 @@ class LoopbackOrbStateSubscriber(threading.Thread):
                     self._consume_sse(cookie)
             except Exception:
                 pass
+            if (
+                self._on_parent_lost is not None
+                and self._ppid_provider() != self._initial_ppid
+            ):
+                self._stop_event.set()
+                self._on_parent_lost()
+                break
             if self._stop_event.wait(timeout=backoff):
                 break
             backoff = min(3.0, backoff * 2.0)
@@ -874,6 +887,7 @@ def run_orb_overlay(
         base_url=url,
         stop_event=stop_event,
         on_state_change=_on_state_change,
+        on_parent_lost=stop_event.set,
     )
     subscriber.start()
     _emit_ipc("ready", backend="gtk4-layer-shell")

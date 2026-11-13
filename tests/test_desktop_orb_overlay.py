@@ -225,3 +225,27 @@ async def test_ac11_loopback_orb_subscriber_authenticates_cookie_and_tracks_sse_
     assert not subscriber.is_alive(), "Subscriber thread must exit cleanly after stop_event"
     assert all("nova_ui_session=tok-orb-test" in c for c in observed_cookies)
     assert [st for st, _ in observed_states[:3]] == ["standby", "listening", "standby"]
+
+
+def test_ac10_subscriber_invokes_on_parent_lost_when_reparented_after_disconnect() -> None:
+    """Contract OP-8: If parent dies (PPID changes) and loopback closes, subscriber exits 0."""
+    current_ppid = [4242]
+    parent_lost = threading.Event()
+    stop_event = threading.Event()
+
+    def _ppid() -> int:
+        curr = current_ppid[0]
+        current_ppid[0] = 1
+        return curr
+
+    subscriber = LoopbackOrbStateSubscriber(
+        base_url="http://127.0.0.1:65530",
+        stop_event=stop_event,
+        on_state_change=lambda _s, _v: None,
+        on_parent_lost=parent_lost.set,
+        ppid_provider=_ppid,
+    )
+    subscriber.start()
+    assert parent_lost.wait(timeout=2.0) is True
+    subscriber.join(timeout=1.0)
+    assert not subscriber.is_alive()

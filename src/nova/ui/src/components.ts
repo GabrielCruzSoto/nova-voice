@@ -312,6 +312,17 @@ export function renderWorkspaceBar(
           <span class="nova-state-pill" data-state="${safeState}">${escapeHtml(stateMeta.title)}</span>
         </div>
       </div>
+      <div class="workspace-view-actions">
+        <button
+          type="button"
+          class="btn-toggle-view"
+          data-action="toggle-ui-mode"
+          title="Modo widget"
+          aria-label="Modo widget"
+        >
+          Modo widget
+        </button>
+      </div>
       <div class="workspace-selection">
         ${chipHtml}
         <label class="sr-only" for="nova-workspace-select">Cambiar proyecto activo</label>
@@ -330,17 +341,6 @@ export function renderWorkspaceBar(
           data-action="pick-native"
         >
           Abrir carpeta…
-        </button>
-      </div>
-      <div class="workspace-view-actions">
-        <button
-          type="button"
-          class="btn-toggle-view"
-          data-action="toggle-ui-mode"
-          title="Modo widget"
-          aria-label="Modo widget"
-        >
-          Modo widget
         </button>
       </div>
       ${fallbackNote}
