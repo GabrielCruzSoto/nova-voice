@@ -688,3 +688,253 @@ test("AC-6: Scoped Escape key handling via public controller method handleEscape
 
   app.dispose();
 });
+
+test("AC-7: Empty workspace state with escaped catalog and pick-native", async () => {
+  const modelWithMaliciousCatalog = {
+    status: "empty",
+    voiceEnabled: true,
+    uiMode: "panel",
+    callSession: {
+      call_id: "c-empty",
+      state: "standby",
+      turn_count: 0,
+      active_correlation_id: null,
+    },
+    activeWorkspace: null,
+    availableWorkspaces: [
+      { display_name: "alpha", canonical_path: "/home/dev/Proyectos/alpha" },
+      { display_name: "<img src=x onerror=evil()>", canonical_path: "/home/dev/Proyectos/<evil>" },
+    ],
+    pendingApprovals: [],
+    messages: [],
+    errorBanner: null,
+    noticeBanner: null,
+    pickerFallbackOpen: false,
+    lastMilestone: null,
+  };
+
+  const html = renderAppShell(modelWithMaliciousCatalog);
+
+  // Exists data-slot="workspace-empty-state" with heading "Elegí un proyecto"
+  assert.match(html, /data-slot="workspace-empty-state"/);
+  assert.match(html, /<h2[^>]*>\s*Elegí un proyecto\s*<\/h2>/);
+
+  // Contains button for each option with data-action="select-workspace-option" and escaped data-canonical-path
+  assert.match(html, /data-action="select-workspace-option"[^>]+data-canonical-path="\/home\/dev\/Proyectos\/alpha"/);
+  assert.match(html, /data-action="select-workspace-option"[^>]+data-canonical-path="\/home\/dev\/Proyectos\/&lt;evil&gt;"/);
+
+  // Malicious display_name escaped
+  assert.ok(html.includes("&lt;img src=x onerror=evil()&gt;"));
+  assert.ok(!html.includes("<img src=x"));
+
+  // Contains pick-native button
+  assert.match(html, /<button[^>]+data-action="pick-native"[^>]*>\s*Abrir carpeta…\s*<\/button>/);
+
+  // Does NOT contain greeting
+  assert.ok(!html.includes("nova-empty-greeting"));
+
+  // Empty catalog scenario
+  const htmlEmptyCat = renderAppShell({ ...modelWithMaliciousCatalog, availableWorkspaces: [] });
+  assert.ok(!htmlEmptyCat.includes('data-action="select-workspace-option"'));
+  assert.match(htmlEmptyCat, /<button[^>]+data-action="pick-native"[^>]*>\s*Abrir carpeta…\s*<\/button>/);
+
+  // Loading scenario: no empty state during loading
+  const htmlLoading = renderAppShell({ ...modelWithMaliciousCatalog, status: "loading" });
+  assert.match(htmlLoading, /data-view-status="loading"/);
+  assert.ok(!htmlLoading.includes('data-slot="workspace-empty-state"'));
+
+  // Controller interaction: select option via catalog uses CSRF
+  const calls = [];
+  const fakeFetch = async (url, init) => {
+    calls.push({ url, method: init?.method, headers: init?.headers, body: init?.body });
+    if (url === "/api/state") {
+      return new Response(
+        JSON.stringify({
+          schema_version: "1.3.0",
+          csrf_token: "csrf-empty-test",
+          voice_enabled: true,
+          call_session: { call_id: "c1", state: "standby", turn_count: 0, active_correlation_id: null },
+          active_workspace: null,
+          available_workspaces: [
+            { display_name: "beta", canonical_path: "/home/dev/Proyectos/beta" },
+          ],
+          pending_approvals: [],
+          messages: [],
+        }),
+        { status: 200 },
+      );
+    }
+    if (url === "/api/events") {
+      return new Response(new ReadableStream(), {
+        status: 200,
+        headers: { "Content-Type": "text/event-stream" },
+      });
+    }
+    if (url === "/api/workspace/select") {
+      return new Response(
+        JSON.stringify({
+          cancelled: false,
+          workspace: {
+            display_name: "beta",
+            canonical_path: "/home/dev/Proyectos/beta",
+            selected_via: "exact_path",
+          },
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      );
+    }
+    return new Response(JSON.stringify({ ok: true }), { status: 200 });
+  };
+
+  const renders = [];
+  const app = new DesktopAppController({
+    fetchImpl: fakeFetch,
+    onRender: (renderedHtml, m) => {
+      renders.push({ renderedHtml, m });
+    },
+  });
+  await app.start();
+  await new Promise((r) => setTimeout(r, 20));
+
+  // Initial render has empty state
+  assert.ok(renders[renders.length - 1].renderedHtml.includes('data-slot="workspace-empty-state"'));
+
+  // User activates "beta"
+  await app.selectWorkspace("/home/dev/Proyectos/beta");
+
+  const selectReq = calls.find((c) => c.url === "/api/workspace/select");
+  assert.ok(selectReq, "POST to /api/workspace/select registered");
+  assert.equal(selectReq.headers["X-Nova-CSRF"], "csrf-empty-test");
+  assert.deepEqual(JSON.parse(selectReq.body), { path_or_query: "/home/dev/Proyectos/beta" });
+
+  // Empty state disappears from next render
+  const latestHtml = renders[renders.length - 1].renderedHtml;
+  assert.ok(!latestHtml.includes('data-slot="workspace-empty-state"'));
+
+  app.dispose();
+});
+
+test("AC-8: Composer disabled guard with accessible description and backend race", async () => {
+  const modelNoWorkspace = {
+    status: "empty",
+    voiceEnabled: true,
+    uiMode: "panel",
+    callSession: {
+      call_id: "c-empty",
+      state: "standby",
+      turn_count: 0,
+      active_correlation_id: null,
+    },
+    activeWorkspace: null,
+    availableWorkspaces: [],
+    pendingApprovals: [],
+    messages: [],
+    errorBanner: null,
+    noticeBanner: null,
+    pickerFallbackOpen: false,
+    lastMilestone: null,
+  };
+
+  const html = renderAppShell(modelNoWorkspace);
+
+  // Textarea and submit have disabled
+  assert.match(html, /<textarea[^>]+id="nova-chat-input"[^>]*\sdisabled\b/);
+  assert.match(html, /<button[^>]+type="submit"[^>]*\sdisabled\b/);
+
+  // Textarea has aria-describedby matching element whose text contains "proyecto"
+  const describedByMatch = html.match(/id="nova-chat-input"[^>]+aria-describedby="([^"]+)"/);
+  assert.ok(describedByMatch, "textarea must have aria-describedby");
+  const descId = describedByMatch[1];
+  const descElMatch = html.match(new RegExp(`<[^>]+id="${descId}"[^>]*>([^<]+)<`));
+  assert.ok(descElMatch, `Element with id ${descId} must exist`);
+  assert.match(descElMatch[1], /proyecto/i, "Description element must mention 'proyecto'");
+
+  // Controller guard prevents chat sending when activeWorkspace is null
+  const calls = [];
+  let sseControllerRef = null;
+  const encoder = new TextEncoder();
+
+  const fakeFetch = async (url, init) => {
+    calls.push({ url, method: init?.method, body: init?.body });
+    if (url === "/api/state") {
+      return new Response(
+        JSON.stringify({
+          schema_version: "1.3.0",
+          csrf_token: "csrf-ac8",
+          voice_enabled: true,
+          call_session: { call_id: "c1", state: "standby", turn_count: 0, active_correlation_id: null },
+          active_workspace: null,
+          available_workspaces: [],
+          pending_approvals: [],
+          messages: [],
+        }),
+        { status: 200 },
+      );
+    }
+    if (url === "/api/events") {
+      const stream = new ReadableStream({
+        start(controller) {
+          sseControllerRef = controller;
+        },
+      });
+      return new Response(stream, {
+        status: 200,
+        headers: { "Content-Type": "text/event-stream" },
+      });
+    }
+    if (url === "/api/chat") {
+      return new Response(
+        JSON.stringify({
+          error_code: "WORKSPACE_NOT_FOUND",
+          message: "Workspace path does not exist",
+          correlation_id: "corr-race",
+        }),
+        { status: 404, headers: { "Content-Type": "application/json" } },
+      );
+    }
+    return new Response(JSON.stringify({ ok: true }), { status: 200 });
+  };
+
+  const renders = [];
+  const app = new DesktopAppController({
+    fetchImpl: fakeFetch,
+    onRender: (renderedHtml, m) => {
+      renders.push({ renderedHtml, m });
+    },
+  });
+  await app.start();
+  await new Promise((r) => setTimeout(r, 20));
+
+  // Guard prevents sending without workspace
+  await app.submitChat("hola");
+  const chatCalls = calls.filter((c) => c.url === "/api/chat");
+  assert.equal(chatCalls.length, 0, "0 calls to /api/chat when activeWorkspace is null");
+
+  // SSE emits workspace_changed -> composer enabled
+  const frame = `event: nova_event\ndata: ${JSON.stringify({
+    seq: 1,
+    event_type: "workspace_changed",
+    correlation_id: "corr-ws",
+    timestamp: new Date().toISOString(),
+    payload: {
+      display_name: "valid-ws",
+      canonical_path: "/home/dev/valid-ws",
+      selected_via: "exact_path",
+    },
+  })}\n\n`;
+  sseControllerRef.enqueue(encoder.encode(frame));
+  await new Promise((r) => setTimeout(r, 20));
+
+  const afterWsHtml = renders[renders.length - 1].renderedHtml;
+  assert.match(afterWsHtml, /<textarea[^>]+id="nova-chat-input"/);
+  const inputTagMatch = afterWsHtml.match(/<textarea[^>]+id="nova-chat-input"[^>]*>/);
+  assert.ok(inputTagMatch && !inputTagMatch[0].includes("disabled"), "Textarea must not be disabled once workspace arrives");
+
+  // Backend race: 404 WORKSPACE_NOT_FOUND on chat submit displays notice without adding to messages
+  const msgCountBefore = app.model.messages.length;
+  await app.submitChat("hola");
+  assert.equal(app.model.messages.length, msgCountBefore, "Messages array must not grow on 404 failure");
+  assert.ok(app.model.noticeBanner !== null || app.model.errorBanner !== null, "Notice banner must be set on 404");
+
+  app.dispose();
+});

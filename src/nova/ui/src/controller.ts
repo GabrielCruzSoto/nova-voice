@@ -126,7 +126,7 @@ export class DesktopAppController {
 
   async submitChat(utterance: string): Promise<void> {
     const trimmed = utterance.trim();
-    if (!trimmed || this.#disposed) {
+    if (!trimmed || this.#disposed || !this.#model.activeWorkspace) {
       return;
     }
     const resp = await this.#postJson("/api/chat", { utterance: trimmed });
@@ -540,6 +540,8 @@ export class DesktopAppController {
         this.#model.status,
         this.#model.messages,
         this.#model.errorBanner,
+        this.#model.activeWorkspace,
+        this.#model.availableWorkspaces,
       );
       timelineSlot.scrollTop = timelineSlot.scrollHeight;
     }
@@ -600,6 +602,11 @@ export class DesktopAppController {
           void this.triggerCallAction("barge-in");
         } else if (action === "pick-native") {
           void this.pickNativeWorkspace();
+        } else if (action === "select-workspace-option") {
+          const canonicalPath = target.dataset["canonicalPath"] ?? "";
+          if (canonicalPath) {
+            void this.selectWorkspace(canonicalPath);
+          }
         } else if (action === "approve-command") {
           const auditId = target.dataset["auditId"] ?? "";
           void this.resolveApproval(auditId, true);

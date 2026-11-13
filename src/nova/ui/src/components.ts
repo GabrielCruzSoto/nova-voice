@@ -328,10 +328,51 @@ const ROLE_BADGE_MAP: Readonly<Record<string, string>> = {
   security: "Gatekeeper",
 };
 
+export function renderWorkspaceEmptyState(options: readonly UiWorkspaceOption[]): string {
+  const optionsHtml =
+    options.length > 0
+      ? `
+      <div class="workspace-catalog">
+        ${options
+          .map(
+            (opt) => `
+          <button
+            type="button"
+            class="btn-workspace-option"
+            data-action="select-workspace-option"
+            data-canonical-path="${escapeHtml(opt.canonical_path)}"
+          >
+            ${escapeHtml(opt.display_name)}
+          </button>
+        `,
+          )
+          .join("")}
+      </div>
+    `.trim()
+      : "";
+
+  return `
+    <div class="workspace-empty-state" data-slot="workspace-empty-state">
+      <h2 class="workspace-empty-title">Elegí un proyecto</h2>
+      <p class="workspace-empty-desc">Para comenzar a trabajar, seleccioná un proyecto del catálogo o abrí una carpeta.</p>
+      ${optionsHtml}
+      <button
+        type="button"
+        class="btn btn--secondary"
+        data-action="pick-native"
+      >
+        Abrir carpeta…
+      </button>
+    </div>
+  `.trim();
+}
+
 export function renderChatTimeline(
   status: ViewStatus,
   messages: readonly UiChatMessage[],
   errorBanner: string | null,
+  activeWorkspace?: UiWorkspaceView | null,
+  availableWorkspaces: readonly UiWorkspaceOption[] = [],
 ): string {
   const safeError = errorBanner
     ? `<div class="timeline-error-banner" role="alert">${escapeHtml(errorBanner)}</div>`
@@ -341,6 +382,15 @@ export function renderChatTimeline(
     return `
       <div class="chat-timeline chat-timeline--state" data-view-status="loading" role="status" aria-live="polite">
         <p>Conectando con el puente local de Nova (127.0.0.1)…</p>
+      </div>
+    `.trim();
+  }
+
+  if (activeWorkspace === null) {
+    return `
+      <div class="chat-timeline chat-timeline--state" data-view-status="${escapeHtml(status)}">
+        ${safeError}
+        ${renderWorkspaceEmptyState(availableWorkspaces)}
       </div>
     `.trim();
   }
@@ -604,7 +654,13 @@ export function renderAppShell(model: PresentationalAppModel): string {
 
       <main class="nova-main" aria-label="Historial de conversación y aprobaciones">
         <div class="nova-timeline-scroll" data-slot="timeline">
-          ${renderChatTimeline(model.status, model.messages, model.errorBanner)}
+          ${renderChatTimeline(
+            model.status,
+            model.messages,
+            model.errorBanner,
+            model.activeWorkspace,
+            model.availableWorkspaces,
+          )}
         </div>
 
         <div class="nova-approvals-slot" data-slot="approvals">
