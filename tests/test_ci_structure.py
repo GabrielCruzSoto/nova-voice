@@ -185,6 +185,13 @@ def test_ruleset_structure_and_status_checks() -> None:
     for ctx in required_contexts:
         assert ctx in pr_jobs, f"Ruleset check '{ctx}' has no matching job in pr-check.yml"
 
+    # Bypass actor must be Repository Admin (actor_id 5)
+    bypass = data.get("bypass_actors", [])
+    assert len(bypass) == 1
+    assert bypass[0].get("actor_id") == 5
+    assert bypass[0].get("actor_type") == "RepositoryRole"
+    assert bypass[0].get("bypass_mode") == "pull_request"
+
 
 def test_actionlint_if_available() -> None:
     if shutil.which("actionlint"):

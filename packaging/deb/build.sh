@@ -123,9 +123,14 @@ mkdir -p "${STAGING_DIR}/usr/share/doc/nova-voice"
 
 VENV_TARGET="${STAGING_DIR}/opt/nova/venv"
 
-echo "Creating isolated virtual environment at ${VENV_TARGET}..."
-if ! python3 -m venv --system-site-packages "$VENV_TARGET" 2>/dev/null; then
-  python3 -m venv --without-pip --system-site-packages "$VENV_TARGET"
+SYS_PYTHON="python3"
+if [[ -x "/usr/bin/python3" ]]; then
+  SYS_PYTHON="/usr/bin/python3"
+fi
+
+echo "Creating isolated virtual environment at ${VENV_TARGET} using ${SYS_PYTHON}..."
+if ! "$SYS_PYTHON" -m venv --system-site-packages "$VENV_TARGET" 2>/dev/null; then
+  "$SYS_PYTHON" -m venv --without-pip --system-site-packages "$VENV_TARGET"
 fi
 
 echo "Installing runtime dependencies and nova-voice..."
@@ -153,6 +158,11 @@ version = 3.12.3
 executable = /usr/bin/python3.12
 command = /usr/bin/python3 -m venv --system-site-packages /opt/nova/venv
 EOF
+
+# Normalize interpreter symlinks inside venv so there is no host toolcache leakage
+ln -snf /usr/bin/python3.12 "${VENV_TARGET}/bin/python3"
+ln -snf python3 "${VENV_TARGET}/bin/python"
+ln -snf python3 "${VENV_TARGET}/bin/python3.12"
 
 # Sanitize shebangs in /opt/nova/venv/bin
 for binfile in "${VENV_TARGET}/bin"/*; do

@@ -27,6 +27,12 @@ jobs:
           python-version: "3.12"
           cache: "pip"
 
+      - name: Set up Node.js 24
+        timeout-minutes: 3
+        uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4.2.0
+        with:
+          node-version: "24"
+
       - name: Install system dependencies
         timeout-minutes: 5
         run: |
@@ -41,15 +47,15 @@ jobs:
 
       - name: Lint with Ruff
         timeout-minutes: 3
-        run: ruff check src tests
+        run: ruff check src tests scripts
 
       - name: Type check with Mypy
         timeout-minutes: 5
-        run: mypy --strict src tests
+        run: mypy --strict src tests scripts
 
       - name: Run Python tests
         timeout-minutes: 10
-        run: pytest -q
+        run: pytest -q --ignore=tests/test_deb_package.py
 
   ui-quality:
     name: UI Typecheck & Tests
@@ -60,11 +66,11 @@ jobs:
         timeout-minutes: 3
         uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683  # v4.2.2
 
-      - name: Set up Node.js
+      - name: Set up Node.js 24
         timeout-minutes: 3
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4.2.0
         with:
-          node-version: "20"
+          node-version: "24"
           cache: "npm"
 
       - name: Install dependencies
@@ -168,18 +174,18 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Set up Node.js
+      - name: Set up Node.js 24
         timeout-minutes: 3
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4.2.0
         with:
-          node-version: "20"
+          node-version: "24"
           cache: "npm"
 
       - name: Install packaging tools
         timeout-minutes: 5
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends dpkg-dev binutils xz-utils desktop-file-utils
+          sudo apt-get install -y --no-install-recommends python3-venv dpkg-dev binutils xz-utils desktop-file-utils
 
       - name: Install UI dependencies and build UI
         timeout-minutes: 5
@@ -188,6 +194,14 @@ jobs:
       - name: Build Debian package (PR mode)
         timeout-minutes: 10
         run: bash packaging/deb/build.sh --mode pr
+
+      - name: Install test dependencies
+        timeout-minutes: 3
+        run: pip install pytest
+
+      - name: Run Debian packaging tests
+        timeout-minutes: 10
+        run: pytest -q tests/test_deb_package.py
 
       - name: Upload Debian package artifact
         timeout-minutes: 5

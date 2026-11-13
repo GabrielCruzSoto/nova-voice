@@ -169,6 +169,11 @@ def test_deb_extracted_desktop_entry_and_venv(
     app_js_matches = list(extract_dir.glob("opt/nova/venv/**/ui/static/app.js"))
     assert len(app_js_matches) >= 1, "app.js must be present in packaged venv site-packages"
 
+    # Validate python3 symlink normalization (no toolcache or host venv leak)
+    py3_link = extract_dir / "opt" / "nova" / "venv" / "bin" / "python3"
+    assert py3_link.is_symlink(), "python3 in venv must be a symlink"
+    assert os.readlink(py3_link) == "/usr/bin/python3.12"
+
     # Check for build path leaks in text files under /opt/nova
     build_dir_str = str(_REPO_ROOT)
     r_grep = subprocess.run(

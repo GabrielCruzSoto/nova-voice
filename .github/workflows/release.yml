@@ -32,18 +32,18 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Set up Node.js
+      - name: Set up Node.js 24
         timeout-minutes: 3
         uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020  # v4.2.0
         with:
-          node-version: "20"
+          node-version: "24"
           cache: "npm"
 
       - name: Install packaging tools
         timeout-minutes: 5
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends dpkg-dev binutils xz-utils desktop-file-utils
+          sudo apt-get install -y --no-install-recommends python3-venv dpkg-dev binutils xz-utils desktop-file-utils
 
       - name: Evaluate release decision
         id: decision
