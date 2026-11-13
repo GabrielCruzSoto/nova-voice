@@ -4,7 +4,10 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 export PYTHONPATH="${ROOT_DIR}/src${PYTHONPATH:+:${PYTHONPATH}}"
 
+common_dir="$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null || true)"
 if [[ -x "${ROOT_DIR}/.venv/bin/python" ]]; then
   exec "${ROOT_DIR}/.venv/bin/python" -m nova "$@"
+elif [[ -n "${common_dir}" && -x "$(dirname "${common_dir}")/.venv/bin/python" ]]; then
+  exec "$(dirname "${common_dir}")/.venv/bin/python" -m nova "$@"
 fi
 exec python3 -m nova "$@"

@@ -1,0 +1,40 @@
+{
+  "schema_version": "1.0.0",
+  "models": [
+    {
+      "filename": "silero_vad.onnx",
+      "type": "vad",
+      "source_type": "https",
+      "url": "https://github.com/snakers4/silero-vad/raw/v4.0/files/silero_vad.onnx",
+      "sha256": "a35ebf52fd3ce5f1469b2a36158dba761bc47b973ea3382b3186ca15b1f5af28",
+      "size_bytes": 1807522,
+      "description": "Silero VAD v4.0 ONNX neural voice activity detector"
+    },
+    {
+      "filename": "es_ES-davefx-medium.onnx",
+      "type": "tts_model",
+      "source_type": "https",
+      "url": "https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/es/es_ES/davefx/medium/es_ES-davefx-medium.onnx",
+      "sha256": "6658b03b1a6c316ee4c265a9896abc1393353c2d9e1bca7d66c2c442e222a917",
+      "size_bytes": 63201294,
+      "description": "Piper Spanish (Spain) davefx medium ONNX TTS voice model"
+    },
+    {
+      "filename": "es_ES-davefx-medium.onnx.json",
+      "type": "tts_config",
+      "source_type": "https",
+      "url": "https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/es/es_ES/davefx/medium/es_ES-davefx-medium.onnx.json",
+      "sha256": "0e0dda87c732f6f38771ff274a6380d9252f327dca77aa2963d5fbdf9ec54842",
+      "size_bytes": 4817,
+      "description": "Piper Spanish davefx medium voice phoneme and audio configuration"
+    },
+    {
+      "filename": "oye_nova.onnx",
+      "type": "wakeword",
+      "source_type": "local-import",
+      "sha256": "94a13cfe60075b132f6a472e7e462e8123ee70861bc3fb58434a73712ee0d2cb",
+      "size_bytes": 1271370,
+      "description": "Nova custom wake-word ONNX model ('Oye Nova') for OpenWakeWord"
+    }
+  ]
+}
