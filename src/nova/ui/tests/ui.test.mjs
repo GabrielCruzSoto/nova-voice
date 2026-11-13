@@ -8,6 +8,7 @@ import {
   escapeHtml,
   renderAppShell,
   renderApprovalBanner,
+  renderCallControls,
   renderChatTimeline,
   renderNovaReactiveOrb,
   renderNovaSquircleSvg,
@@ -454,4 +455,236 @@ test("Visual Identity & GNOME Specification: design tokens, squircle SVGs, sinus
   // Tray symbolic icon exists
   const traySvgPath = path.join(STATIC_DIR, "nova-gnome-tray-symbolic.svg");
   assert.ok(fs.existsSync(traySvgPath));
+});
+
+test("AC-3 & AC-4: Dock standby and call modes, textarea lifecycle, and mic button removal", async () => {
+  const baseModel = {
+    status: "success",
+    voiceEnabled: true,
+    uiMode: "panel",
+    callSession: {
+      call_id: "call-1",
+      state: "standby",
+      turn_count: 0,
+      active_correlation_id: null,
+    },
+    activeWorkspace: {
+      display_name: "alpha",
+      canonical_path: "/home/dev/Proyectos/alpha",
+      selected_via: "exact_path",
+    },
+    availableWorkspaces: [
+      { display_name: "alpha", canonical_path: "/home/dev/Proyectos/alpha" },
+    ],
+    pendingApprovals: [],
+    messages: [],
+    errorBanner: null,
+    pickerFallbackOpen: false,
+    lastMilestone: null,
+  };
+
+  // AC-3: Standby and closed modes
+  for (const st of ["standby", "closed"]) {
+    const html = renderAppShell({ ...baseModel, callSession: { ...baseModel.callSession, state: st } });
+    assert.match(html, /data-slot="dock"[^>]*data-dock-mode="standby"/);
+
+    // Orb in dock is the only call-start occurrence
+    const startMatches = html.match(/data-action="call-start"/g) || [];
+    assert.equal(startMatches.length, 1, `Expected exactly 1 call-start in state ${st}`);
+    assert.match(html, /<button[^>]+class="nova-dock-orb"[^>]+data-action="call-start"[^>]+aria-label="Iniciar llamada"/);
+
+    // Contains textarea with maxlength="16000" and submit button
+    assert.match(html, /<textarea[^>]+id="nova-chat-input"[^>]+maxlength="16000"/);
+    assert.match(html, /<button[^>]+type="submit"/);
+
+    // Does NOT contain wave box, barge-in, call-end, nor btn-mic
+    assert.ok(!html.includes("nova-wave-box"));
+    assert.ok(!html.includes('data-action="call-barge-in"'));
+    assert.ok(!html.includes('data-action="call-end"'));
+    assert.ok(!html.includes("btn-mic"));
+  }
+
+  // Without voice available: orb is disabled
+  const noVoiceHtml = renderAppShell({ ...baseModel, voiceEnabled: false });
+  assert.match(noVoiceHtml, /data-action="call-start"[^>]*disabled/);
+  assert.match(noVoiceHtml, /data-action="call-start"[^>]*aria-disabled="true"/);
+
+  // AC-4: In call states {listening, thinking, executing, speaking}
+  const callStates = ["listening", "thinking", "executing", "speaking"];
+  for (const st of callStates) {
+    const html = renderAppShell({ ...baseModel, callSession: { ...baseModel.callSession, state: st } });
+    assert.match(html, /data-slot="dock"[^>]*data-dock-mode="call"/);
+    assert.ok(html.includes("nova-wave-svg--dynamic"));
+
+    // Barge-in and end buttons enabled without disabled attribute
+    assert.match(html, /<button[^>]+data-action="call-barge-in"[^>]*>\s*Interrumpir \(Esc\)\s*<\/button>/);
+    const bargeInMatch = html.match(/<button[^>]+data-action="call-barge-in"[^>]*>/);
+    assert.ok(bargeInMatch && !bargeInMatch[0].includes("disabled"), `Barge-in should not be disabled in ${st}`);
+
+    assert.match(html, /<button[^>]+data-action="call-end"[^>]*>\s*Colgar\s*<\/button>/);
+    const endMatch = html.match(/<button[^>]+data-action="call-end"[^>]*>/);
+    assert.ok(endMatch && !endMatch[0].includes("disabled"), `Call-end should not be disabled in ${st}`);
+
+    // Orb has disabled and aria-disabled="true"
+    assert.match(html, /data-action="call-start"[^>]*disabled/);
+    assert.match(html, /data-action="call-start"[^>]*aria-disabled="true"/);
+
+    // Shell does not contain textarea nor submit button
+    assert.ok(!html.includes('id="nova-chat-input"'));
+    assert.ok(!html.includes('type="submit"'));
+  }
+});
+
+test("AC-5: Strict 12-combination barge-in enablement in renderCallControls and controller guard", async () => {
+  const allStates = ["standby", "listening", "thinking", "executing", "speaking", "closed"];
+  for (const st of allStates) {
+    for (const voiceEnabled of [true, false]) {
+      const inCall = st !== "standby" && st !== "closed";
+      const expectedEnabled = voiceEnabled && inCall;
+      const html = renderCallControls(st, voiceEnabled);
+
+      const btnMatch = html.match(/<button[^>]+data-action="call-barge-in"[^>]*>/);
+      assert.ok(btnMatch, `Button must exist for ${st}, voice=${voiceEnabled}`);
+
+      if (expectedEnabled) {
+        assert.ok(!btnMatch[0].includes("disabled"), `barge-in should be enabled for ${st}, voice=${voiceEnabled}`);
+      } else {
+        assert.ok(btnMatch[0].includes("disabled"), `barge-in must have disabled for ${st}, voice=${voiceEnabled}`);
+        assert.ok(btnMatch[0].includes('aria-disabled="true"'), `barge-in must have aria-disabled for ${st}, voice=${voiceEnabled}`);
+      }
+    }
+  }
+
+  // Controller defense in depth
+  const calls = [];
+  const fakeFetch = async (url, init) => {
+    calls.push({ url, method: init?.method });
+    if (url === "/api/state") {
+      return new Response(
+        JSON.stringify({
+          schema_version: "1.3.0",
+          csrf_token: "csrf-token",
+          voice_enabled: true,
+          call_session: { call_id: "c1", state: "standby", turn_count: 0, active_correlation_id: null },
+          active_workspace: { display_name: "w", canonical_path: "/w", selected_via: "exact_path" },
+          available_workspaces: [],
+          pending_approvals: [],
+          messages: [],
+        }),
+        { status: 200 },
+      );
+    }
+    if (url === "/api/events") {
+      return new Response(new ReadableStream(), {
+        status: 200,
+        headers: { "Content-Type": "text/event-stream" },
+      });
+    }
+    return new Response(JSON.stringify({ ok: true }), { status: 200 });
+  };
+
+  const app = new DesktopAppController({ fetchImpl: fakeFetch });
+  await app.start();
+  await new Promise((r) => setTimeout(r, 20));
+
+  // Standby -> trigger barge-in must result in 0 calls to /api/call/barge-in
+  await app.triggerCallAction("barge-in");
+  const bargeInCalls = calls.filter((c) => c.url === "/api/call/barge-in");
+  assert.equal(bargeInCalls.length, 0, "Standby barge-in must be blocked by controller guard");
+  app.dispose();
+});
+
+test("AC-6: Scoped Escape key handling via public controller method handleEscapeKey", async () => {
+  const calls = [];
+  let sseControllerRef = null;
+  const encoder = new TextEncoder();
+
+  const fakeFetch = async (url, init) => {
+    calls.push({ url, method: init?.method, body: init?.body });
+    if (url === "/api/state") {
+      return new Response(
+        JSON.stringify({
+          schema_version: "1.3.0",
+          csrf_token: "csrf-token",
+          voice_enabled: true,
+          call_session: { call_id: "c1", state: "standby", turn_count: 0, active_correlation_id: null },
+          active_workspace: { display_name: "w", canonical_path: "/w", selected_via: "exact_path" },
+          available_workspaces: [],
+          pending_approvals: [],
+          messages: [],
+        }),
+        { status: 200 },
+      );
+    }
+    if (url === "/api/events") {
+      const stream = new ReadableStream({
+        start(controller) {
+          sseControllerRef = controller;
+        },
+      });
+      return new Response(stream, {
+        status: 200,
+        headers: { "Content-Type": "text/event-stream" },
+      });
+    }
+    return new Response(JSON.stringify({ ok: true }), { status: 200 });
+  };
+
+  const app = new DesktopAppController({ fetchImpl: fakeFetch });
+  await app.start();
+  await new Promise((r) => setTimeout(r, 20));
+
+  // Helper to emit call_state_changed
+  const setCallState = async (state) => {
+    const frame = `event: nova_event\ndata: ${JSON.stringify({
+      seq: Date.now(),
+      event_type: "call_state_changed",
+      correlation_id: "corr-esc",
+      timestamp: new Date().toISOString(),
+      payload: { call_id: "c1", state, turn_count: 1 },
+    })}\n\n`;
+    sseControllerRef.enqueue(encoder.encode(frame));
+    await new Promise((r) => setTimeout(r, 20));
+  };
+
+  // 1. speaking + panel -> exactly 1 POST to /api/call/barge-in
+  await setCallState("speaking");
+  assert.equal(app.model.callSession.state, "speaking");
+  assert.equal(app.model.uiMode, "panel");
+  const countBefore1 = calls.filter((c) => c.url === "/api/call/barge-in").length;
+  await app.handleEscapeKey();
+  const countAfter1 = calls.filter((c) => c.url === "/api/call/barge-in").length;
+  assert.equal(countAfter1 - countBefore1, 1, "speaking + panel emits 1 barge-in request");
+
+  // 2. listening + orb -> exactly 1 POST to /api/call/barge-in, uiMode remains orb
+  await setCallState("listening");
+  await app.toggleUiMode(); // switches to orb
+  assert.equal(app.model.uiMode, "orb");
+  const countBefore2 = calls.filter((c) => c.url === "/api/call/barge-in").length;
+  await app.handleEscapeKey();
+  const countAfter2 = calls.filter((c) => c.url === "/api/call/barge-in").length;
+  assert.equal(countAfter2 - countBefore2, 1, "listening + orb emits 1 barge-in request");
+  assert.equal(app.model.uiMode, "orb", "uiMode remains orb after barge-in during call");
+
+  // 3. standby + orb -> 0 new requests, uiMode transitions to panel
+  await setCallState("standby");
+  assert.equal(app.model.uiMode, "orb");
+  const countBefore3 = calls.length;
+  await app.handleEscapeKey();
+  const countAfter3 = calls.length;
+  assert.equal(countAfter3, countBefore3, "standby + orb generates 0 network requests");
+  assert.equal(app.model.uiMode, "panel", "standby + orb transitions uiMode to panel");
+
+  // 4. standby + panel -> 0 new requests, model unchanged (structural equality)
+  assert.equal(app.model.uiMode, "panel");
+  assert.equal(app.model.callSession.state, "standby");
+  const modelBefore4 = JSON.stringify(app.model);
+  const countBefore4 = calls.length;
+  await app.handleEscapeKey();
+  const countAfter4 = calls.length;
+  const modelAfter4 = JSON.stringify(app.model);
+  assert.equal(countAfter4, countBefore4, "standby + panel generates 0 network requests");
+  assert.equal(modelAfter4, modelBefore4, "standby + panel leaves model structurally identical");
+
+  app.dispose();
 });

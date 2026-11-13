@@ -144,12 +144,40 @@ export class DesktopAppController {
     if (this.#disposed) {
       return;
     }
+    const inCall =
+      this.#model.callSession.state !== "standby" && this.#model.callSession.state !== "closed";
+    if (action === "barge-in" && (!inCall || !this.#model.voiceEnabled)) {
+      return;
+    }
     const resp = await this.#postJson(`/api/call/${action}`, {});
     if (!resp.ok) {
       const errBody = await this.#safeParseError(resp);
       this.#updateModel({
         errorBanner: errBody?.message ?? `No fue posible ejecutar '${action}'.`,
       });
+    }
+  }
+
+  async toggleUiMode(): Promise<void> {
+    if (this.#disposed) {
+      return;
+    }
+    const nextMode = (this.#model.uiMode ?? "panel") === "orb" ? "panel" : "orb";
+    this.#updateModel({ uiMode: nextMode });
+  }
+
+  async handleEscapeKey(): Promise<void> {
+    if (this.#disposed) {
+      return;
+    }
+    const inCall =
+      this.#model.callSession.state !== "standby" && this.#model.callSession.state !== "closed";
+    if (inCall) {
+      await this.triggerCallAction("barge-in");
+      return;
+    }
+    if ((this.#model.uiMode ?? "panel") === "orb") {
+      this.#updateModel({ uiMode: "panel" });
     }
   }
 
@@ -563,14 +591,7 @@ export class DesktopAppController {
         }
         const action = target.dataset["action"];
         if (action === "toggle-ui-mode") {
-          if (
-            this.#model.callSession.state === "standby" ||
-            this.#model.callSession.state === "closed"
-          ) {
-            void this.triggerCallAction("start");
-          }
-          const nextMode = (this.#model.uiMode ?? "panel") === "orb" ? "panel" : "orb";
-          this.#updateModel({ uiMode: nextMode });
+          void this.toggleUiMode();
         } else if (action === "call-start") {
           void this.triggerCallAction("start");
         } else if (action === "call-end") {
@@ -625,7 +646,7 @@ export class DesktopAppController {
       "keydown",
       (ev) => {
         if (ev.key === "Escape") {
-          void this.triggerCallAction("barge-in");
+          void this.handleEscapeKey();
           return;
         }
         const target = ev.target as HTMLElement | null;
