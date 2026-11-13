@@ -6,6 +6,7 @@ import json
 import re
 import shutil
 import subprocess
+import tomllib
 from pathlib import Path
 
 import yaml  # type: ignore[import-untyped]
@@ -197,3 +198,19 @@ def test_actionlint_if_available() -> None:
     if shutil.which("actionlint"):
         res = subprocess.run(["actionlint"], cwd=_REPO_ROOT, capture_output=True, text=True)
         assert res.returncode == 0, f"actionlint failed:\n{res.stdout}\n{res.stderr}"
+
+
+def test_mypy_ignores_optional_webview_stubs() -> None:
+    pyproject_path = _REPO_ROOT / "pyproject.toml"
+    assert pyproject_path.is_file(), "pyproject.toml must exist"
+    with open(pyproject_path, "rb") as f:
+        data = tomllib.load(f)
+    overrides = data.get("tool", {}).get("mypy", {}).get("overrides", [])
+    assert isinstance(overrides, list), "tool.mypy.overrides must be a list"
+    webview_override = next(
+        (o for o in overrides if isinstance(o, dict) and "webview" in o.get("module", [])),
+        None,
+    )
+    assert webview_override is not None, "Must define mypy override for webview module"
+    assert webview_override.get("ignore_missing_imports") is True
+

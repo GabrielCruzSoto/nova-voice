@@ -71,6 +71,10 @@ mypy_path = "src"
 cache_dir = ".venv/.cache/mypy"
 plugins = ["pydantic.mypy"]
 
+[[tool.mypy.overrides]]
+module = ["webview", "webview.*"]
+ignore_missing_imports = true
+
 [tool.ruff]
 target-version = "py312"
 line-length = 100
