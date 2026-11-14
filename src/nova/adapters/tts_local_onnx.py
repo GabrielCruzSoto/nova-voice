@@ -153,6 +153,27 @@ class LocalOnnxTtsAdapter:
         self._kokoro_infer_lock = threading.Lock()
         self._kokoro: KokoroBackendProtocol | None = None
 
+    def update_settings(
+        self,
+        *,
+        engine: Literal["kokoro", "piper"] | None = None,
+        speed: float | None = None,
+        kokoro_voice: str | None = None,
+        kokoro_lang: str | None = None,
+    ) -> None:
+        """Hot-update TTS engine, voice, language, and speed for future synthesis."""
+        updates: dict[str, Any] = {}
+        if engine is not None:
+            updates["engine"] = engine
+        if speed is not None:
+            updates["speed"] = speed
+        if kokoro_voice is not None:
+            updates["kokoro_voice"] = kokoro_voice
+        if kokoro_lang is not None:
+            updates["kokoro_lang"] = kokoro_lang
+        if updates:
+            self._settings = self._settings.model_copy(update=updates)
+
     def _build_default_kokoro(self) -> KokoroBackendProtocol:
         model_p = self._settings.kokoro_model_path
         voices_p = self._settings.kokoro_voices_path

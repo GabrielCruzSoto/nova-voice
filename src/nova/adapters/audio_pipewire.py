@@ -127,6 +127,20 @@ class PipeWireAudioAdapter:
         self._stopping_playback = False
         self._playback_stop_lock = asyncio.Lock()
 
+    def update_settings(
+        self,
+        *,
+        capture_target: str | None = None,
+        playback_target: str | None = None,
+    ) -> None:
+        """Hot-update PipeWire/PulseAudio target devices for future streams."""
+        self._settings = self._settings.model_copy(
+            update={
+                "capture_target": capture_target,
+                "playback_target": playback_target,
+            }
+        )
+
     @property
     def is_playing(self) -> bool:
         """Return True while a playback subprocess is active."""

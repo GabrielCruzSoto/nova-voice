@@ -112,6 +112,10 @@ class FasterWhisperSttAdapter:
         self._model: WhisperModelProtocol | None = None
         self._active_device: InferenceDevice = self._settings.preferred_device
 
+    def update_settings(self, *, language: str | None = None) -> None:
+        """Hot-update Whisper language hint (`None` means auto-detect)."""
+        self._settings = self._settings.model_copy(update={"language": language})
+
     def _instantiate_sync(self, device: InferenceDevice) -> WhisperModelProtocol:
         compute = (
             self._settings.cuda_compute_type

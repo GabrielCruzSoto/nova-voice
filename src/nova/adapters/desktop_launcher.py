@@ -22,13 +22,16 @@ from typing import Literal, Protocol
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from nova.adapters.antigravity_adapter import AntigravityCLIAdapter, AntigravityRunnerConfig
+from nova.adapters.audio_device_discovery import PipeWireDeviceDiscoveryAdapter
 from nova.adapters.audio_pipewire import PipeWireAudioAdapter, PipeWireAudioSettings
 from nova.adapters.config_store import TomlConfigStore, resolve_config_file_path
+from nova.adapters.control_ipc import UnixControlIpcServer
 from nova.adapters.desktop_ui_server import DesktopUiServer, DesktopUiServerSettings
 from nova.adapters.folder_picker_gtk import GtkFolderPickerAdapter
 from nova.adapters.gatekeeper_ipc import GatekeeperIPCConfig, UnixSocketGatekeeperServer
 from nova.adapters.pi_auditor_adapter import PiAuditorAdapter, PiAuditorConfig
 from nova.adapters.pi_rpc_client import PiRpcClient, PiRpcConfig
+from nova.adapters.shortcut_registrar import LinuxShortcutRegistrar
 from nova.adapters.stt_faster_whisper import FasterWhisperSettings, FasterWhisperSttAdapter
 from nova.adapters.tts_local_onnx import LocalOnnxTtsAdapter, LocalOnnxTtsSettings
 from nova.adapters.vad_silero import SileroVadAdapter, SileroVadSettings
@@ -36,6 +39,7 @@ from nova.adapters.wakeword_openwakeword import OpenWakeWordAdapter, OpenWakeWor
 from nova.adapters.workspace_resolver import LocalWorkspaceResolver
 from nova.application.orchestrator import NovaOrchestrator, OrchestratorSettings
 from nova.application.security_gatekeeper import SecurityGatekeeper
+from nova.application.settings_service import SettingsService
 from nova.application.ui_state_hub import UiStateHub
 from nova.application.voice_coordinator import VoiceCallCoordinator, VoiceCoordinatorSettings
 from nova.domain.errors import (
@@ -44,7 +48,7 @@ from nova.domain.errors import (
     VoicePipelineError,
     redact_sensitive_text,
 )
-from nova.domain.events import OrchestratorEventBus
+from nova.domain.events import OrchestratorEventBus, UiPanelToggleRequestedEvent
 from nova.domain.models import (
     CallSession,
     InferenceDevice,
@@ -367,6 +371,7 @@ def build_default_voice_coordinator(
         settings=VoiceCoordinatorSettings(
             speech_threshold=config.speech_threshold,
             barge_in_threshold=config.barge_in_threshold,
+            ptt_mode=config.ptt_mode,
         ),
     )
 
@@ -471,9 +476,13 @@ class NovaDesktopRuntime:
         self._native_shell_available = native_shell_available
 
         self._event_bus = OrchestratorEventBus()
+        self._config_store = TomlConfigStore(config_path=resolve_config_file_path())
         self._ipc_server: UnixSocketGatekeeperServer | None = None
+        self._control_ipc: UnixControlIpcServer | None = None
         self._pi_client: PiRpcClient | None = None
+        self._orchestrator: NovaOrchestrator | None = None
         self._voice_coordinator: VoiceRuntimePort | None = None
+        self._settings_service: SettingsService | None = None
         self._state_hub: UiStateHub | None = None
         self._ui_server: DesktopUiServer | None = None
         self._gatekeeper: SecurityGatekeeper | None = None
@@ -520,6 +529,80 @@ class NovaDesktopRuntime:
                 value, str
             ) else value
         logger.info(json.dumps(safe, ensure_ascii=False, sort_keys=True))
+
+    def _apply_hot_settings(self, updated: NovaPersistedSettings) -> None:
+        """Apply hot-reloadable configuration changes to live runtime components."""
+        if self._pi_client is not None:
+            self._pi_client.update_model(
+                provider=updated.models.pi_provider,
+                model=updated.models.pi_model,
+            )
+        if self._orchestrator is not None:
+            self._orchestrator.update_models(tier2_model=updated.models.tier2_model)
+
+        voice_coord = self._voice_coordinator
+        if voice_coord is None:
+            return
+        update_coord = getattr(voice_coord, "update_settings", None)
+        if callable(update_coord):
+            update_coord(
+                ptt_mode=updated.shortcuts.ptt_mode,
+                speech_threshold=updated.voice.speech_threshold,
+                barge_in_threshold=updated.voice.barge_in_threshold,
+            )
+        audio_in = getattr(voice_coord, "_audio_input", None)
+        if audio_in is not None and callable(getattr(audio_in, "update_settings", None)):
+            audio_in.update_settings(
+                capture_target=updated.audio.capture_target,
+                playback_target=updated.audio.playback_target,
+            )
+        audio_out = getattr(voice_coord, "_audio_output", None)
+        if (
+            audio_out is not None
+            and audio_out is not audio_in
+            and callable(getattr(audio_out, "update_settings", None))
+        ):
+            audio_out.update_settings(
+                capture_target=updated.audio.capture_target,
+                playback_target=updated.audio.playback_target,
+            )
+        wake_word = getattr(voice_coord, "_wake_word", None)
+        if wake_word is not None and callable(getattr(wake_word, "update_settings", None)):
+            wake_word.update_settings(threshold=updated.voice.wakeword_threshold)
+        stt = getattr(voice_coord, "_stt", None)
+        if stt is not None and callable(getattr(stt, "update_settings", None)):
+            stt.update_settings(language=updated.voice.whisper_language)
+        tts = getattr(voice_coord, "_tts", None)
+        if tts is not None and callable(getattr(tts, "update_settings", None)):
+            tts.update_settings(
+                engine=updated.voice.tts_engine,
+                speed=updated.voice.tts_speed,
+                kokoro_voice=updated.voice.kokoro_voice,
+            )
+
+    async def _handle_control_action(self, action: str) -> dict[str, object]:
+        """Handle local `nova control <action>` commands received via UnixControlIpcServer."""
+        if action == "ptt-toggle":
+            if self._voice_coordinator is None:
+                return {"ok": True, "action": action, "voice_enabled": False}
+            trigger = getattr(self._voice_coordinator, "trigger_ptt_toggle", None)
+            if callable(trigger):
+                await trigger()
+            else:
+                await self._voice_coordinator.start_call(reason="global_ptt_toggle")
+            return {"ok": True, "action": action}
+        if action == "toggle-panel":
+            await self._event_bus.publish(
+                UiPanelToggleRequestedEvent(correlation_id="corr-ipc-panel")
+            )
+            return {"ok": True, "action": action}
+        if action == "barge-in":
+            if self._voice_coordinator is not None:
+                await self._voice_coordinator.barge_in()
+            elif self._orchestrator is not None:
+                await self._orchestrator.barge_in()
+            return {"ok": True, "action": action}
+        return {"ok": False, "action": action}
 
     async def __aenter__(self) -> NovaDesktopRuntime:
         await self.start()
@@ -605,6 +688,7 @@ class NovaDesktopRuntime:
                 settings=OrchestratorSettings(default_tier2_model=self._config.tier2_model),
                 security_gatekeeper=gatekeeper,
             )
+            self._orchestrator = orchestrator
 
             voice_coord: VoiceRuntimePort | None = None
             if self._config.enable_voice:
@@ -650,16 +734,35 @@ class NovaDesktopRuntime:
             )
             self._state_hub = state_hub
 
+            initial_persisted = await asyncio.to_thread(self._config_store.load)
+            settings_service = SettingsService(
+                config_store=self._config_store,
+                initial_settings=initial_persisted,
+                audio_discovery=PipeWireDeviceDiscoveryAdapter(),
+                shortcut_registrar=LinuxShortcutRegistrar(),
+                event_bus=self._event_bus,
+                on_hot_apply=self._apply_hot_settings,
+            )
+            self._settings_service = settings_service
+
             ui_server = DesktopUiServer(
                 orchestrator=orchestrator,
                 state_hub=state_hub,
                 event_bus=self._event_bus,
                 voice_coordinator=voice_coord,
                 folder_picker=self._folder_picker,
+                settings_service=settings_service,
                 settings=DesktopUiServerSettings(host="127.0.0.1", port=self._config.port),
             )
             await ui_server.start()
             self._ui_server = ui_server
+
+            control_ipc = UnixControlIpcServer(
+                handler=self._handle_control_action,
+                runtime_base_dir=self._config.ipc_runtime_dir,
+            )
+            await control_ipc.start()
+            self._control_ipc = control_ipc
             self._started = True
 
             if self._config.open_browser:
@@ -697,6 +800,11 @@ class NovaDesktopRuntime:
         if self._reap_tasks:
             await asyncio.gather(*self._reap_tasks, return_exceptions=True)
         self._reap_tasks.clear()
+
+        if self._control_ipc is not None:
+            with contextlib.suppress(Exception):
+                await self._control_ipc.close()
+            self._control_ipc = None
 
         if self._ui_server is not None:
             with contextlib.suppress(Exception):
@@ -1167,7 +1275,9 @@ def config_from_namespace(
     ):
         ws_candidate = Path(persisted.general.last_active_workspace)
         if ws_candidate.is_dir():
-            initial_ws = str(ws_candidate)
+            resolved_candidate = ws_candidate.resolve()
+            if any(resolved_candidate.is_relative_to(Path(root).resolve()) for root in roots):
+                initial_ws = str(resolved_candidate)
 
     enable_voice = False if ns.no_voice else bool(persisted.voice.enable_voice)
 
