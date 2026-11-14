@@ -8,12 +8,14 @@ from typing import Protocol
 
 from nova.domain.events import CommandApprovalResolvedEvent
 from nova.domain.models import (
+    AudioDeviceCatalog,
     AudioFrame,
     CodingTaskRequest,
     CommandAuditInput,
     CommandAuditResult,
     CommandExecutionDecision,
     CommandInterceptRequest,
+    NovaPersistedSettings,
     ResolveWorkspaceRequest,
     RunnerProgressEvent,
     SynthesizedAudio,
@@ -172,4 +174,29 @@ class FolderPickerPort(Protocol):
 
     async def pick_directory(self, initial_dir: Path | None = None) -> Path | None:
         """Open a native folder picker; return selected directory Path, or None if cancelled."""
+        ...
+
+
+class ConfigStorePort(Protocol):
+    """Abstract port for atomic 0600 local configuration persistence (NOVA-008)."""
+
+    @property
+    def config_path(self) -> Path:
+        """Resolved path to config.toml."""
+        ...
+
+    def load(self) -> NovaPersistedSettings:
+        """Load persisted settings, returning defaults when config.toml does not exist."""
+        ...
+
+    def save(self, settings: NovaPersistedSettings) -> Path:
+        """Atomically persist validated settings with 0600 permissions."""
+        ...
+
+
+class AudioDeviceDiscoveryPort(Protocol):
+    """Abstract port for local PipeWire/PulseAudio device enumeration (NOVA-008 OP-3)."""
+
+    async def list_devices(self) -> AudioDeviceCatalog:
+        """Return enumerated audio inputs and outputs, degrading cleanly when unavailable."""
         ...

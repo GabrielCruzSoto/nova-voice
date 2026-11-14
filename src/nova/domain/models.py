@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from datetime import UTC, datetime
 from typing import Literal
 
@@ -247,3 +248,160 @@ class TranscriptionResult(BaseModel):
     confidence: float = Field(ge=0.0, le=1.0)
     backend_device: InferenceDevice
     duration_ms: float = Field(ge=0.0)
+
+
+SensitivityPreset = Literal["low", "normal", "high"]
+PttMode = Literal["single_turn", "toggle_call"]
+TtsEngineChoice = Literal["kokoro", "piper"]
+ControlAction = Literal["ptt-toggle", "toggle-panel", "barge-in", "ping"]
+
+SENSITIVITY_THRESHOLDS: dict[SensitivityPreset, tuple[float, float, float]] = {
+    "low": (0.75, 0.65, 0.75),
+    "normal": (0.60, 0.50, 0.60),
+    "high": (0.45, 0.35, 0.45),
+}
+
+_FORBIDDEN_SECRET_VALUE_RE = re.compile(
+    r"(?i)(?:^sk-[A-Za-z0-9_\-]{6,}|^nvapi-[A-Za-z0-9_\-]{6,}|^gh[po]-[A-Za-z0-9_\-]{6,}|"
+    r"^AIza[A-Za-z0-9_\-]{6,}|^Bearer\s+)"
+)
+
+
+def _validate_safe_setting_token(
+    value: str | None,
+    *,
+    allow_empty: bool = False,
+) -> str | None:
+    if value is None:
+        return None
+    cleaned = value.strip()
+    if not cleaned:
+        return "" if allow_empty else None
+    if cleaned.startswith("-") or any(ord(ch) < 32 or ord(ch) == 127 for ch in cleaned):
+        raise ValueError("Setting value must not start with '-' or contain control chars")
+    if _FORBIDDEN_SECRET_VALUE_RE.search(cleaned):
+        raise ValueError("Credentials, API keys, and tokens are forbidden in config.toml")
+    return cleaned
+
+
+class GeneralSettingsSection(BaseModel):
+    """Non-sensitive general desktop preferences persisted in config.toml."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    remember_workspace: bool = True
+    last_active_workspace: str | None = None
+
+    @field_validator("last_active_workspace")
+    @classmethod
+    def _validate_workspace(cls, value: str | None) -> str | None:
+        return _validate_safe_setting_token(value)
+
+
+class AudioSettingsSection(BaseModel):
+    """Non-sensitive PipeWire/PulseAudio device preferences persisted in config.toml."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    capture_target: str | None = None
+    playback_target: str | None = None
+
+    @field_validator("capture_target", "playback_target")
+    @classmethod
+    def _validate_targets(cls, value: str | None) -> str | None:
+        return _validate_safe_setting_token(value)
+
+
+class VoiceSettingsSection(BaseModel):
+    """Voice pipeline preferences persisted in config.toml."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    enable_voice: bool = True
+    whisper_language: str = Field(default="es", min_length=2, max_length=10)
+    whisper_model: str = Field(default="small", min_length=1, max_length=120)
+    whisper_device: InferenceDevice = "cuda"
+    tts_engine: TtsEngineChoice = "piper"
+    kokoro_voice: str = Field(default="ef_dora", min_length=1, max_length=64)
+    tts_speed: float = Field(default=1.0, ge=0.5, le=2.0)
+    sensitivity_preset: SensitivityPreset = "normal"
+    wakeword_threshold: float = Field(default=0.60, gt=0.0, le=1.0)
+    speech_threshold: float = Field(default=0.50, gt=0.0, le=1.0)
+    barge_in_threshold: float = Field(default=0.60, gt=0.0, le=1.0)
+
+    @field_validator("whisper_language", "whisper_model", "kokoro_voice")
+    @classmethod
+    def _validate_voice_tokens(cls, value: str) -> str:
+        checked = _validate_safe_setting_token(value)
+        if checked is None:
+            raise ValueError("Voice setting value cannot be empty")
+        return checked
+
+
+class ModelsSettingsSection(BaseModel):
+    """Tier 1 and Tier 2 model identifiers persisted in config.toml (no API keys)."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    pi_provider: str = Field(default="nvidia", min_length=1, max_length=64)
+    pi_model: str = Field(default="deepseek-ai/deepseek-v4.1-flash", min_length=1, max_length=160)
+    tier2_model: str = Field(default="claude-opus-5-5-high", min_length=1, max_length=160)
+
+    @field_validator("pi_provider", "pi_model", "tier2_model")
+    @classmethod
+    def _validate_model_tokens(cls, value: str) -> str:
+        checked = _validate_safe_setting_token(value)
+        if checked is None:
+            raise ValueError("Model setting value cannot be empty")
+        return checked
+
+
+class ShortcutsSettingsSection(BaseModel):
+    """Push-to-Talk and global shortcut preferences persisted in config.toml."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    ptt_mode: PttMode = "single_turn"
+    global_shortcut: str = Field(default="Super+Shift+Space", min_length=1, max_length=64)
+
+    @field_validator("global_shortcut")
+    @classmethod
+    def _validate_shortcut(cls, value: str) -> str:
+        checked = _validate_safe_setting_token(value)
+        if checked is None:
+            raise ValueError("global_shortcut cannot be empty")
+        return checked
+
+
+class NovaPersistedSettings(BaseModel):
+    """Validated non-sensitive configuration persisted in $XDG_CONFIG_HOME/nova/config.toml."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    schema_version: Literal["1.0"] = "1.0"
+    general: GeneralSettingsSection = Field(default_factory=GeneralSettingsSection)
+    audio: AudioSettingsSection = Field(default_factory=AudioSettingsSection)
+    voice: VoiceSettingsSection = Field(default_factory=VoiceSettingsSection)
+    models: ModelsSettingsSection = Field(default_factory=ModelsSettingsSection)
+    shortcuts: ShortcutsSettingsSection = Field(default_factory=ShortcutsSettingsSection)
+
+
+class AudioDeviceInfo(BaseModel):
+    """Local PipeWire/PulseAudio input or output device metadata (NOVA-008 OP-3)."""
+
+    model_config = ConfigDict(frozen=True, extra="ignore")
+
+    id: str = Field(min_length=1)
+    description: str = Field(min_length=1)
+    is_default: bool = False
+
+
+class AudioDeviceCatalog(BaseModel):
+    """Enumerated local input/output audio devices (NOVA-008 OP-3)."""
+
+    model_config = ConfigDict(frozen=True, extra="ignore")
+
+    available: bool = True
+    backend: Literal["pipewire", "pulseaudio", "none"] = "none"
+    inputs: tuple[AudioDeviceInfo, ...] = ()
+    outputs: tuple[AudioDeviceInfo, ...] = ()
