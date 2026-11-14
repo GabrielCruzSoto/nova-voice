@@ -1234,10 +1234,44 @@ async def run_desktop_daemon(config: NovaDesktopConfig) -> int:
                 loop.remove_signal_handler(sig)
 
 
+def _run_control_cli(args: Sequence[str]) -> int:
+    from nova.adapters.control_ipc import VALID_CONTROL_ACTIONS, send_control_command
+
+    if not args:
+        allowed = "|".join(sorted(VALID_CONTROL_ACTIONS))
+        sys.stderr.write(f"Usage: nova control <{allowed}>\n")
+        sys.stderr.flush()
+        return 2
+    action = args[0]
+    try:
+        resp = send_control_command(action)
+    except ValueError as exc:
+        sys.stderr.write(f"nova control error: {exc}\n")
+        sys.stderr.flush()
+        return 2
+    except (OSError, json.JSONDecodeError) as exc:
+        sys.stderr.write(f"nova control unavailable: {exc}\n")
+        sys.stderr.flush()
+        return 1
+
+    if not resp.get("ok"):
+        sys.stderr.write(f"nova control rejected: {resp.get('message', 'unknown error')}\n")
+        sys.stderr.flush()
+        return 1
+
+    sys.stdout.write(json.dumps(resp, ensure_ascii=False) + "\n")
+    sys.stdout.flush()
+    return 0
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     """CLI entry point for `nova-desktop` and `python -m nova`."""
+    raw_argv = list(argv) if argv is not None else sys.argv[1:]
+    if raw_argv and raw_argv[0] == "control":
+        return _run_control_cli(raw_argv[1:])
+
     parser = build_arg_parser()
-    ns = parser.parse_args(list(argv) if argv is not None else None)
+    ns = parser.parse_args(raw_argv)
     if ns.version:
         try:
             import importlib.metadata

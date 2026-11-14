@@ -30,6 +30,7 @@ from nova.domain.events import (
 from nova.domain.models import (
     CallSession,
     CallSessionState,
+    PttMode,
     TranscriptionResult,
     WorkspaceContext,
     WorkspaceQueryMode,
@@ -100,6 +101,7 @@ class VoiceCoordinatorSettings(BaseModel):
     max_tts_queue: int = Field(default=16, ge=1, le=64)
     call_idle_timeout_seconds: float = Field(default=180.0, gt=0.0, le=3600.0)
     allow_barge_in_during_tts: bool = True
+    ptt_mode: PttMode = "single_turn"
 
 
 class VoiceCallCoordinator:
@@ -143,6 +145,9 @@ class VoiceCallCoordinator:
         self._call_open = False
         self._call_epoch = 0
         self._capture_reset_epoch = 0
+        self._single_turn_active = False
+        self._ptt_hold_active = False
+        self._flush_ptt_hold = False
 
         self._tts_queue: deque[VoiceMilestoneEvent] = deque()
         self._tts_wakeup = asyncio.Event()
@@ -250,6 +255,9 @@ class VoiceCallCoordinator:
         self._call_open = False
         self._call_epoch += 1
         self._capture_reset_epoch += 1
+        self._single_turn_active = False
+        self._ptt_hold_active = False
+        self._flush_ptt_hold = False
         self._purge_segment_queue()
 
         stt_task = self._current_stt_task
@@ -274,12 +282,78 @@ class VoiceCallCoordinator:
             return
         await self._execute_barge_in()
 
+    async def trigger_ptt_toggle(self) -> CallSessionState:
+        """Handle global/UI Push-to-Talk toggle according to `settings.ptt_mode`."""
+        state = self._session.state
+        if state == "closed":
+            return state
+        if state == "speaking":
+            await self.barge_in()
+            return self._session.state
+        if state == "standby":
+            self._ptt_hold_active = False
+            self._flush_ptt_hold = False
+            self._single_turn_active = self._settings.ptt_mode == "single_turn"
+            reason = (
+                "ptt_single_turn_start"
+                if self._single_turn_active
+                else "ptt_toggle_start"
+            )
+            await self.start_call(reason=reason)
+            return self._session.state
+        await self.end_call(reason="ptt_toggle_stop")
+        return self._session.state
+
+    async def start_ptt_hold(self) -> CallSessionState:
+        """Begin Hold-to-Talk capture directly from panel button/key press."""
+        state = self._session.state
+        if state == "closed":
+            return state
+        if state == "speaking":
+            await self.barge_in()
+        self._ptt_hold_active = True
+        self._flush_ptt_hold = False
+        self._single_turn_active = True
+        if self._session.state == "standby":
+            await self.start_call(reason="ptt_hold_start")
+        return self._session.state
+
+    async def stop_ptt_hold(self) -> CallSessionState:
+        """Release Hold-to-Talk capture and flush buffered audio immediately."""
+        if self._session.state == "closed":
+            return self._session.state
+        if self._ptt_hold_active:
+            self._ptt_hold_active = False
+            self._flush_ptt_hold = True
+        return self._session.state
+
+    def update_settings(
+        self,
+        *,
+        ptt_mode: PttMode | None = None,
+        speech_threshold: float | None = None,
+        barge_in_threshold: float | None = None,
+    ) -> None:
+        """Update dynamic voice coordinator thresholds and PTT mode in RAM."""
+        updates: dict[str, object] = {}
+        if ptt_mode is not None:
+            updates["ptt_mode"] = ptt_mode
+        if speech_threshold is not None:
+            updates["speech_threshold"] = speech_threshold
+        if barge_in_threshold is not None:
+            updates["barge_in_threshold"] = barge_in_threshold
+        if updates:
+            self._settings = self._settings.model_copy(update=updates)
+
     async def shutdown(self) -> None:
         """Unsubscribe from bus, stop audio streams, cancel workers, and close CallSession."""
         self._event_bus.unsubscribe(self._on_event)
         self._call_open = False
         self._call_epoch += 1
         self._capture_reset_epoch += 1
+        self._single_turn_active = False
+        self._ptt_hold_active = False
+        self._flush_ptt_hold = False
         self._purge_segment_queue()
         self._tts_queue.clear()
         self._started = False
@@ -583,6 +657,18 @@ class VoiceCallCoordinator:
 
                 # State == "listening"
                 if not in_speech:
+                    if self._ptt_hold_active:
+                        in_speech = True
+                        speech_started_at = self._clock()
+                        speech_run = 0
+                        silence_run = 0
+                        seeded = b"".join(pre_roll)
+                        pre_roll.clear()
+                        utterance_buf = bytearray(seeded[: self._settings.max_utterance_bytes])
+                        remaining = self._settings.max_utterance_bytes - len(utterance_buf)
+                        if remaining > 0:
+                            utterance_buf.extend(frame.pcm_s16le[:remaining])
+                        continue
                     now = self._clock()
                     if (
                         not self._active_turn_tasks
@@ -627,9 +713,16 @@ class VoiceCallCoordinator:
                         silence_run += 1
 
                     if (
-                        silence_run >= self._settings.end_silence_frames
+                        (
+                            not self._ptt_hold_active
+                            and (
+                                self._flush_ptt_hold
+                                or silence_run >= self._settings.end_silence_frames
+                            )
+                        )
                         or len(utterance_buf) >= self._settings.max_utterance_bytes
                     ):
+                        self._flush_ptt_hold = False
                         segment = bytes(utterance_buf)
                         utterance_buf.clear()
                         in_speech = False
@@ -885,11 +978,18 @@ class VoiceCallCoordinator:
                 and not self._audio_output.is_playing
                 and not self._tts_queue
             ):
-                await self._transition_state(
-                    "listening",
-                    reason="turn_completed",
-                    correlation_id=corr_id,
-                )
+                if (
+                    self._single_turn_active
+                    and self._session.turn_count > 0
+                    and not self._has_active_pending_approval()
+                ):
+                    await self.end_call(reason="ptt_single_turn_completed")
+                else:
+                    await self._transition_state(
+                        "listening",
+                        reason="turn_completed",
+                        correlation_id=corr_id,
+                    )
 
     async def _synthesize_and_play_item(
         self,
@@ -960,18 +1060,33 @@ class VoiceCallCoordinator:
                 and self._call_open
             ):
                 if self._session.state == "speaking":
-                    target = self._post_speech_target_state()
-                    await self._transition_state(
-                        target,
-                        reason="tts_playback_completed",
-                        correlation_id=milestone.correlation_id,
-                    )
+                    if (
+                        self._single_turn_active
+                        and self._session.turn_count > 0
+                        and not self._active_turn_tasks
+                        and not self._has_active_pending_approval()
+                    ):
+                        await self.end_call(reason="ptt_single_turn_completed")
+                    else:
+                        target = self._post_speech_target_state()
+                        await self._transition_state(
+                            target,
+                            reason="tts_playback_completed",
+                            correlation_id=milestone.correlation_id,
+                        )
                 elif (
                     self._session.state in ("thinking", "executing")
                     and not self._active_turn_tasks
                 ):
-                    await self._transition_state(
-                        "listening",
-                        reason="turn_completed",
-                        correlation_id=milestone.correlation_id,
-                    )
+                    if (
+                        self._single_turn_active
+                        and self._session.turn_count > 0
+                        and not self._has_active_pending_approval()
+                    ):
+                        await self.end_call(reason="ptt_single_turn_completed")
+                    else:
+                        await self._transition_state(
+                            "listening",
+                            reason="turn_completed",
+                            correlation_id=milestone.correlation_id,
+                        )
