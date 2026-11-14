@@ -14,7 +14,7 @@ import time
 import uuid
 from collections import OrderedDict
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from http.cookies import SimpleCookie
 from pathlib import Path
 from typing import Any, Protocol
@@ -22,6 +22,7 @@ from urllib.parse import urlsplit
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from nova.application.settings_service import SettingsService
 from nova.application.ui_state_hub import UiStateHub
 from nova.domain.errors import (
     ApprovalNotFoundError,
@@ -155,6 +156,7 @@ class DesktopUiServer:
         event_bus: OrchestratorEventBus | None = None,
         voice_coordinator: VoiceControlUiPort | None = None,
         folder_picker: FolderPickerPort | None = None,
+        settings_service: SettingsService | None = None,
         static_dir: Path | None = None,
         settings: DesktopUiServerSettings | None = None,
         clock: Callable[[], float] = time.monotonic,
@@ -165,6 +167,7 @@ class DesktopUiServer:
         self._event_bus = event_bus
         self._voice_coordinator = voice_coordinator
         self._folder_picker = folder_picker
+        self._settings_service = settings_service
         self._static_dir = static_dir or _default_static_dir()
         self._settings = settings or DesktopUiServerSettings()
         self._clock = clock
@@ -535,6 +538,57 @@ class DesktopUiServer:
             await self._write_json(writer, 200, snap.model_dump(), corr_id)
             return
 
+        if method == "GET" and path == "/api/settings":
+            sess = self._validate_session_cookie(headers.get("cookie"))
+            if sess is None:
+                await self._write_error(
+                    writer,
+                    403,
+                    "UI_FORBIDDEN_ORIGIN_OR_CSRF",
+                    "Missing or invalid UI session cookie.",
+                    corr_id,
+                )
+                return
+            if self._settings_service is None:
+                await self._write_error(
+                    writer,
+                    503,
+                    "UI_SETTINGS_UNAVAILABLE",
+                    "Persistent settings service is not enabled in this session.",
+                    corr_id,
+                )
+                return
+            await self._write_json(
+                writer,
+                200,
+                self._settings_service.get_settings_payload(),
+                corr_id,
+            )
+            return
+
+        if method == "GET" and path == "/api/audio/devices":
+            sess = self._validate_session_cookie(headers.get("cookie"))
+            if sess is None:
+                await self._write_error(
+                    writer,
+                    403,
+                    "UI_FORBIDDEN_ORIGIN_OR_CSRF",
+                    "Missing or invalid UI session cookie.",
+                    corr_id,
+                )
+                return
+            if self._settings_service is None:
+                await self._write_json(
+                    writer,
+                    200,
+                    {"available": False, "backend": "none", "inputs": [], "outputs": []},
+                    corr_id,
+                )
+                return
+            catalog = await self._settings_service.list_audio_devices()
+            await self._write_json(writer, 200, catalog.model_dump(), corr_id)
+            return
+
         if method == "GET" and path == "/api/events":
             sess = self._validate_session_cookie(headers.get("cookie"))
             if sess is None:
@@ -549,7 +603,7 @@ class DesktopUiServer:
             await self._handle_sse_stream(reader, writer, sess, corr_id)
             return
 
-        if method == "POST" and path.startswith("/api/"):
+        if method in ("POST", "PUT") and path.startswith("/api/"):
             sess = self._validate_session_cookie(headers.get("cookie"))
             provided_csrf = headers.get(CSRF_HEADER_NAME, "")
             if (
@@ -565,7 +619,10 @@ class DesktopUiServer:
                     corr_id,
                 )
                 return
-            await self._dispatch_post_api(writer, path, body_bytes, corr_id)
+            if method == "PUT":
+                await self._dispatch_put_api(writer, path, body_bytes, corr_id)
+            else:
+                await self._dispatch_post_api(writer, path, body_bytes, corr_id)
             return
 
         await self._write_error(
@@ -735,6 +792,51 @@ class DesktopUiServer:
             )
         return parsed
 
+    async def _dispatch_put_api(
+        self,
+        writer: asyncio.StreamWriter,
+        path: str,
+        body_bytes: bytes,
+        corr_id: str,
+    ) -> None:
+        try:
+            payload = self._parse_json_object(body_bytes)
+        except DesktopUiError as exc:
+            await self._write_error(writer, 400, exc.code, exc.sanitized_message, corr_id)
+            return
+
+        if path == "/api/settings":
+            if self._settings_service is None:
+                await self._write_error(
+                    writer,
+                    503,
+                    "UI_SETTINGS_UNAVAILABLE",
+                    "Persistent settings service is not enabled in this session.",
+                    corr_id,
+                )
+                return
+            try:
+                result = await self._settings_service.update_settings(
+                    payload,
+                    correlation_id=corr_id,
+                )
+            except DesktopUiError as exc:
+                status_code = 503 if exc.code == "CONFIG_PERSIST_FAILED" else 422
+                await self._write_error(
+                    writer, status_code, exc.code, exc.sanitized_message, corr_id
+                )
+                return
+            await self._write_json(writer, 200, result, corr_id)
+            return
+
+        await self._write_error(
+            writer,
+            404,
+            "UI_ROUTE_NOT_FOUND",
+            f"Unknown PUT route: {path}",
+            corr_id,
+        )
+
     async def _dispatch_post_api(
         self,
         writer: asyncio.StreamWriter,
@@ -804,6 +906,83 @@ class DesktopUiServer:
                 {"ok": True, "call_state": self._voice_coordinator.session.state},
                 corr_id,
             )
+            return
+
+        if path == "/api/call/ptt":
+            raw_action = payload.get("action")
+            if raw_action not in ("start", "stop", "toggle"):
+                await self._write_error(
+                    writer,
+                    422,
+                    "INVALID_PTT_ACTION",
+                    "Field 'action' must be one of: start, stop, toggle.",
+                    corr_id,
+                )
+                return
+            if self._voice_coordinator is None:
+                await self._write_error(
+                    writer,
+                    503,
+                    "VOICE_UNAVAILABLE",
+                    "Local voice pipeline is not enabled in this session.",
+                    corr_id,
+                )
+                return
+            method_map = {
+                "start": "start_ptt_hold",
+                "stop": "stop_ptt_hold",
+                "toggle": "trigger_ptt_toggle",
+            }
+            handler = getattr(self._voice_coordinator, method_map[raw_action], None)
+            if handler is None:
+                await self._write_error(
+                    writer,
+                    503,
+                    "VOICE_UNAVAILABLE",
+                    "Push-to-Talk control is not supported by the active voice coordinator.",
+                    corr_id,
+                )
+                return
+            await handler()
+            await self._write_json(
+                writer,
+                200,
+                {
+                    "status": "accepted",
+                    "ok": True,
+                    "action": raw_action,
+                    "call_state": self._voice_coordinator.session.state,
+                },
+                corr_id,
+            )
+            return
+
+        if path == "/api/settings/shortcut":
+            if self._settings_service is None:
+                await self._write_error(
+                    writer,
+                    503,
+                    "UI_SETTINGS_UNAVAILABLE",
+                    "Persistent settings service is not enabled in this session.",
+                    corr_id,
+                )
+                return
+            raw_shortcut = payload.get("shortcut")
+            if not isinstance(raw_shortcut, str) or not raw_shortcut.strip():
+                await self._write_error(
+                    writer,
+                    400,
+                    "UI_INVALID_JSON_OR_PAYLOAD",
+                    "Field 'shortcut' must be a non-empty string.",
+                    corr_id,
+                )
+                return
+            try:
+                reg_result = self._settings_service.register_shortcut(raw_shortcut.strip())
+            except DesktopUiError as exc:
+                await self._write_error(writer, 422, exc.code, exc.sanitized_message, corr_id)
+                return
+            await self._write_json(writer, 200, asdict(reg_result), corr_id)
             return
 
         if path == "/api/workspace/select":
@@ -921,6 +1100,8 @@ class DesktopUiServer:
             )
             return
 
+        if self._settings_service is not None:
+            await self._settings_service.record_active_workspace(ctx.canonical_path)
         await self._write_json(
             writer,
             200,

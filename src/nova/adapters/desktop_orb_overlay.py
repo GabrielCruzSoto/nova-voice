@@ -210,6 +210,7 @@ class LoopbackOrbStateSubscriber(threading.Thread):
         base_url: str,
         stop_event: threading.Event,
         on_state_change: Callable[[str, bool], None],
+        on_panel_toggle_requested: Callable[[], None] | None = None,
         on_parent_lost: Callable[[], None] | None = None,
         ppid_provider: Callable[[], int] = os.getppid,
     ) -> None:
@@ -219,6 +220,7 @@ class LoopbackOrbStateSubscriber(threading.Thread):
         self._port = port
         self._stop_event = stop_event
         self._on_state_change = on_state_change
+        self._on_panel_toggle_requested = on_panel_toggle_requested
         self._on_parent_lost = on_parent_lost
         self._ppid_provider = ppid_provider
         self._initial_ppid = ppid_provider()
@@ -305,6 +307,12 @@ class LoopbackOrbStateSubscriber(threading.Thread):
                         if isinstance(payload, dict):
                             next_st = str(payload.get("state", "standby"))
                             self._on_state_change(next_st, self._voice_enabled)
+                    elif (
+                        ev_name == "nova_event"
+                        and data.get("event_type") == "panel_toggle_requested"
+                    ):
+                        if self._on_panel_toggle_requested is not None:
+                            self._on_panel_toggle_requested()
 
                 try:
                     chunk = sock.recv(4096)

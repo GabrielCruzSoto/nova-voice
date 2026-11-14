@@ -22,12 +22,16 @@ from typing import Literal, Protocol
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from nova.adapters.antigravity_adapter import AntigravityCLIAdapter, AntigravityRunnerConfig
+from nova.adapters.audio_device_discovery import PipeWireDeviceDiscoveryAdapter
 from nova.adapters.audio_pipewire import PipeWireAudioAdapter, PipeWireAudioSettings
+from nova.adapters.config_store import TomlConfigStore, resolve_config_file_path
+from nova.adapters.control_ipc import UnixControlIpcServer
 from nova.adapters.desktop_ui_server import DesktopUiServer, DesktopUiServerSettings
 from nova.adapters.folder_picker_gtk import GtkFolderPickerAdapter
 from nova.adapters.gatekeeper_ipc import GatekeeperIPCConfig, UnixSocketGatekeeperServer
 from nova.adapters.pi_auditor_adapter import PiAuditorAdapter, PiAuditorConfig
 from nova.adapters.pi_rpc_client import PiRpcClient, PiRpcConfig
+from nova.adapters.shortcut_registrar import LinuxShortcutRegistrar
 from nova.adapters.stt_faster_whisper import FasterWhisperSettings, FasterWhisperSttAdapter
 from nova.adapters.tts_local_onnx import LocalOnnxTtsAdapter, LocalOnnxTtsSettings
 from nova.adapters.vad_silero import SileroVadAdapter, SileroVadSettings
@@ -35,19 +39,24 @@ from nova.adapters.wakeword_openwakeword import OpenWakeWordAdapter, OpenWakeWor
 from nova.adapters.workspace_resolver import LocalWorkspaceResolver
 from nova.application.orchestrator import NovaOrchestrator, OrchestratorSettings
 from nova.application.security_gatekeeper import SecurityGatekeeper
+from nova.application.settings_service import SettingsService
 from nova.application.ui_state_hub import UiStateHub
-from nova.application.voice_coordinator import VoiceCallCoordinator
+from nova.application.voice_coordinator import VoiceCallCoordinator, VoiceCoordinatorSettings
 from nova.domain.errors import (
     DesktopUiError,
     NovaDomainError,
     VoicePipelineError,
     redact_sensitive_text,
 )
-from nova.domain.events import OrchestratorEventBus
+from nova.domain.events import OrchestratorEventBus, UiPanelToggleRequestedEvent
 from nova.domain.models import (
     CallSession,
     InferenceDevice,
+    NovaPersistedSettings,
+    PttMode,
     ResolveWorkspaceRequest,
+    SensitivityPreset,
+    TtsEngineChoice,
     WorkspaceContext,
 )
 from nova.domain.ports import FolderPickerPort
@@ -55,7 +64,6 @@ from nova.domain.ports import FolderPickerPort
 logger = logging.getLogger("nova.desktop_launcher")
 
 BrowserPreference = Literal["auto", "xdg-open", "firefox", "webview", "window"]
-TtsEngineChoice = Literal["kokoro", "piper"]
 
 _LOOPBACK_BROWSER_URL_RE = re.compile(r"^http://127\.0\.0\.1:[1-9][0-9]{0,4}/?$")
 
@@ -195,12 +203,25 @@ class NovaDesktopConfig(BaseModel):
     wakeword_models: tuple[str, ...] = ()
     silero_vad_model_path: str | None = None
     whisper_model: str = Field(default="small", min_length=1)
+    whisper_language: str | None = Field(default="es", min_length=2, max_length=10)
     whisper_device: InferenceDevice = "cuda"
     tts_engine: TtsEngineChoice = "kokoro"
     kokoro_model_path: str | None = None
     kokoro_voices_path: str | None = None
+    kokoro_voice: str = Field(default="ef_dora", min_length=1)
+    tts_speed: float = Field(default=1.0, ge=0.5, le=2.0)
     piper_binary: str = Field(default="piper", min_length=1)
     piper_model_path: str | None = None
+    capture_target: str | None = None
+    playback_target: str | None = None
+    sensitivity_preset: SensitivityPreset = "normal"
+    wakeword_threshold: float = Field(default=0.60, gt=0.0, le=1.0)
+    speech_threshold: float = Field(default=0.50, gt=0.0, le=1.0)
+    barge_in_threshold: float = Field(default=0.60, gt=0.0, le=1.0)
+    ptt_mode: PttMode = "single_turn"
+    global_shortcut: str = Field(default="Super+Shift+Space", min_length=1)
+    remember_workspace: bool = True
+    config_path: str | None = None
 
     @field_validator(
         "initial_workspace",
@@ -212,10 +233,16 @@ class NovaDesktopConfig(BaseModel):
         "tier2_model",
         "silero_vad_model_path",
         "whisper_model",
+        "whisper_language",
         "kokoro_model_path",
         "kokoro_voices_path",
+        "kokoro_voice",
         "piper_binary",
         "piper_model_path",
+        "capture_target",
+        "playback_target",
+        "global_shortcut",
+        "config_path",
     )
     @classmethod
     def _check_tokens(cls, value: str | None) -> str | None:
@@ -296,9 +323,17 @@ def build_default_voice_coordinator(
 ) -> VoiceCallCoordinator:
     """Instantiate the local GPU/CPU voice stack after verifying prerequisites."""
     _probe_voice_prerequisites(config)
-    audio = PipeWireAudioAdapter(PipeWireAudioSettings())
+    audio = PipeWireAudioAdapter(
+        PipeWireAudioSettings(
+            capture_target=config.capture_target,
+            playback_target=config.playback_target,
+        )
+    )
     wake_word = OpenWakeWordAdapter(
-        OpenWakeWordSettings(model_paths=config.wakeword_models),
+        OpenWakeWordSettings(
+            model_paths=config.wakeword_models,
+            threshold=config.wakeword_threshold,
+        ),
     )
     vad = SileroVadAdapter(
         SileroVadSettings(model_path=config.silero_vad_model_path),
@@ -306,6 +341,7 @@ def build_default_voice_coordinator(
     stt = FasterWhisperSttAdapter(
         FasterWhisperSettings(
             model_size_or_path=config.whisper_model,
+            language=config.whisper_language,
             preferred_device=config.whisper_device,
             local_files_only=True,
         ),
@@ -315,6 +351,8 @@ def build_default_voice_coordinator(
             engine=config.tts_engine,
             kokoro_model_path=config.kokoro_model_path,
             kokoro_voices_path=config.kokoro_voices_path,
+            kokoro_voice=config.kokoro_voice,
+            speed=config.tts_speed,
             piper_binary=config.piper_binary,
             piper_model_path=config.piper_model_path,
         ),
@@ -330,6 +368,11 @@ def build_default_voice_coordinator(
         event_bus=event_bus,
         security_gatekeeper=security_gatekeeper,
         extra_secrets_provider=extra_secrets_provider,
+        settings=VoiceCoordinatorSettings(
+            speech_threshold=config.speech_threshold,
+            barge_in_threshold=config.barge_in_threshold,
+            ptt_mode=config.ptt_mode,
+        ),
     )
 
 
@@ -433,9 +476,18 @@ class NovaDesktopRuntime:
         self._native_shell_available = native_shell_available
 
         self._event_bus = OrchestratorEventBus()
+        cfg_path = (
+            Path(self._config.config_path)
+            if self._config.config_path
+            else resolve_config_file_path()
+        )
+        self._config_store = TomlConfigStore(config_path=cfg_path)
         self._ipc_server: UnixSocketGatekeeperServer | None = None
+        self._control_ipc: UnixControlIpcServer | None = None
         self._pi_client: PiRpcClient | None = None
+        self._orchestrator: NovaOrchestrator | None = None
         self._voice_coordinator: VoiceRuntimePort | None = None
+        self._settings_service: SettingsService | None = None
         self._state_hub: UiStateHub | None = None
         self._ui_server: DesktopUiServer | None = None
         self._gatekeeper: SecurityGatekeeper | None = None
@@ -482,6 +534,80 @@ class NovaDesktopRuntime:
                 value, str
             ) else value
         logger.info(json.dumps(safe, ensure_ascii=False, sort_keys=True))
+
+    def _apply_hot_settings(self, updated: NovaPersistedSettings) -> None:
+        """Apply hot-reloadable configuration changes to live runtime components."""
+        if self._pi_client is not None:
+            self._pi_client.update_model(
+                provider=updated.models.pi_provider,
+                model=updated.models.pi_model,
+            )
+        if self._orchestrator is not None:
+            self._orchestrator.update_models(tier2_model=updated.models.tier2_model)
+
+        voice_coord = self._voice_coordinator
+        if voice_coord is None:
+            return
+        update_coord = getattr(voice_coord, "update_settings", None)
+        if callable(update_coord):
+            update_coord(
+                ptt_mode=updated.shortcuts.ptt_mode,
+                speech_threshold=updated.voice.speech_threshold,
+                barge_in_threshold=updated.voice.barge_in_threshold,
+            )
+        audio_in = getattr(voice_coord, "_audio_input", None)
+        if audio_in is not None and callable(getattr(audio_in, "update_settings", None)):
+            audio_in.update_settings(
+                capture_target=updated.audio.capture_target,
+                playback_target=updated.audio.playback_target,
+            )
+        audio_out = getattr(voice_coord, "_audio_output", None)
+        if (
+            audio_out is not None
+            and audio_out is not audio_in
+            and callable(getattr(audio_out, "update_settings", None))
+        ):
+            audio_out.update_settings(
+                capture_target=updated.audio.capture_target,
+                playback_target=updated.audio.playback_target,
+            )
+        wake_word = getattr(voice_coord, "_wake_word", None)
+        if wake_word is not None and callable(getattr(wake_word, "update_settings", None)):
+            wake_word.update_settings(threshold=updated.voice.wakeword_threshold)
+        stt = getattr(voice_coord, "_stt", None)
+        if stt is not None and callable(getattr(stt, "update_settings", None)):
+            stt.update_settings(language=updated.voice.whisper_language)
+        tts = getattr(voice_coord, "_tts", None)
+        if tts is not None and callable(getattr(tts, "update_settings", None)):
+            tts.update_settings(
+                engine=updated.voice.tts_engine,
+                speed=updated.voice.tts_speed,
+                kokoro_voice=updated.voice.kokoro_voice,
+            )
+
+    async def _handle_control_action(self, action: str) -> dict[str, object]:
+        """Handle local `nova control <action>` commands received via UnixControlIpcServer."""
+        if action == "ptt-toggle":
+            if self._voice_coordinator is None:
+                return {"ok": True, "action": action, "voice_enabled": False}
+            trigger = getattr(self._voice_coordinator, "trigger_ptt_toggle", None)
+            if callable(trigger):
+                await trigger()
+            else:
+                await self._voice_coordinator.start_call(reason="global_ptt_toggle")
+            return {"ok": True, "action": action}
+        if action == "toggle-panel":
+            await self._event_bus.publish(
+                UiPanelToggleRequestedEvent(correlation_id="corr-ipc-panel")
+            )
+            return {"ok": True, "action": action}
+        if action == "barge-in":
+            if self._voice_coordinator is not None:
+                await self._voice_coordinator.barge_in()
+            elif self._orchestrator is not None:
+                await self._orchestrator.barge_in()
+            return {"ok": True, "action": action}
+        return {"ok": False, "action": action}
 
     async def __aenter__(self) -> NovaDesktopRuntime:
         await self.start()
@@ -567,6 +693,7 @@ class NovaDesktopRuntime:
                 settings=OrchestratorSettings(default_tier2_model=self._config.tier2_model),
                 security_gatekeeper=gatekeeper,
             )
+            self._orchestrator = orchestrator
 
             voice_coord: VoiceRuntimePort | None = None
             if self._config.enable_voice:
@@ -612,16 +739,35 @@ class NovaDesktopRuntime:
             )
             self._state_hub = state_hub
 
+            initial_persisted = await asyncio.to_thread(self._config_store.load)
+            settings_service = SettingsService(
+                config_store=self._config_store,
+                initial_settings=initial_persisted,
+                audio_discovery=PipeWireDeviceDiscoveryAdapter(),
+                shortcut_registrar=LinuxShortcutRegistrar(),
+                event_bus=self._event_bus,
+                on_hot_apply=self._apply_hot_settings,
+            )
+            self._settings_service = settings_service
+
             ui_server = DesktopUiServer(
                 orchestrator=orchestrator,
                 state_hub=state_hub,
                 event_bus=self._event_bus,
                 voice_coordinator=voice_coord,
                 folder_picker=self._folder_picker,
+                settings_service=settings_service,
                 settings=DesktopUiServerSettings(host="127.0.0.1", port=self._config.port),
             )
             await ui_server.start()
             self._ui_server = ui_server
+
+            control_ipc = UnixControlIpcServer(
+                handler=self._handle_control_action,
+                runtime_base_dir=self._config.ipc_runtime_dir,
+            )
+            await control_ipc.start()
+            self._control_ipc = control_ipc
             self._started = True
 
             if self._config.open_browser:
@@ -660,6 +806,11 @@ class NovaDesktopRuntime:
             await asyncio.gather(*self._reap_tasks, return_exceptions=True)
         self._reap_tasks.clear()
 
+        if self._control_ipc is not None:
+            with contextlib.suppress(Exception):
+                await self._control_ipc.close()
+            self._control_ipc = None
+
         if self._ui_server is not None:
             with contextlib.suppress(Exception):
                 await self._ui_server.close()
@@ -686,6 +837,56 @@ class NovaDesktopRuntime:
             self._ipc_server = None
 
         self._started = False
+
+
+class _TrackStoreAction(argparse.Action):
+    """Store CLI argument value and record `dest` as explicitly supplied on CLI."""
+
+    def __call__(
+        self,
+        parser: argparse.ArgumentParser,
+        namespace: argparse.Namespace,
+        values: object,
+        option_string: str | None = None,
+    ) -> None:
+        del parser, option_string
+        setattr(namespace, self.dest, values)
+        explicit: set[str] = getattr(namespace, "_explicit_cli_fields", set())
+        explicit.add(self.dest)
+        namespace._explicit_cli_fields = explicit
+
+
+class _TrackStoreFalseAction(argparse.Action):
+    """Store False when flag is passed and record `dest` as explicitly supplied on CLI."""
+
+    def __init__(
+        self,
+        option_strings: Sequence[str],
+        dest: str,
+        default: bool = True,
+        help: str | None = None,
+    ) -> None:
+        super().__init__(
+            option_strings=option_strings,
+            dest=dest,
+            nargs=0,
+            const=False,
+            default=default,
+            help=help,
+        )
+
+    def __call__(
+        self,
+        parser: argparse.ArgumentParser,
+        namespace: argparse.Namespace,
+        values: object,
+        option_string: str | None = None,
+    ) -> None:
+        del parser, values, option_string
+        setattr(namespace, self.dest, False)
+        explicit: set[str] = getattr(namespace, "_explicit_cli_fields", set())
+        explicit.add(self.dest)
+        namespace._explicit_cli_fields = explicit
 
 
 def build_arg_parser() -> argparse.ArgumentParser:
@@ -716,6 +917,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--workspace",
         default=None,
+        action=_TrackStoreAction,
         help="Optional initial project directory inside allowed roots.",
     )
     parser.add_argument(
@@ -735,6 +937,13 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Disable the local voice pipeline and start in text/UI mode only.",
     )
     parser.add_argument(
+        "--config",
+        dest="config_path",
+        default=None,
+        action=_TrackStoreAction,
+        help="Optional path to config.toml (defaults to $XDG_CONFIG_HOME/nova/config.toml).",
+    )
+    parser.add_argument(
         "--ipc-runtime-dir",
         default=None,
         help="Custom 0700 directory for the Gatekeeper AF_UNIX socket.",
@@ -742,26 +951,31 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--pi-executable",
         default="pi",
+        action=_TrackStoreAction,
         help="Executable name or path for Tier 1 Pi CLI.",
     )
     parser.add_argument(
         "--pi-provider",
         default="nvidia",
+        action=_TrackStoreAction,
         help="Provider passed to Tier 1 Pi CLI.",
     )
     parser.add_argument(
         "--pi-model",
         default="deepseek-ai/deepseek-v4.1-flash",
+        action=_TrackStoreAction,
         help="Model identifier passed to Tier 1 Pi CLI.",
     )
     parser.add_argument(
         "--agy-executable",
         default="agy",
+        action=_TrackStoreAction,
         help="Executable name or path for Tier 2 Antigravity CLI.",
     )
     parser.add_argument(
         "--tier2-model",
         default="claude-opus-5-5-high",
+        action=_TrackStoreAction,
         help="Default model identifier passed to Tier 2 runner.",
     )
     parser.add_argument(
@@ -779,18 +993,21 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--whisper-model",
         default=os.environ.get("NOVA_WHISPER_MODEL", "small"),
+        action=_TrackStoreAction,
         help="Local faster-whisper model size or local directory path.",
     )
     parser.add_argument(
         "--whisper-device",
         choices=("cuda", "cpu"),
         default="cuda",
+        action=_TrackStoreAction,
         help="Preferred faster-whisper device (falls back to CPU automatically).",
     )
     parser.add_argument(
         "--tts-engine",
         choices=("kokoro", "piper"),
         default="kokoro",
+        action=_TrackStoreAction,
         help="Local Spanish ONNX TTS engine.",
     )
     parser.add_argument(
@@ -912,8 +1129,49 @@ def resolve_model_path(
     return None
 
 
-def config_from_namespace(ns: argparse.Namespace) -> NovaDesktopConfig:
-    """Convert parsed CLI namespace into a validated `NovaDesktopConfig`."""
+def _pick_setting_str(
+    *,
+    field_name: str,
+    explicit_fields: set[str],
+    cli_value: str | None,
+    env_var: str | None,
+    toml_value: str | None,
+    default_value: str,
+    env: Mapping[str, str],
+) -> str:
+    if field_name in explicit_fields and cli_value is not None:
+        return cli_value
+    if env_var is not None:
+        env_val = env.get(env_var, "").strip()
+        if env_val:
+            return env_val
+    if toml_value is not None:
+        return toml_value
+    return default_value
+
+
+def config_from_namespace(
+    ns: argparse.Namespace,
+    *,
+    persisted_settings: NovaPersistedSettings | None = None,
+    env: Mapping[str, str] | None = None,
+) -> NovaDesktopConfig:
+    """Build `NovaDesktopConfig` applying precedence CLI > ENV > config.toml > defaults."""
+    effective_env = env if env is not None else os.environ
+    explicit_fields: set[str] = set(getattr(ns, "_explicit_cli_fields", set()))
+
+    raw_cfg_path = getattr(ns, "config_path", None)
+    resolved_cfg_path = (
+        Path(raw_cfg_path).expanduser()
+        if isinstance(raw_cfg_path, str) and raw_cfg_path.strip()
+        else resolve_config_file_path(effective_env)
+    )
+    persisted = (
+        persisted_settings
+        if persisted_settings is not None
+        else TomlConfigStore(resolved_cfg_path).load()
+    )
+
     roots = tuple(ns.allowed_roots) if ns.allowed_roots else _default_allowed_roots()
     models_dir = getattr(ns, "models_dir", None)
 
@@ -921,7 +1179,7 @@ def config_from_namespace(ns: argparse.Namespace) -> NovaDesktopConfig:
     if not wake_models:
         resolved_ww = resolve_model_path(
             "oye_nova.onnx",
-            explicit_param=os.environ.get("NOVA_WAKEWORD_MODEL"),
+            explicit_param=effective_env.get("NOVA_WAKEWORD_MODEL"),
             models_dir=models_dir,
         )
         if resolved_ww is not None:
@@ -936,7 +1194,17 @@ def config_from_namespace(ns: argparse.Namespace) -> NovaDesktopConfig:
     if resolved_vad is not None:
         vad_model = str(resolved_vad)
 
-    tts_engine = ns.tts_engine
+    tts_engine_raw = _pick_setting_str(
+        field_name="tts_engine",
+        explicit_fields=explicit_fields,
+        cli_value=ns.tts_engine,
+        env_var="NOVA_TTS_ENGINE",
+        toml_value=persisted.voice.tts_engine,
+        default_value="kokoro",
+        env=effective_env,
+    )
+    tts_engine: TtsEngineChoice = "piper" if tts_engine_raw == "piper" else "kokoro"
+
     piper_model = ns.piper_model
     resolved_piper = resolve_model_path(
         "es_ES-davefx-medium.onnx",
@@ -954,33 +1222,105 @@ def config_from_namespace(ns: argparse.Namespace) -> NovaDesktopConfig:
         if venv_piper.is_file() and os.access(venv_piper, os.X_OK):
             piper_bin = str(venv_piper)
 
-    whisper_model = ns.whisper_model
-    whisper_dev = ns.whisper_device
+    whisper_model = _pick_setting_str(
+        field_name="whisper_model",
+        explicit_fields=explicit_fields,
+        cli_value=ns.whisper_model,
+        env_var="NOVA_WHISPER_MODEL",
+        toml_value=persisted.voice.whisper_model,
+        default_value="small",
+        env=effective_env,
+    )
+    whisper_dev_raw = _pick_setting_str(
+        field_name="whisper_device",
+        explicit_fields=explicit_fields,
+        cli_value=ns.whisper_device,
+        env_var="NOVA_WHISPER_DEVICE",
+        toml_value=persisted.voice.whisper_device,
+        default_value="cuda",
+        env=effective_env,
+    )
+    whisper_dev: InferenceDevice = "cpu" if whisper_dev_raw == "cpu" else "cuda"
     if whisper_dev == "cuda" and not shutil.which("nvidia-smi"):
         whisper_dev = "cpu"
+
+    pi_provider = _pick_setting_str(
+        field_name="pi_provider",
+        explicit_fields=explicit_fields,
+        cli_value=ns.pi_provider,
+        env_var="NOVA_PI_PROVIDER",
+        toml_value=persisted.models.pi_provider,
+        default_value="nvidia",
+        env=effective_env,
+    )
+    pi_model = _pick_setting_str(
+        field_name="pi_model",
+        explicit_fields=explicit_fields,
+        cli_value=ns.pi_model,
+        env_var="NOVA_PI_MODEL",
+        toml_value=persisted.models.pi_model,
+        default_value="deepseek-ai/deepseek-v4.1-flash",
+        env=effective_env,
+    )
+    tier2_model = _pick_setting_str(
+        field_name="tier2_model",
+        explicit_fields=explicit_fields,
+        cli_value=ns.tier2_model,
+        env_var="NOVA_TIER2_MODEL",
+        toml_value=persisted.models.tier2_model,
+        default_value="claude-opus-5-5-high",
+        env=effective_env,
+    )
+
+    initial_ws = ns.workspace
+    if (
+        initial_ws is None
+        and persisted.general.remember_workspace
+        and persisted.general.last_active_workspace
+    ):
+        ws_candidate = Path(persisted.general.last_active_workspace)
+        if ws_candidate.is_dir():
+            resolved_candidate = ws_candidate.resolve()
+            if any(resolved_candidate.is_relative_to(Path(root).resolve()) for root in roots):
+                initial_ws = str(resolved_candidate)
+
+    enable_voice = False if ns.no_voice else bool(persisted.voice.enable_voice)
 
     return NovaDesktopConfig(
         port=int(ns.port),
         allowed_roots=roots,
-        initial_workspace=ns.workspace,
+        initial_workspace=initial_ws,
         open_browser=not bool(ns.no_browser),
         browser_preference=ns.browser,
-        enable_voice=not bool(ns.no_voice),
+        enable_voice=enable_voice,
         ipc_runtime_dir=ns.ipc_runtime_dir,
         pi_executable=ns.pi_executable,
-        pi_provider=ns.pi_provider,
-        pi_model=ns.pi_model,
+        pi_provider=pi_provider,
+        pi_model=pi_model,
         agy_executable=ns.agy_executable,
-        tier2_model=ns.tier2_model,
+        tier2_model=tier2_model,
         wakeword_models=wake_models,
         silero_vad_model_path=vad_model,
         whisper_model=whisper_model,
+        whisper_language=persisted.voice.whisper_language,
         whisper_device=whisper_dev,
         tts_engine=tts_engine,
         kokoro_model_path=ns.kokoro_model,
         kokoro_voices_path=ns.kokoro_voices,
+        kokoro_voice=persisted.voice.kokoro_voice,
+        tts_speed=persisted.voice.tts_speed,
         piper_binary=piper_bin,
         piper_model_path=piper_model,
+        capture_target=persisted.audio.capture_target,
+        playback_target=persisted.audio.playback_target,
+        sensitivity_preset=persisted.voice.sensitivity_preset,
+        wakeword_threshold=persisted.voice.wakeword_threshold,
+        speech_threshold=persisted.voice.speech_threshold,
+        barge_in_threshold=persisted.voice.barge_in_threshold,
+        ptt_mode=persisted.shortcuts.ptt_mode,
+        global_shortcut=persisted.shortcuts.global_shortcut,
+        remember_workspace=persisted.general.remember_workspace,
+        config_path=str(resolved_cfg_path),
     )
 
 
@@ -1009,10 +1349,44 @@ async def run_desktop_daemon(config: NovaDesktopConfig) -> int:
                 loop.remove_signal_handler(sig)
 
 
+def _run_control_cli(args: Sequence[str]) -> int:
+    from nova.adapters.control_ipc import VALID_CONTROL_ACTIONS, send_control_command
+
+    if not args:
+        allowed = "|".join(sorted(VALID_CONTROL_ACTIONS))
+        sys.stderr.write(f"Usage: nova control <{allowed}>\n")
+        sys.stderr.flush()
+        return 2
+    action = args[0]
+    try:
+        resp = send_control_command(action)
+    except ValueError as exc:
+        sys.stderr.write(f"nova control error: {exc}\n")
+        sys.stderr.flush()
+        return 2
+    except (OSError, json.JSONDecodeError) as exc:
+        sys.stderr.write(f"nova control unavailable: {exc}\n")
+        sys.stderr.flush()
+        return 1
+
+    if not resp.get("ok"):
+        sys.stderr.write(f"nova control rejected: {resp.get('message', 'unknown error')}\n")
+        sys.stderr.flush()
+        return 1
+
+    sys.stdout.write(json.dumps(resp, ensure_ascii=False) + "\n")
+    sys.stdout.flush()
+    return 0
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     """CLI entry point for `nova-desktop` and `python -m nova`."""
+    raw_argv = list(argv) if argv is not None else sys.argv[1:]
+    if raw_argv and raw_argv[0] == "control":
+        return _run_control_cli(raw_argv[1:])
+
     parser = build_arg_parser()
-    ns = parser.parse_args(list(argv) if argv is not None else None)
+    ns = parser.parse_args(raw_argv)
     if ns.version:
         try:
             import importlib.metadata

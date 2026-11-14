@@ -5,6 +5,7 @@
  */
 
 import type {
+  AudioDeviceInfo,
   CallSessionState,
   PresentationalAppModel,
   UiApprovalItem,
@@ -322,6 +323,15 @@ export function renderWorkspaceBar(
         </div>
       </div>
       <div class="workspace-view-actions">
+        <button
+          type="button"
+          class="btn-toggle-view btn-settings"
+          data-action="open-settings"
+          title="Ajustes"
+          aria-label="Ajustes"
+        >
+          ⚙ Ajustes
+        </button>
         <button
           type="button"
           class="btn-toggle-view"
@@ -694,6 +704,20 @@ export function renderDock(model: PresentationalAppModel): string {
             ></textarea>
             ${!hasWorkspace ? `<span id="composer-no-workspace-hint" class="sr-only">Selecciona un proyecto para chatear</span>` : ""}
             <div class="composer-actions">
+              <button
+                type="button"
+                class="btn-icon nova-ptt-hold-btn"
+                data-action="ptt-hold"
+                title="Mantener para hablar"
+                aria-label="Mantener para hablar"${!model.voiceEnabled ? ' disabled aria-disabled="true"' : ""}
+              >
+                <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
+                  <path d="M12 1a3 3 0 0 0-3 3v8a3 3 0 0 0 6 0V4a3 3 0 0 0-3-3z" />
+                  <path d="M19 10v2a7 7 0 0 1-14 0v-2" />
+                  <line x1="12" y1="19" x2="12" y2="23" />
+                  <line x1="8" y1="23" x2="16" y2="23" />
+                </svg>
+              </button>
               <button type="submit" class="btn-icon btn-send" title="Enviar mensaje" aria-label="Enviar"${submitDisabledAttr}>
                 <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
                   <line x1="22" y1="2" x2="11" y2="13" />
@@ -734,6 +758,167 @@ export function renderDock(model: PresentationalAppModel): string {
           Colgar
         </button>
       </div>
+    </div>
+  `.trim();
+}
+
+function renderAudioDeviceOptions(
+  devices: readonly AudioDeviceInfo[],
+  selectedId: string | null,
+): string {
+  const defaultSelected = selectedId === null || selectedId === "" ? " selected" : "";
+  const items = devices
+    .map((dev) => {
+      const sel = selectedId === dev.id ? " selected" : "";
+      const label = dev.is_default ? `${dev.description} (Predeterminado)` : dev.description;
+      return `<option value="${escapeHtml(dev.id)}"${sel}>${escapeHtml(label)}</option>`;
+    })
+    .join("");
+  return `<option value=""${defaultSelected}>Predeterminado del sistema</option>${items}`;
+}
+
+export function renderSettingsDrawer(model: PresentationalAppModel): string {
+  if (!model.settingsDrawerOpen) {
+    return "";
+  }
+  const s = model.settingsData;
+  if (model.settingsLoading && !s) {
+    return `
+      <div class="nova-settings-backdrop" data-action="close-settings">
+        <aside class="nova-settings-drawer" role="dialog" aria-modal="true" aria-label="Ajustes de Nova">
+          <div class="nova-settings-header">
+            <h2 class="nova-settings-title">Ajustes</h2>
+            <button type="button" class="btn-icon" data-action="close-settings" aria-label="Cerrar ajustes">✕</button>
+          </div>
+          <p class="nova-settings-loading">Cargando configuración…</p>
+        </aside>
+      </div>
+    `.trim();
+  }
+
+  const inputs = model.audioDevices?.inputs ?? [];
+  const outputs = model.audioDevices?.outputs ?? [];
+  const capTarget = s?.audio.capture_target ?? null;
+  const playTarget = s?.audio.playback_target ?? null;
+  const sensitivity = s?.voice.sensitivity_preset ?? "normal";
+  const ttsSpeed = s?.voice.tts_speed ?? 1.1;
+  const ttsEngine = s?.voice.tts_engine ?? "kokoro";
+  const whisperLang = s?.voice.whisper_language ?? "";
+  const pttMode = s?.shortcuts.ptt_mode ?? "single_turn";
+  const pttShortcut = s?.shortcuts.global_shortcut ?? "Super+Shift+Space";
+  const piProvider = s?.models.pi_provider ?? "github-copilot";
+  const piModel = s?.models.pi_model ?? "gpt-4.1";
+  const tier2Model = s?.models.tier2_model ?? "claude-opus-5-5-high";
+  const rememberWs = s?.general.remember_workspace ?? true;
+  const savingAttr = model.settingsSaving ? " disabled" : "";
+
+  const errorBanner = model.settingsError
+    ? `<div class="nova-settings-alert nova-settings-alert--error" role="alert">${escapeHtml(model.settingsError)}</div>`
+    : "";
+  const noticeBanner = model.settingsNotice
+    ? `<div class="nova-settings-alert nova-settings-alert--notice" role="status">${escapeHtml(model.settingsNotice)}</div>`
+    : "";
+  const sc = model.shortcutStatus;
+  const shortcutHint = sc
+    ? sc.status === "registered"
+      ? `<p class="nova-settings-hint nova-settings-hint--ok">Atajo registrado: <code>${escapeHtml(sc.shortcut)}</code> → <code>${escapeHtml(sc.command)}</code></p>`
+      : `<p class="nova-settings-hint">Configura manualmente en tu escritorio: <code>${escapeHtml(sc.manual_command ?? sc.command)}</code></p>`
+    : "";
+
+  return `
+    <div class="nova-settings-backdrop">
+      <aside class="nova-settings-drawer" role="dialog" aria-modal="true" aria-label="Ajustes de Nova">
+        <div class="nova-settings-header">
+          <h2 class="nova-settings-title">Ajustes</h2>
+          <button type="button" class="btn-icon" data-action="close-settings" aria-label="Cerrar ajustes">✕</button>
+        </div>
+        ${errorBanner}
+        ${noticeBanner}
+        <form class="nova-settings-form" data-action="settings-form">
+          <section class="nova-settings-section">
+            <h3 class="nova-settings-section-title">Audio</h3>
+            <label class="nova-settings-field">
+              <span>Micrófono</span>
+              <select name="audio.capture_target">${renderAudioDeviceOptions(inputs, capTarget)}</select>
+            </label>
+            <label class="nova-settings-field">
+              <span>Salida de audio</span>
+              <select name="audio.playback_target">${renderAudioDeviceOptions(outputs, playTarget)}</select>
+            </label>
+          </section>
+
+          <section class="nova-settings-section">
+            <h3 class="nova-settings-section-title">Voz y sensibilidad</h3>
+            <label class="nova-settings-field">
+              <span>Sensibilidad de activación</span>
+              <select name="voice.sensitivity_preset">
+                <option value="low"${sensitivity === "low" ? " selected" : ""}>Baja (menos falsos positivos)</option>
+                <option value="normal"${sensitivity === "normal" ? " selected" : ""}>Normal</option>
+                <option value="high"${sensitivity === "high" ? " selected" : ""}>Alta (más sensible)</option>
+              </select>
+            </label>
+            <label class="nova-settings-field">
+              <span>Velocidad de voz (${ttsSpeed.toFixed(2)}×)</span>
+              <input type="range" name="voice.tts_speed" min="0.5" max="2.0" step="0.05" value="${ttsSpeed}" />
+            </label>
+            <label class="nova-settings-field">
+              <span>Motor TTS</span>
+              <select name="voice.tts_engine">
+                <option value="kokoro"${ttsEngine === "kokoro" ? " selected" : ""}>Kokoro ONNX</option>
+                <option value="piper"${ttsEngine === "piper" ? " selected" : ""}>Piper ONNX</option>
+              </select>
+            </label>
+            <label class="nova-settings-field">
+              <span>Idioma Whisper (vacío = auto)</span>
+              <input type="text" name="voice.whisper_language" value="${escapeHtml(whisperLang)}" placeholder="es, en, ..." maxlength="16" />
+            </label>
+          </section>
+
+          <section class="nova-settings-section">
+            <h3 class="nova-settings-section-title">Push-to-Talk global</h3>
+            <label class="nova-settings-field">
+              <span>Modo del atajo</span>
+              <select name="shortcuts.ptt_mode">
+                <option value="single_turn"${pttMode === "single_turn" ? " selected" : ""}>Turno único (recomendado)</option>
+                <option value="toggle_call"${pttMode === "toggle_call" ? " selected" : ""}>Alternar llamada continua</option>
+              </select>
+            </label>
+            <label class="nova-settings-field">
+              <span>Combinación de teclas</span>
+              <div class="nova-settings-inline">
+                <input type="text" name="shortcuts.global_shortcut" value="${escapeHtml(pttShortcut)}" maxlength="64" />
+                <button type="button" class="btn btn--secondary" data-action="register-shortcut"${savingAttr}>Registrar</button>
+              </div>
+            </label>
+            ${shortcutHint}
+          </section>
+
+          <section class="nova-settings-section">
+            <h3 class="nova-settings-section-title">Modelos y general</h3>
+            <label class="nova-settings-field">
+              <span>Proveedor Tier 1</span>
+              <input type="text" name="models.pi_provider" value="${escapeHtml(piProvider)}" maxlength="64" />
+            </label>
+            <label class="nova-settings-field">
+              <span>Modelo Tier 1</span>
+              <input type="text" name="models.pi_model" value="${escapeHtml(piModel)}" maxlength="128" />
+            </label>
+            <label class="nova-settings-field">
+              <span>Modelo Tier 2 (Agente)</span>
+              <input type="text" name="models.tier2_model" value="${escapeHtml(tier2Model)}" maxlength="128" />
+            </label>
+            <label class="nova-settings-checkbox">
+              <input type="checkbox" name="general.remember_workspace"${rememberWs ? " checked" : ""} />
+              <span>Recordar último proyecto al iniciar</span>
+            </label>
+          </section>
+
+          <div class="nova-settings-footer">
+            <button type="button" class="btn btn--ghost" data-action="close-settings">Cancelar</button>
+            <button type="submit" class="btn btn--primary"${savingAttr}>${model.settingsSaving ? "Guardando…" : "Guardar"}</button>
+          </div>
+        </form>
+      </aside>
     </div>
   `.trim();
 }
@@ -801,6 +986,7 @@ export function renderAppShell(model: PresentationalAppModel): string {
           ${renderDock(model)}
         </div>
       </main>
+      <div data-slot="settings-drawer">${renderSettingsDrawer(model)}</div>
     </div>
   `.trim();
 }

@@ -23,7 +23,7 @@ class WhisperModelProtocol(Protocol):
         self,
         audio_samples: Any,
         *,
-        language: str,
+        language: str | None,
         beam_size: int,
     ) -> tuple[Iterable[Any], Any]: ...
 
@@ -86,7 +86,7 @@ class FasterWhisperSettings(BaseModel):
     model_config = ConfigDict(frozen=True, extra="ignore")
 
     model_size_or_path: str = Field(default="small", min_length=1)
-    language: str = Field(default="es", min_length=2, max_length=10)
+    language: str | None = Field(default="es", min_length=2, max_length=10)
     preferred_device: InferenceDevice = "cuda"
     cuda_compute_type: str = Field(default="float16", min_length=1)
     cpu_compute_type: str = Field(default="int8", min_length=1)
@@ -111,6 +111,10 @@ class FasterWhisperSttAdapter:
         self._load_lock = asyncio.Lock()
         self._model: WhisperModelProtocol | None = None
         self._active_device: InferenceDevice = self._settings.preferred_device
+
+    def update_settings(self, *, language: str | None = None) -> None:
+        """Hot-update Whisper language hint (`None` means auto-detect)."""
+        self._settings = self._settings.model_copy(update={"language": language})
 
     def _instantiate_sync(self, device: InferenceDevice) -> WhisperModelProtocol:
         compute = (
