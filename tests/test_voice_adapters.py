@@ -139,7 +139,7 @@ async def test_faster_whisper_adapter_falls_back_cuda_to_cpu_and_writes_zero_fil
             self,
             audio_samples: list[float],
             *,
-            language: str,
+            language: str | None,
             beam_size: int,
         ) -> tuple[list[object], object]:
             assert language == "es"
@@ -183,7 +183,7 @@ async def test_faster_whisper_timeout_raises_voice_transcription_timeout() -> No
             self,
             audio_samples: list[float],
             *,
-            language: str,
+            language: str | None,
             beam_size: int,
         ) -> tuple[list[object], object]:
             time_mod.sleep(0.2)

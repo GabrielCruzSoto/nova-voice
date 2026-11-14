@@ -144,3 +144,13 @@ def test_launcher_precedence_cli_over_env_over_toml_over_defaults(
     assert cfg.whisper_model == "large-v3"
     assert cfg.pi_model == "from-toml-pi"
     assert cfg.tts_speed == pytest.approx(1.25)
+
+
+def test_faster_whisper_accepts_none_auto_detect_language() -> None:
+    from nova.adapters.stt_faster_whisper import FasterWhisperSettings, FasterWhisperSttAdapter
+
+    settings = FasterWhisperSettings(language=None, preferred_device="cpu")
+    assert settings.language is None
+    adapter = FasterWhisperSttAdapter(settings)
+    adapter.update_settings(language="en")
+    adapter.update_settings(language=None)
