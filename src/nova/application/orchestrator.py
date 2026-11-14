@@ -154,6 +154,13 @@ class NovaOrchestrator:
         self._active_turn_task: asyncio.Task[None] | None = None
         self._barge_in_cancelled: weakref.WeakSet[asyncio.Task[None]] = weakref.WeakSet()
 
+    def update_models(self, *, tier2_model: str | None = None) -> None:
+        """Hot-update default Tier 2 model for future delegations."""
+        if tier2_model is not None and tier2_model.strip():
+            self._settings = self._settings.model_copy(
+                update={"default_tier2_model": tier2_model.strip()}
+            )
+
     def _extra_secrets(self) -> tuple[str, ...]:
         if self._security_gatekeeper is None:
             return ()

@@ -153,6 +153,27 @@ class VoiceTranscriptionEvent(BaseModel):
     timestamp: str = Field(default_factory=utc_now_iso)
 
 
+class SettingsUpdatedEvent(BaseModel):
+    """Published when persisted settings change and hot-reload is applied (NOVA-008)."""
+
+    model_config = ConfigDict(frozen=True, extra="ignore")
+
+    correlation_id: str = Field(min_length=1)
+    requires_restart: bool = False
+    restart_fields: tuple[str, ...] = ()
+    timestamp: str = Field(default_factory=utc_now_iso)
+
+
+class UiPanelToggleRequestedEvent(BaseModel):
+    """Published when `nova control toggle-panel` requests native panel toggle (NOVA-008)."""
+
+    model_config = ConfigDict(frozen=True, extra="ignore")
+
+    correlation_id: str = Field(min_length=1)
+    source: str = Field(default="control_ipc", min_length=1)
+    timestamp: str = Field(default_factory=utc_now_iso)
+
+
 OrchestratorEvent = (
     WorkspaceChangedEvent
     | ChatStreamEvent
@@ -163,6 +184,8 @@ OrchestratorEvent = (
     | CommandApprovalResolvedEvent
     | CallStateChangedEvent
     | VoiceTranscriptionEvent
+    | SettingsUpdatedEvent
+    | UiPanelToggleRequestedEvent
 )
 EventSubscriber = Callable[[OrchestratorEvent], Awaitable[None]]
 

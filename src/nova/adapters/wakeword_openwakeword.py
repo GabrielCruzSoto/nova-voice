@@ -102,6 +102,11 @@ class OpenWakeWordAdapter:
         self._last_detected_at: float | None = None
         self._pending_reset = False
 
+    def update_settings(self, *, threshold: float | None = None) -> None:
+        """Hot-update wakeword detection threshold."""
+        if threshold is not None:
+            self._settings = self._settings.model_copy(update={"threshold": threshold})
+
     async def _ensure_backend(self) -> WakeWordBackendProtocol:
         if self._backend is not None:
             return self._backend

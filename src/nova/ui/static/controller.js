@@ -3,13 +3,14 @@
  * Holds CSRF token strictly in private JS memory, manages SSE + fetch lifecycle via
  * AbortController, and delegates rendering to pure components.ts functions.
  */
-import { escapeHtml, renderAppShell, renderApprovalBanner, renderChatTimeline, renderDock, renderNoticeSlot, renderWorkspaceBar, resolveHumanNotice, } from "./components.js";
+import { escapeHtml, renderAppShell, renderApprovalBanner, renderChatTimeline, renderDock, renderNoticeSlot, renderSettingsDrawer, renderWorkspaceBar, resolveHumanNotice, } from "./components.js";
 const MAX_CLIENT_MESSAGES = 200;
 export class DesktopAppController {
     #csrfToken = "";
     #abortController = new AbortController();
     #disposed = false;
     #shellMounted = false;
+    #pttHolding = false;
     #sleepTimer = null;
     #fetch;
     #root;
@@ -144,6 +145,10 @@ export class DesktopAppController {
         if (this.#disposed) {
             return;
         }
+        if (this.#model.settingsDrawerOpen) {
+            this.closeSettingsDrawer();
+            return;
+        }
         const inCall = this.#model.callSession.state !== "standby" && this.#model.callSession.state !== "closed";
         if (inCall) {
             await this.triggerCallAction("barge-in");
@@ -229,9 +234,125 @@ export class DesktopAppController {
             errorBanner: errBody?.message ?? "No se pudo resolver la solicitud de aprobación.",
         });
     }
+    async openSettingsDrawer() {
+        if (this.#disposed) {
+            return;
+        }
+        this.#updateModel({
+            settingsDrawerOpen: true,
+            settingsLoading: true,
+            settingsError: null,
+            settingsNotice: null,
+            shortcutStatus: null,
+        });
+        try {
+            const [settingsResp, audioResp] = await Promise.all([
+                this.#fetch("/api/settings", {
+                    method: "GET",
+                    credentials: "same-origin",
+                    signal: this.#abortController.signal,
+                }),
+                this.#fetch("/api/audio/devices", {
+                    method: "GET",
+                    credentials: "same-origin",
+                    signal: this.#abortController.signal,
+                }),
+            ]);
+            if (!settingsResp.ok) {
+                const err = await this.#safeParseError(settingsResp);
+                this.#updateModel({
+                    settingsLoading: false,
+                    settingsError: err?.message ?? "No se pudo cargar la configuración.",
+                });
+                return;
+            }
+            const settingsPayload = (await settingsResp.json());
+            const audioCatalog = audioResp.ok
+                ? (await audioResp.json())
+                : (this.#model.audioDevices ?? null);
+            this.#updateModel({
+                settingsLoading: false,
+                settingsData: settingsPayload.settings,
+                audioDevices: audioCatalog,
+            });
+        }
+        catch {
+            if (!this.#disposed) {
+                this.#updateModel({
+                    settingsLoading: false,
+                    settingsError: "Error de conexión al cargar los ajustes.",
+                });
+            }
+        }
+    }
+    closeSettingsDrawer() {
+        if (this.#disposed) {
+            return;
+        }
+        this.#updateModel({
+            settingsDrawerOpen: false,
+            settingsError: null,
+            settingsNotice: null,
+        });
+    }
+    async saveSettings(patch) {
+        if (this.#disposed) {
+            return;
+        }
+        this.#updateModel({ settingsSaving: true, settingsError: null, settingsNotice: null });
+        const resp = await this.#sendJson("PUT", "/api/settings", patch);
+        if (!resp.ok) {
+            const err = await this.#safeParseError(resp);
+            this.#updateModel({
+                settingsSaving: false,
+                settingsError: err?.message ?? "No se pudieron guardar los ajustes.",
+            });
+            return;
+        }
+        const payload = (await resp.json());
+        this.#updateModel({
+            settingsSaving: false,
+            settingsData: payload.settings,
+            settingsDrawerOpen: payload.requires_restart ? true : false,
+            settingsNotice: payload.requires_restart
+                ? `Guardado. Algunos cambios aplican al reiniciar (${payload.restart_fields.join(", ")}).`
+                : null,
+            lastMilestone: payload.requires_restart ? null : "Ajustes guardados y aplicados.",
+        });
+    }
+    async registerGlobalShortcut(shortcut) {
+        if (this.#disposed) {
+            return;
+        }
+        const resp = await this.#postJson("/api/settings/shortcut", { shortcut });
+        if (!resp.ok) {
+            const err = await this.#safeParseError(resp);
+            this.#updateModel({
+                settingsError: err?.message ?? "No se pudo registrar el atajo global.",
+            });
+            return;
+        }
+        const sc = (await resp.json());
+        this.#updateModel({ settingsError: null, shortcutStatus: sc });
+    }
+    async triggerPtt(action) {
+        if (this.#disposed || !this.#model.voiceEnabled) {
+            return;
+        }
+        const resp = await this.#postJson("/api/call/ptt", { action });
+        if (!resp.ok) {
+            const err = await this.#safeParseError(resp);
+            this.#updateModel({
+                errorBanner: err?.message ?? "No se pudo ejecutar Push-to-Talk.",
+            });
+        }
+    }
     async #postJson(url, body) {
+        return this.#sendJson("POST", url, body);
+    }
+    async #sendJson(method, url, body) {
         return this.#fetch(url, {
-            method: "POST",
+            method,
             credentials: "same-origin",
             headers: {
                 "Content-Type": "application/json",
@@ -438,6 +559,18 @@ export class DesktopAppController {
             const auditId = String(p["audit_id"] ?? "");
             const remaining = this.#model.pendingApprovals.filter((a) => a.audit_id !== auditId);
             this.#updateModel({ pendingApprovals: remaining });
+            return;
+        }
+        if (env.event_type === "settings_updated") {
+            if (this.#model.settingsDrawerOpen) {
+                void this.openSettingsDrawer();
+            }
+            return;
+        }
+        if (env.event_type === "panel_toggle_requested") {
+            if (this.#model.uiMode === "orb") {
+                void this.toggleUiMode();
+            }
         }
     }
     #appendMessage(msg) {
@@ -543,6 +676,10 @@ export class DesktopAppController {
             layoutEl.dataset["uiMode"] = this.#model.uiMode ?? "panel";
             layoutEl.dataset["callState"] = this.#model.callSession.state;
         }
+        const settingsSlot = this.#root.querySelector('[data-slot="settings-drawer"]');
+        if (settingsSlot) {
+            settingsSlot.innerHTML = renderSettingsDrawer(this.#model);
+        }
     }
     #bindDomEvents() {
         const root = this.#root;
@@ -588,7 +725,35 @@ export class DesktopAppController {
                 const auditId = target.dataset["auditId"] ?? "";
                 void this.resolveApproval(auditId, false);
             }
+            else if (action === "open-settings") {
+                void this.openSettingsDrawer();
+            }
+            else if (action === "close-settings") {
+                this.closeSettingsDrawer();
+            }
+            else if (action === "register-shortcut") {
+                const shortcutInput = root.querySelector('input[name="shortcuts.global_shortcut"]');
+                const shortcut = shortcutInput?.value.trim() || "Super+Shift+Space";
+                void this.registerGlobalShortcut(shortcut);
+            }
         }, { signal: sig });
+        root.addEventListener("pointerdown", (ev) => {
+            const pttBtn = ev.target?.closest('[data-action="ptt-hold"]');
+            if (!pttBtn || pttBtn.disabled) {
+                return;
+            }
+            this.#pttHolding = true;
+            void this.triggerPtt("start");
+        }, { signal: sig });
+        const stopPttHold = () => {
+            if (!this.#pttHolding) {
+                return;
+            }
+            this.#pttHolding = false;
+            void this.triggerPtt("stop");
+        };
+        root.addEventListener("pointerup", stopPttHold, { signal: sig });
+        root.addEventListener("pointercancel", stopPttHold, { signal: sig });
         root.addEventListener("change", (ev) => {
             const target = ev.target;
             if (target?.dataset["action"] === "select-workspace-dropdown" && target.value) {
@@ -596,6 +761,37 @@ export class DesktopAppController {
             }
         }, { signal: sig });
         root.addEventListener("submit", (ev) => {
+            const settingsForm = ev.target?.closest('[data-action="settings-form"]');
+            if (settingsForm) {
+                ev.preventDefault();
+                const fd = new FormData(settingsForm);
+                const patch = {
+                    general: {
+                        remember_workspace: fd.get("general.remember_workspace") === "on",
+                    },
+                    audio: {
+                        capture_target: String(fd.get("audio.capture_target") ?? ""),
+                        playback_target: String(fd.get("audio.playback_target") ?? ""),
+                    },
+                    voice: {
+                        sensitivity_preset: String(fd.get("voice.sensitivity_preset") ?? "normal"),
+                        tts_speed: Number(fd.get("voice.tts_speed") ?? 1.1),
+                        tts_engine: String(fd.get("voice.tts_engine") ?? "kokoro"),
+                        whisper_language: String(fd.get("voice.whisper_language") ?? ""),
+                    },
+                    models: {
+                        pi_provider: String(fd.get("models.pi_provider") ?? "").trim(),
+                        pi_model: String(fd.get("models.pi_model") ?? "").trim(),
+                        tier2_model: String(fd.get("models.tier2_model") ?? "").trim(),
+                    },
+                    shortcuts: {
+                        ptt_mode: String(fd.get("shortcuts.ptt_mode") ?? "single_turn"),
+                        global_shortcut: String(fd.get("shortcuts.global_shortcut") ?? "Super+Shift+Space").trim(),
+                    },
+                };
+                void this.saveSettings(patch);
+                return;
+            }
             const form = ev.target?.closest('[data-action="chat-form"]');
             if (!form) {
                 return;

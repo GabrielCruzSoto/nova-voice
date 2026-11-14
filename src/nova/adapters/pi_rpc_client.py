@@ -140,6 +140,16 @@ class PiRpcClient:
         if was_running:
             await self.start()
 
+    def update_model(self, *, provider: str | None = None, model: str | None = None) -> None:
+        """Update Tier 1 provider/model for future Pi RPC process launches."""
+        updates: dict[str, Any] = {}
+        if provider is not None:
+            updates["provider"] = provider
+        if model is not None:
+            updates["model"] = model
+        if updates:
+            self._config = self._config.model_copy(update=updates)
+
     async def close(self) -> None:
         """Close stdin for orderly shutdown and escalate to SIGTERM/SIGKILL if needed."""
         proc = self._process

@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import re
+from collections.abc import Mapping
+from typing import Any
 
 _SECRET_PATTERNS: tuple[re.Pattern[str], ...] = (
     re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._\-+/=]+"),
@@ -82,3 +84,27 @@ class VoicePipelineError(NovaDomainError):
 
 class DesktopUiError(NovaDomainError):
     """Raised when the loopback Desktop UI bridge or native picker encounters a domain failure."""
+
+
+_CONFIG_SECRET_KEY_RE = re.compile(
+    r"(?i)(?:^|_|-)(?:api[_-]?key|token|secret|password|passwd|credential|private[_-]?key|auth)$"
+)
+
+
+def reject_secret_settings_keys(data: Any) -> None:
+    """Reject credential-like keys in persisted config payloads before saving or applying."""
+    if isinstance(data, Mapping):
+        for key, value in data.items():
+            key_str = str(key)
+            if _CONFIG_SECRET_KEY_RE.search(key_str):
+                raise DesktopUiError(
+                    code="CONFIG_SECRET_FORBIDDEN",
+                    message=(
+                        f"Forbidden credential key '{key_str}' in config.toml; "
+                        "store secrets in environment variables only."
+                    ),
+                )
+            reject_secret_settings_keys(value)
+    elif isinstance(data, list):
+        for item in data:
+            reject_secret_settings_keys(item)

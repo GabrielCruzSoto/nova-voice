@@ -699,6 +699,7 @@ def _run_pyqt6_shell(
         base_url=base_url,
         stop_event=sse_stop,
         on_state_change=lambda st, ve: _enqueue("orb_state", (st, ve)),
+        on_panel_toggle_requested=lambda: _enqueue("panel_toggle", None),
         on_parent_lost=lambda: _enqueue("signal", None),
     )
     sse_subscriber.start()
@@ -722,6 +723,8 @@ def _run_pyqt6_shell(
                 controller.handle_ipc_line(payload)
             elif kind == "overlay_exit" and isinstance(payload, int):
                 controller.handle_overlay_exit(payload, shutting_down=shutting_down)
+            elif kind == "panel_toggle":
+                controller.toggle_panel()
             elif kind == "orb_state" and isinstance(payload, tuple) and len(payload) == 2:
                 nonlocal current_orb_state
                 st_name, v_enabled = payload

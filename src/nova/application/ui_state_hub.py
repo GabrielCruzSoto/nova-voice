@@ -23,6 +23,8 @@ from nova.domain.events import (
     OrchestratorEvent,
     OrchestratorEventBus,
     RunnerFailureEvent,
+    SettingsUpdatedEvent,
+    UiPanelToggleRequestedEvent,
     VoiceMilestoneEvent,
     VoiceTranscriptionEvent,
     WorkspaceChangedEvent,
@@ -49,6 +51,8 @@ UiEventType = Literal[
     "command_approval_resolved",
     "call_state_changed",
     "voice_transcription",
+    "settings_updated",
+    "panel_toggle_requested",
 ]
 UiMessageRole = Literal["user", "assistant", "system", "security"]
 UiMessageModality = Literal[
@@ -491,6 +495,29 @@ class UiStateHub:
                 correlation_id=event.correlation_id,
                 timestamp=event.timestamp,
                 payload=rec.to_dto().model_dump(),
+            )
+            return
+
+        if isinstance(event, SettingsUpdatedEvent):
+            self._emit_envelope(
+                seq=seq,
+                event_type="settings_updated",
+                correlation_id=event.correlation_id,
+                timestamp=event.timestamp,
+                payload={
+                    "requires_restart": event.requires_restart,
+                    "restart_fields": list(event.restart_fields),
+                },
+            )
+            return
+
+        if isinstance(event, UiPanelToggleRequestedEvent):
+            self._emit_envelope(
+                seq=seq,
+                event_type="panel_toggle_requested",
+                correlation_id=event.correlation_id,
+                timestamp=event.timestamp,
+                payload={"source": event.source},
             )
             return
 
