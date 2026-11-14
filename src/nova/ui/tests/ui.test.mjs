@@ -1876,3 +1876,197 @@ test("NOVA-007 AC-3..AC-9: Clean bevelled N monogram, floating orb standby/activ
   assert.ok(!unknownOrbHtml.includes("nova-radial-equalizer-svg"), "Unknown future state must not render active radial equalizer");
 });
 
+test("NOVA-008 T5: Settings drawer, XSS escaping, Hold-to-Talk button, and controller API integration", async () => {
+  const basePanelModel = {
+    status: "empty",
+    uiMode: "panel",
+    voiceEnabled: true,
+    callSession: { call_id: "c-ptt", state: "standby", turn_count: 0, active_correlation_id: null },
+    activeWorkspace: { display_name: "nova", canonical_path: "/nova", selected_via: "exact_path" },
+    availableWorkspaces: [],
+    pendingApprovals: [],
+    messages: [],
+    errorBanner: null,
+    pickerFallbackOpen: false,
+    lastMilestone: null,
+  };
+
+  // 1. Header includes open-settings button and standby dock includes Hold-to-Talk button
+  const closedHtml = renderAppShell(basePanelModel);
+  assert.ok(closedHtml.includes('data-action="open-settings"'));
+  assert.ok(closedHtml.includes('data-action="ptt-hold"'));
+  assert.ok(!closedHtml.includes("nova-settings-drawer"));
+
+  const noVoiceHtml = renderAppShell({ ...basePanelModel, voiceEnabled: false });
+  const pttMatch = noVoiceHtml.match(/<button[^>]+data-action="ptt-hold"[^>]*>/);
+  assert.ok(pttMatch && pttMatch[0].includes("disabled"), "Hold-to-Talk must be disabled when voiceEnabled=false");
+
+  // 2. Open settings drawer renders escaped devices and persisted values
+  const openHtml = renderAppShell({
+    ...basePanelModel,
+    settingsDrawerOpen: true,
+    audioDevices: {
+      available: true,
+      backend: "pipewire",
+      inputs: [{ id: "mic-<bad>", description: "Mic <script>alert(1)</script>", is_default: true }],
+      outputs: [{ id: "spk-1", description: "Speaker", is_default: true }],
+    },
+    settingsData: {
+      schema_version: 1,
+      general: { remember_workspace: true, last_active_workspace: "/nova" },
+      audio: { capture_target: "mic-<bad>", playback_target: null },
+      voice: {
+        enable_voice: true,
+        sensitivity_preset: "high",
+        wakeword_threshold: 0.45,
+        speech_threshold: 0.45,
+        barge_in_threshold: 0.55,
+        whisper_model: "small",
+        whisper_language: "es",
+        whisper_device: "auto",
+        tts_engine: "kokoro",
+        tts_speed: 1.25,
+        kokoro_voice: "ef_dora",
+      },
+      models: { pi_provider: "github-copilot", pi_model: "gpt-4.1", tier2_model: "claude-opus-5-5-high" },
+      shortcuts: { global_ptt_shortcut: "Super+Shift+Space", ptt_mode: "single_turn" },
+    },
+  });
+  assert.ok(openHtml.includes("nova-settings-drawer"));
+  assert.ok(!openHtml.includes("<script>alert(1)</script>"));
+  assert.ok(openHtml.includes("&lt;script&gt;alert(1)&lt;/script&gt;"));
+  assert.ok(openHtml.includes("Super+Shift+Space"));
+
+  // 3. Controller openSettingsDrawer, saveSettings, registerGlobalShortcut, triggerPtt, and Escape
+  const requests = [];
+  const fakeFetch = async (url, init) => {
+    requests.push({ url, method: init?.method ?? "GET", headers: init?.headers, body: init?.body });
+    if (url === "/api/state") {
+      return new Response(
+        JSON.stringify({
+          schema_version: "1.3.0",
+          csrf_token: "csrf-settings-token",
+          voice_enabled: true,
+          call_session: { call_id: "c1", state: "standby", turn_count: 0, active_correlation_id: null },
+          active_workspace: { display_name: "nova", canonical_path: "/nova", selected_via: "exact_path" },
+          available_workspaces: [],
+          pending_approvals: [],
+          messages: [],
+        }),
+        { status: 200 },
+      );
+    }
+    if (url === "/api/events") {
+      return new Response(new ReadableStream(), {
+        status: 200,
+        headers: { "Content-Type": "text/event-stream" },
+      });
+    }
+    if (url === "/api/settings" && (init?.method ?? "GET") === "GET") {
+      return new Response(
+        JSON.stringify({
+          schema_version: 1,
+          config_path: "/home/u/.config/nova/config.toml",
+          settings: {
+            schema_version: 1,
+            general: { remember_workspace: true, last_active_workspace: "/nova" },
+            audio: { capture_target: null, playback_target: null },
+            voice: {
+              enable_voice: true,
+              sensitivity_preset: "normal",
+              wakeword_threshold: 0.55,
+              speech_threshold: 0.5,
+              barge_in_threshold: 0.65,
+              whisper_model: "small",
+              whisper_language: null,
+              whisper_device: "auto",
+              tts_engine: "kokoro",
+              tts_speed: 1.1,
+              kokoro_voice: "ef_dora",
+            },
+            models: { pi_provider: "github-copilot", pi_model: "gpt-4.1", tier2_model: "claude-opus-5-5-high" },
+            shortcuts: { global_ptt_shortcut: "Super+Shift+Space", ptt_mode: "single_turn" },
+          },
+        }),
+        { status: 200 },
+      );
+    }
+    if (url === "/api/audio/devices") {
+      return new Response(
+        JSON.stringify({ available: true, backend: "pipewire", inputs: [], outputs: [] }),
+        { status: 200 },
+      );
+    }
+    if (url === "/api/settings" && init?.method === "PUT") {
+      return new Response(
+        JSON.stringify({
+          saved: true,
+          requires_restart: false,
+          restart_fields: [],
+          settings: {
+            schema_version: 1,
+            general: { remember_workspace: true, last_active_workspace: "/nova" },
+            audio: { capture_target: "mic-1", playback_target: null },
+            voice: {
+              enable_voice: true,
+              sensitivity_preset: "high",
+              wakeword_threshold: 0.45,
+              speech_threshold: 0.45,
+              barge_in_threshold: 0.55,
+              whisper_model: "small",
+              whisper_language: "es",
+              whisper_device: "auto",
+              tts_engine: "kokoro",
+              tts_speed: 1.3,
+              kokoro_voice: "ef_dora",
+            },
+            models: { pi_provider: "github-copilot", pi_model: "gpt-4.1", tier2_model: "claude-opus-5-5-high" },
+            shortcuts: { global_ptt_shortcut: "Super+Shift+Space", ptt_mode: "single_turn" },
+          },
+        }),
+        { status: 200 },
+      );
+    }
+    if (url === "/api/settings/shortcut") {
+      return new Response(
+        JSON.stringify({
+          status: "registered",
+          desktop_environment: "COSMIC",
+          shortcut: "Super+Shift+Space",
+          command: "nova control ptt-toggle",
+        }),
+        { status: 200 },
+      );
+    }
+    if (url === "/api/call/ptt") {
+      return new Response(JSON.stringify({ ok: true, action: "start", call_state: "listening" }), { status: 200 });
+    }
+    return new Response("{}", { status: 404 });
+  };
+
+  const ctrl = new DesktopAppController({ fetchImpl: fakeFetch });
+  await ctrl.start();
+  await ctrl.openSettingsDrawer();
+  assert.equal(ctrl.model.settingsDrawerOpen, true);
+  assert.equal(ctrl.model.settingsData?.shortcuts.ptt_mode, "single_turn");
+
+  await ctrl.handleEscapeKey();
+  assert.equal(ctrl.model.settingsDrawerOpen, false, "Escape must close open settings drawer");
+
+  await ctrl.openSettingsDrawer();
+  await ctrl.registerGlobalShortcut("Super+Shift+Space");
+  assert.equal(ctrl.model.shortcutStatus?.status, "registered");
+
+  await ctrl.saveSettings({ voice: { sensitivity_preset: "high", tts_speed: 1.3 } });
+  assert.equal(ctrl.model.settingsDrawerOpen, false);
+  assert.equal(ctrl.model.settingsData?.voice.tts_speed, 1.3);
+
+  await ctrl.triggerPtt("start");
+  await ctrl.triggerPtt("stop");
+  const putReq = requests.find((r) => r.url === "/api/settings" && r.method === "PUT");
+  assert.ok(putReq && putReq.headers["X-Nova-CSRF"] === "csrf-settings-token");
+  const pttReqs = requests.filter((r) => r.url === "/api/call/ptt");
+  assert.equal(pttReqs.length, 2);
+  ctrl.dispose();
+});
+

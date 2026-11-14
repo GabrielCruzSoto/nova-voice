@@ -23,7 +23,9 @@ export type UiEventType =
   | "command_approval_requested"
   | "command_approval_resolved"
   | "call_state_changed"
-  | "voice_transcription";
+  | "voice_transcription"
+  | "settings_updated"
+  | "panel_toggle_requested";
 
 export type UiMessageRole = "user" | "assistant" | "system" | "security";
 
@@ -111,6 +113,81 @@ export interface UiNoticeBanner {
   readonly dismissible: boolean;
 }
 
+export type SensitivityPreset = "low" | "normal" | "high";
+export type PttMode = "single_turn" | "toggle_call";
+export type TtsEngineChoice = "kokoro" | "piper";
+
+export interface AudioDeviceInfo {
+  readonly id: string;
+  readonly description: string;
+  readonly is_default: boolean;
+}
+
+export interface AudioDeviceCatalog {
+  readonly available: boolean;
+  readonly backend: string;
+  readonly inputs: readonly AudioDeviceInfo[];
+  readonly outputs: readonly AudioDeviceInfo[];
+}
+
+export interface NovaSettingsDocument {
+  readonly schema_version: number;
+  readonly general: {
+    readonly remember_workspace: boolean;
+    readonly last_active_workspace: string | null;
+  };
+  readonly audio: {
+    readonly capture_target: string | null;
+    readonly playback_target: string | null;
+  };
+  readonly voice: {
+    readonly enable_voice: boolean;
+    readonly sensitivity_preset: SensitivityPreset;
+    readonly wakeword_threshold: number;
+    readonly speech_threshold: number;
+    readonly barge_in_threshold: number;
+    readonly whisper_model: string;
+    readonly whisper_language: string | null;
+    readonly whisper_device: "cuda" | "cpu" | "auto";
+    readonly tts_engine: TtsEngineChoice;
+    readonly tts_speed: number;
+    readonly kokoro_voice: string;
+  };
+  readonly models: {
+    readonly pi_provider: string;
+    readonly pi_model: string;
+    readonly tier2_model: string;
+  };
+  readonly shortcuts: {
+    readonly global_ptt_shortcut: string;
+    readonly ptt_mode: PttMode;
+    readonly control_command?: string;
+    readonly desktop_environment?: string;
+    readonly auto_register_supported?: boolean;
+  };
+}
+
+export interface SettingsGetResponse {
+  readonly schema_version: number;
+  readonly config_path: string;
+  readonly settings: NovaSettingsDocument;
+}
+
+export interface SettingsPutResponse {
+  readonly saved: boolean;
+  readonly requires_restart: boolean;
+  readonly restart_fields: readonly string[];
+  readonly settings: NovaSettingsDocument;
+}
+
+export interface ShortcutRegisterResponse {
+  readonly status: "registered" | "manual_required";
+  readonly desktop_environment: string;
+  readonly shortcut: string;
+  readonly command: string;
+  readonly manual_command?: string | null;
+}
+
 export interface PresentationalAppModel {
   readonly status: ViewStatus;
   readonly voiceEnabled: boolean;
@@ -125,4 +202,12 @@ export interface PresentationalAppModel {
   readonly lastMilestone: string | null;
   readonly uiMode: "panel" | "orb";
   readonly isStandby?: boolean;
+  readonly settingsDrawerOpen?: boolean;
+  readonly settingsLoading?: boolean;
+  readonly settingsSaving?: boolean;
+  readonly settingsData?: NovaSettingsDocument | null;
+  readonly audioDevices?: AudioDeviceCatalog | null;
+  readonly settingsNotice?: string | null;
+  readonly settingsError?: string | null;
+  readonly shortcutStatus?: ShortcutRegisterResponse | null;
 }
