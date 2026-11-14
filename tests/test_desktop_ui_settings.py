@@ -251,11 +251,18 @@ async def test_settings_endpoints_audio_devices_and_ptt(tmp_path: Path) -> None:
         )
         assert st_422 == 422
 
-        # 4. Valid PUT /api/settings persists 0600 TOML and hot-applies
+        # 4. Valid PUT /api/settings persists 0600 TOML and hot-applies (incl. empty lang -> auto)
         put_payload: dict[str, Any] = {
             "audio": {"capture_target": "mic-1"},
-            "voice": {"tts_speed": 1.4, "sensitivity_preset": "high"},
-            "shortcuts": {"ptt_mode": "toggle_call"},
+            "voice": {
+                "tts_speed": 1.4,
+                "sensitivity_preset": "high",
+                "whisper_language": "",
+            },
+            "shortcuts": {
+                "ptt_mode": "toggle_call",
+                "global_shortcut": "Super+Alt+Space",
+            },
         }
         st_put, _, body_put = await _http_req(
             srv.port,
@@ -273,6 +280,8 @@ async def test_settings_endpoints_audio_devices_and_ptt(tmp_path: Path) -> None:
         assert put_json["requires_restart"] is False
         assert put_json["settings"]["voice"]["tts_speed"] == pytest.approx(1.4)
         assert put_json["settings"]["voice"]["wakeword_threshold"] == pytest.approx(0.45)
+        assert put_json["settings"]["voice"]["whisper_language"] is None
+        assert put_json["settings"]["shortcuts"]["global_shortcut"] == "Super+Alt+Space"
         assert stat.S_IMODE(cfg_path.stat().st_mode) == 0o600
         assert len(hot_applied) == 1
 
@@ -285,8 +294,20 @@ async def test_settings_endpoints_audio_devices_and_ptt(tmp_path: Path) -> None:
             body=b'{"action":"start"}',
         )
         assert st_ptt == 200
-        assert json.loads(body_ptt.decode("utf-8"))["call_state"] == "listening"
+        ptt_json = json.loads(body_ptt.decode("utf-8"))
+        assert ptt_json["status"] == "accepted"
+        assert ptt_json["call_state"] == "listening"
         assert voice.ptt_actions == ["start"]
+
+        st_ptt_bad, _, body_ptt_bad = await _http_req(
+            srv.port,
+            "POST",
+            "/api/call/ptt",
+            headers={"Cookie": cookie, "Origin": srv.base_url, "X-Nova-CSRF": csrf},
+            body=b'{"action":"invalid"}',
+        )
+        assert st_ptt_bad == 422
+        assert json.loads(body_ptt_bad.decode("utf-8"))["error_code"] == "INVALID_PTT_ACTION"
 
         # 6. POST /api/settings/shortcut
         st_sc, _, body_sc = await _http_req(

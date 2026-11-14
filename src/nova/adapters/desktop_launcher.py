@@ -203,7 +203,7 @@ class NovaDesktopConfig(BaseModel):
     wakeword_models: tuple[str, ...] = ()
     silero_vad_model_path: str | None = None
     whisper_model: str = Field(default="small", min_length=1)
-    whisper_language: str = Field(default="es", min_length=2, max_length=10)
+    whisper_language: str | None = Field(default="es", min_length=2, max_length=10)
     whisper_device: InferenceDevice = "cuda"
     tts_engine: TtsEngineChoice = "kokoro"
     kokoro_model_path: str | None = None
@@ -476,7 +476,12 @@ class NovaDesktopRuntime:
         self._native_shell_available = native_shell_available
 
         self._event_bus = OrchestratorEventBus()
-        self._config_store = TomlConfigStore(config_path=resolve_config_file_path())
+        cfg_path = (
+            Path(self._config.config_path)
+            if self._config.config_path
+            else resolve_config_file_path()
+        )
+        self._config_store = TomlConfigStore(config_path=cfg_path)
         self._ipc_server: UnixSocketGatekeeperServer | None = None
         self._control_ipc: UnixControlIpcServer | None = None
         self._pi_client: PiRpcClient | None = None

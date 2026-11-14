@@ -159,7 +159,7 @@ export interface NovaSettingsDocument {
     readonly tier2_model: string;
   };
   readonly shortcuts: {
-    readonly global_ptt_shortcut: string;
+    readonly global_shortcut: string;
     readonly ptt_mode: PttMode;
     readonly control_command?: string;
     readonly desktop_environment?: string;

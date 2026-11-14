@@ -732,7 +732,7 @@ export class DesktopAppController {
                 this.closeSettingsDrawer();
             }
             else if (action === "register-shortcut") {
-                const shortcutInput = root.querySelector('input[name="shortcuts.global_ptt_shortcut"]');
+                const shortcutInput = root.querySelector('input[name="shortcuts.global_shortcut"]');
                 const shortcut = shortcutInput?.value.trim() || "Super+Shift+Space";
                 void this.registerGlobalShortcut(shortcut);
             }
@@ -786,7 +786,7 @@ export class DesktopAppController {
                     },
                     shortcuts: {
                         ptt_mode: String(fd.get("shortcuts.ptt_mode") ?? "single_turn"),
-                        global_ptt_shortcut: String(fd.get("shortcuts.global_ptt_shortcut") ?? "Super+Shift+Space").trim(),
+                        global_shortcut: String(fd.get("shortcuts.global_shortcut") ?? "Super+Shift+Space").trim(),
                     },
                 };
                 void this.saveSettings(patch);

@@ -821,7 +821,10 @@ class DesktopUiServer:
                     correlation_id=corr_id,
                 )
             except DesktopUiError as exc:
-                await self._write_error(writer, 422, exc.code, exc.sanitized_message, corr_id)
+                status_code = 503 if exc.code == "CONFIG_PERSIST_FAILED" else 422
+                await self._write_error(
+                    writer, status_code, exc.code, exc.sanitized_message, corr_id
+                )
                 return
             await self._write_json(writer, 200, result, corr_id)
             return
@@ -910,8 +913,8 @@ class DesktopUiServer:
             if raw_action not in ("start", "stop", "toggle"):
                 await self._write_error(
                     writer,
-                    400,
-                    "UI_INVALID_JSON_OR_PAYLOAD",
+                    422,
+                    "INVALID_PTT_ACTION",
                     "Field 'action' must be one of: start, stop, toggle.",
                     corr_id,
                 )
@@ -920,7 +923,7 @@ class DesktopUiServer:
                 await self._write_error(
                     writer,
                     503,
-                    "UI_VOICE_UNAVAILABLE",
+                    "VOICE_UNAVAILABLE",
                     "Local voice pipeline is not enabled in this session.",
                     corr_id,
                 )
@@ -935,7 +938,7 @@ class DesktopUiServer:
                 await self._write_error(
                     writer,
                     503,
-                    "UI_VOICE_UNAVAILABLE",
+                    "VOICE_UNAVAILABLE",
                     "Push-to-Talk control is not supported by the active voice coordinator.",
                     corr_id,
                 )
@@ -945,6 +948,7 @@ class DesktopUiServer:
                 writer,
                 200,
                 {
+                    "status": "accepted",
                     "ok": True,
                     "action": raw_action,
                     "call_state": self._voice_coordinator.session.state,

@@ -1929,10 +1929,11 @@ test("NOVA-008 T5: Settings drawer, XSS escaping, Hold-to-Talk button, and contr
         kokoro_voice: "ef_dora",
       },
       models: { pi_provider: "github-copilot", pi_model: "gpt-4.1", tier2_model: "claude-opus-5-5-high" },
-      shortcuts: { global_ptt_shortcut: "Super+Shift+Space", ptt_mode: "single_turn" },
+      shortcuts: { global_shortcut: "Super+Shift+Space", ptt_mode: "single_turn" },
     },
   });
   assert.ok(openHtml.includes("nova-settings-drawer"));
+  assert.ok(openHtml.includes('name="shortcuts.global_shortcut"'));
   assert.ok(!openHtml.includes("<script>alert(1)</script>"));
   assert.ok(openHtml.includes("&lt;script&gt;alert(1)&lt;/script&gt;"));
   assert.ok(openHtml.includes("Super+Shift+Space"));
@@ -1985,7 +1986,7 @@ test("NOVA-008 T5: Settings drawer, XSS escaping, Hold-to-Talk button, and contr
               kokoro_voice: "ef_dora",
             },
             models: { pi_provider: "github-copilot", pi_model: "gpt-4.1", tier2_model: "claude-opus-5-5-high" },
-            shortcuts: { global_ptt_shortcut: "Super+Shift+Space", ptt_mode: "single_turn" },
+            shortcuts: { global_shortcut: "Super+Shift+Space", ptt_mode: "single_turn" },
           },
         }),
         { status: 200 },
@@ -2021,7 +2022,7 @@ test("NOVA-008 T5: Settings drawer, XSS escaping, Hold-to-Talk button, and contr
               kokoro_voice: "ef_dora",
             },
             models: { pi_provider: "github-copilot", pi_model: "gpt-4.1", tier2_model: "claude-opus-5-5-high" },
-            shortcuts: { global_ptt_shortcut: "Super+Shift+Space", ptt_mode: "single_turn" },
+            shortcuts: { global_shortcut: "Super+Shift+Space", ptt_mode: "single_turn" },
           },
         }),
         { status: 200 },

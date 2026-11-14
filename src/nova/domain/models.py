@@ -319,7 +319,7 @@ class VoiceSettingsSection(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     enable_voice: bool = True
-    whisper_language: str = Field(default="es", min_length=2, max_length=10)
+    whisper_language: str | None = Field(default="es", min_length=2, max_length=10)
     whisper_model: str = Field(default="small", min_length=1, max_length=120)
     whisper_device: InferenceDevice = "cuda"
     tts_engine: TtsEngineChoice = "piper"
@@ -330,7 +330,12 @@ class VoiceSettingsSection(BaseModel):
     speech_threshold: float = Field(default=0.50, gt=0.0, le=1.0)
     barge_in_threshold: float = Field(default=0.60, gt=0.0, le=1.0)
 
-    @field_validator("whisper_language", "whisper_model", "kokoro_voice")
+    @field_validator("whisper_language")
+    @classmethod
+    def _validate_whisper_language(cls, value: str | None) -> str | None:
+        return _validate_safe_setting_token(value)
+
+    @field_validator("whisper_model", "kokoro_voice")
     @classmethod
     def _validate_voice_tokens(cls, value: str) -> str:
         checked = _validate_safe_setting_token(value)

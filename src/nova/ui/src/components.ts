@@ -805,7 +805,7 @@ export function renderSettingsDrawer(model: PresentationalAppModel): string {
   const ttsEngine = s?.voice.tts_engine ?? "kokoro";
   const whisperLang = s?.voice.whisper_language ?? "";
   const pttMode = s?.shortcuts.ptt_mode ?? "single_turn";
-  const pttShortcut = s?.shortcuts.global_ptt_shortcut ?? "Super+Shift+Space";
+  const pttShortcut = s?.shortcuts.global_shortcut ?? "Super+Shift+Space";
   const piProvider = s?.models.pi_provider ?? "github-copilot";
   const piModel = s?.models.pi_model ?? "gpt-4.1";
   const tier2Model = s?.models.tier2_model ?? "claude-opus-5-5-high";
@@ -886,7 +886,7 @@ export function renderSettingsDrawer(model: PresentationalAppModel): string {
             <label class="nova-settings-field">
               <span>Combinación de teclas</span>
               <div class="nova-settings-inline">
-                <input type="text" name="shortcuts.global_ptt_shortcut" value="${escapeHtml(pttShortcut)}" maxlength="64" />
+                <input type="text" name="shortcuts.global_shortcut" value="${escapeHtml(pttShortcut)}" maxlength="64" />
                 <button type="button" class="btn btn--secondary" data-action="register-shortcut"${savingAttr}>Registrar</button>
               </div>
             </label>

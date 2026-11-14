@@ -43,6 +43,12 @@ def _normalize_optional_empty_strings(raw: dict[str, Any]) -> dict[str, Any]:
             if a_copy.get(key) == "":
                 a_copy[key] = None
         normalized["audio"] = a_copy
+    voice = normalized.get("voice")
+    if isinstance(voice, Mapping):
+        v_copy = dict(voice)
+        if v_copy.get("whisper_language") == "":
+            v_copy["whisper_language"] = None
+        normalized["voice"] = v_copy
     return normalized
 
 
