@@ -7,14 +7,12 @@ import os
 import re
 import tempfile
 from collections.abc import Mapping
-from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal
 
 from nova.domain.errors import DesktopUiError
+from nova.domain.models import DEFAULT_PTT_COMMAND, ShortcutRegistrationResult
 
 DEFAULT_GLOBAL_SHORTCUT = "Super+Shift+Space"
-DEFAULT_PTT_COMMAND = "nova control ptt-toggle"
 
 _ALLOWED_MODIFIERS: dict[str, str] = {
     "super": "Super",
@@ -34,17 +32,6 @@ _COSMIC_KEY_ALIASES: dict[str, str] = {
     "backspace": "BackSpace",
 }
 _NOVA_SPAWN_RE = re.compile(r'Spawn\("nova\s+control\s+[^"]*"\)')
-
-
-@dataclass(frozen=True, slots=True)
-class ShortcutRegistrationResult:
-    """Outcome of attempting to register Nova's global PTT shortcut on Linux."""
-
-    status: Literal["registered", "manual_required"]
-    desktop_environment: str
-    shortcut: str
-    command: str
-    config_file: str | None = None
 
 
 def parse_shortcut_combo(shortcut: str) -> tuple[tuple[str, ...], str]:

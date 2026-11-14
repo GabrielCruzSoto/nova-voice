@@ -5,7 +5,6 @@ from __future__ import annotations
 import contextlib
 import json
 import os
-import re
 import tempfile
 import tomllib
 from collections.abc import Mapping
@@ -14,14 +13,11 @@ from typing import Any
 
 from pydantic import ValidationError
 
-from nova.domain.errors import DesktopUiError
+from nova.domain.errors import DesktopUiError, reject_secret_settings_keys
 from nova.domain.models import NovaPersistedSettings
 
 MAX_CONFIG_FILE_BYTES = 65_536
-
-_SECRET_KEY_RE = re.compile(
-    r"(?i)(?:^|_|-)(?:api[_-]?key|token|secret|password|passwd|credential|private[_-]?key|auth)$"
-)
+_reject_secret_keys = reject_secret_settings_keys
 
 
 def resolve_config_file_path(env: Mapping[str, str] | None = None) -> Path:
@@ -30,24 +26,6 @@ def resolve_config_file_path(env: Mapping[str, str] | None = None) -> Path:
     xdg_config = effective_env.get("XDG_CONFIG_HOME", "").strip()
     base_dir = Path(xdg_config).expanduser() if xdg_config else Path.home() / ".config"
     return base_dir / "nova" / "config.toml"
-
-
-def _reject_secret_keys(data: Any) -> None:
-    if isinstance(data, Mapping):
-        for key, value in data.items():
-            key_str = str(key)
-            if _SECRET_KEY_RE.search(key_str):
-                raise DesktopUiError(
-                    code="CONFIG_SECRET_FORBIDDEN",
-                    message=(
-                        f"Forbidden credential key '{key_str}' in config.toml; "
-                        "store secrets in environment variables only."
-                    ),
-                )
-            _reject_secret_keys(value)
-    elif isinstance(data, list):
-        for item in data:
-            _reject_secret_keys(item)
 
 
 def _normalize_optional_empty_strings(raw: dict[str, Any]) -> dict[str, Any]:

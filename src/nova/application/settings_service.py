@@ -8,21 +8,21 @@ from typing import Any
 
 from pydantic import ValidationError
 
-from nova.adapters.config_store import _reject_secret_keys
-from nova.adapters.shortcut_registrar import (
-    DEFAULT_PTT_COMMAND,
-    LinuxShortcutRegistrar,
-    ShortcutRegistrationResult,
-)
-from nova.domain.errors import DesktopUiError
+from nova.domain.errors import DesktopUiError, reject_secret_settings_keys
 from nova.domain.events import OrchestratorEventBus, SettingsUpdatedEvent
 from nova.domain.models import (
+    DEFAULT_PTT_COMMAND,
     SENSITIVITY_THRESHOLDS,
     AudioDeviceCatalog,
     NovaPersistedSettings,
     SensitivityPreset,
+    ShortcutRegistrationResult,
 )
-from nova.domain.ports import AudioDeviceDiscoveryPort, ConfigStorePort
+from nova.domain.ports import (
+    AudioDeviceDiscoveryPort,
+    ConfigStorePort,
+    ShortcutRegistrarPort,
+)
 
 _RESTART_ONLY_FIELDS: frozenset[str] = frozenset(
     {
@@ -61,14 +61,14 @@ class SettingsService:
         config_store: ConfigStorePort,
         initial_settings: NovaPersistedSettings | None = None,
         audio_discovery: AudioDeviceDiscoveryPort | None = None,
-        shortcut_registrar: LinuxShortcutRegistrar | None = None,
+        shortcut_registrar: ShortcutRegistrarPort | None = None,
         event_bus: OrchestratorEventBus | None = None,
         on_hot_apply: Callable[[NovaPersistedSettings], None] | None = None,
     ) -> None:
         self._store = config_store
         self._settings = initial_settings or config_store.load()
         self._audio_discovery = audio_discovery
-        self._shortcut_registrar = shortcut_registrar or LinuxShortcutRegistrar()
+        self._shortcut_registrar = shortcut_registrar
         self._event_bus = event_bus
         self._on_hot_apply = on_hot_apply
         self._lock = asyncio.Lock()
@@ -82,8 +82,16 @@ class SettingsService:
         data = self._settings.model_dump()
         shortcuts_dict = dict(data["shortcuts"])
         shortcuts_dict["control_command"] = DEFAULT_PTT_COMMAND
-        shortcuts_dict["desktop_environment"] = self._shortcut_registrar.desktop_environment
-        shortcuts_dict["auto_register_supported"] = self._shortcut_registrar.auto_register_supported
+        shortcuts_dict["desktop_environment"] = (
+            self._shortcut_registrar.desktop_environment
+            if self._shortcut_registrar is not None
+            else "unknown"
+        )
+        shortcuts_dict["auto_register_supported"] = (
+            self._shortcut_registrar.auto_register_supported
+            if self._shortcut_registrar is not None
+            else False
+        )
         data["shortcuts"] = shortcuts_dict
         return {
             "schema_version": self._settings.schema_version,
@@ -99,6 +107,13 @@ class SettingsService:
 
     def register_shortcut(self, shortcut: str) -> ShortcutRegistrationResult:
         """Register global PTT shortcut on supported desktops or return manual command."""
+        if self._shortcut_registrar is None:
+            return ShortcutRegistrationResult(
+                status="manual_required",
+                desktop_environment="unknown",
+                shortcut=shortcut,
+                command=DEFAULT_PTT_COMMAND,
+            )
         return self._shortcut_registrar.register_ptt_shortcut(shortcut)
 
     async def update_settings(
@@ -108,7 +123,7 @@ class SettingsService:
         correlation_id: str = "corr-settings",
     ) -> dict[str, Any]:
         """Validate, atomically persist `0600`, hot-apply dynamic fields, and publish SSE."""
-        _reject_secret_keys(raw_patch)
+        reject_secret_settings_keys(raw_patch)
         allowed_top = {"general", "audio", "voice", "models", "shortcuts"}
         unknown_top = set(raw_patch.keys()) - allowed_top
         if unknown_top:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Literal
 
@@ -405,3 +406,17 @@ class AudioDeviceCatalog(BaseModel):
     backend: Literal["pipewire", "pulseaudio", "none"] = "none"
     inputs: tuple[AudioDeviceInfo, ...] = ()
     outputs: tuple[AudioDeviceInfo, ...] = ()
+
+
+DEFAULT_PTT_COMMAND = "nova control ptt-toggle"
+
+
+@dataclass(frozen=True, slots=True)
+class ShortcutRegistrationResult:
+    """Outcome of attempting to register Nova's global PTT shortcut on Linux."""
+
+    status: Literal["registered", "manual_required"]
+    desktop_environment: str
+    shortcut: str
+    command: str
+    config_file: str | None = None

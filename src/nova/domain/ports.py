@@ -18,6 +18,7 @@ from nova.domain.models import (
     NovaPersistedSettings,
     ResolveWorkspaceRequest,
     RunnerProgressEvent,
+    ShortcutRegistrationResult,
     SynthesizedAudio,
     TranscriptionResult,
     WakeWordDetection,
@@ -199,4 +200,22 @@ class AudioDeviceDiscoveryPort(Protocol):
 
     async def list_devices(self) -> AudioDeviceCatalog:
         """Return enumerated audio inputs and outputs, degrading cleanly when unavailable."""
+        ...
+
+
+class ShortcutRegistrarPort(Protocol):
+    """Abstract port for global Push-to-Talk shortcut registration (NOVA-008 OP-8)."""
+
+    @property
+    def desktop_environment(self) -> str:
+        """Return detected Linux desktop environment identifier."""
+        ...
+
+    @property
+    def auto_register_supported(self) -> bool:
+        """Return True when one-click shortcut registration is supported."""
+        ...
+
+    def register_ptt_shortcut(self, shortcut: str) -> ShortcutRegistrationResult:
+        """Register or return manual instructions for the global PTT shortcut."""
         ...
