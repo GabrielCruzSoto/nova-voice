@@ -101,6 +101,7 @@ class VoiceCoordinatorSettings(BaseModel):
     max_tts_queue: int = Field(default=16, ge=1, le=64)
     call_idle_timeout_seconds: float = Field(default=180.0, gt=0.0, le=3600.0)
     allow_barge_in_during_tts: bool = True
+    barge_in_grace_seconds: float = Field(default=0.35, ge=0.0, le=2.0)
     ptt_mode: PttMode = "single_turn"
 
 
@@ -148,6 +149,7 @@ class VoiceCallCoordinator:
         self._single_turn_active = False
         self._ptt_hold_active = False
         self._flush_ptt_hold = False
+        self._speaking_started_at = 0.0
 
         self._tts_queue: deque[VoiceMilestoneEvent] = deque()
         self._tts_wakeup = asyncio.Event()
@@ -258,6 +260,7 @@ class VoiceCallCoordinator:
         self._single_turn_active = False
         self._ptt_hold_active = False
         self._flush_ptt_hold = False
+        self._speaking_started_at = 0.0
         self._purge_segment_queue()
 
         stt_task = self._current_stt_task
@@ -333,6 +336,7 @@ class VoiceCallCoordinator:
         ptt_mode: PttMode | None = None,
         speech_threshold: float | None = None,
         barge_in_threshold: float | None = None,
+        barge_in_grace_seconds: float | None = None,
     ) -> None:
         """Update dynamic voice coordinator thresholds and PTT mode in RAM."""
         updates: dict[str, object] = {}
@@ -342,6 +346,8 @@ class VoiceCallCoordinator:
             updates["speech_threshold"] = speech_threshold
         if barge_in_threshold is not None:
             updates["barge_in_threshold"] = barge_in_threshold
+        if barge_in_grace_seconds is not None:
+            updates["barge_in_grace_seconds"] = barge_in_grace_seconds
         if updates:
             self._settings = self._settings.model_copy(update=updates)
 
@@ -354,6 +360,7 @@ class VoiceCallCoordinator:
         self._single_turn_active = False
         self._ptt_hold_active = False
         self._flush_ptt_hold = False
+        self._speaking_started_at = 0.0
         self._purge_segment_queue()
         self._tts_queue.clear()
         self._started = False
@@ -406,6 +413,9 @@ class VoiceCallCoordinator:
                 }
             )
             return
+
+        if new_state == "speaking":
+            self._speaking_started_at = now
 
         self._session = self._session.model_copy(
             update={
@@ -602,6 +612,12 @@ class VoiceCallCoordinator:
                             pre_roll.clear()
                             self._vad.reset()
                         continue
+
+                    if state == "speaking" and (self._clock() - self._speaking_started_at < self._settings.barge_in_grace_seconds):
+                        if not in_speech:
+                            barge_in_run = 0
+                            pre_roll.clear()
+                            continue
 
                     if in_speech:
                         # F5: User was already speaking in "listening" when async TTS started;

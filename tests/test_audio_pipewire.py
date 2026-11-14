@@ -277,3 +277,19 @@ async def test_continuous_bounded_stderr_drain_during_long_capture() -> None:
     assert seen == 2
     assert spawned[0].stderr._chunks == []
 
+
+def test_playback_argv_uses_64ms_latency_for_pw_play_and_paplay() -> None:
+    pw_adapter = PipeWireAudioAdapter(
+        which_resolver=lambda cmd: "/usr/bin/pw-play" if cmd == "pw-play" else None
+    )
+    pw_argv = pw_adapter._resolve_playback_argv(24000)
+    assert "--latency" in pw_argv
+    assert pw_argv[pw_argv.index("--latency") + 1] == "64ms"
+
+    pa_adapter = PipeWireAudioAdapter(
+        which_resolver=lambda cmd: "/usr/bin/paplay" if cmd == "paplay" else None
+    )
+    pa_argv = pa_adapter._resolve_playback_argv(24000)
+    assert "--latency-msec=64" in pa_argv
+
+
