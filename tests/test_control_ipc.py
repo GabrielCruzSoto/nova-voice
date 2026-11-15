@@ -80,3 +80,33 @@ def test_send_control_command_rejects_invalid_action(tmp_path: Path) -> None:
     with pytest.raises(ValueError):
         send_control_command("rm -rf /", socket_path=tmp_path / "missing.sock")
     assert os.getuid() >= 0
+
+
+@pytest.mark.asyncio
+async def test_control_ipc_accepts_quit_action_and_returns_shutting_down(
+    tmp_path: Path,
+) -> None:
+    import asyncio
+
+    runtime_dir = tmp_path / "run_quit"
+    received: list[str] = []
+
+    async def handler(action: str) -> dict[str, object]:
+        received.append(action)
+        return {"action": action, "status": "shutting_down"}
+
+    server = UnixControlIpcServer(handler=handler, runtime_base_dir=runtime_dir)
+    await server.start()
+    try:
+        result = await asyncio.to_thread(
+            send_control_command,
+            "quit",
+            socket_path=Path(server.socket_path),
+        )
+        assert result["ok"] is True
+        assert result["action"] == "quit"
+        assert result["status"] == "shutting_down"
+        assert received == ["quit"]
+    finally:
+        await server.close()
+

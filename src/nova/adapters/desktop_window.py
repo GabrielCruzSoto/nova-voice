@@ -55,6 +55,7 @@ __all__ = [
     "parse_window_args",
     "run_window",
     "should_hide_panel_for_title",
+    "should_quit_for_title",
 ]
 
 logger = logging.getLogger("nova.desktop_window")
@@ -64,6 +65,7 @@ _VALID_SHELL_IPC_ACTIONS: frozenset[str] = frozenset(
 )
 _MAX_IPC_LINE_BYTES = 512
 _PANEL_HIDE_TITLE_PREFIX = "Nova::HIDE_PANEL"
+_PANEL_QUIT_TITLE_PREFIX = "Nova::QUIT_APP"
 _STATIC_DIR = Path(__file__).resolve().parent.parent / "ui" / "static"
 
 
@@ -111,6 +113,11 @@ def should_hide_panel_for_title(title: str) -> bool:
     return title.strip().startswith(_PANEL_HIDE_TITLE_PREFIX)
 
 
+def should_quit_for_title(title: str) -> bool:
+    """Return True when `app.ts` signals the native host to shut down Nova."""
+    return title.strip().startswith(_PANEL_QUIT_TITLE_PREFIX)
+
+
 def parse_shell_ipc_line(line: str) -> ShellIpcAction | None:
     """Parse one `nova.desktop.shell_ipc.v1` JSONL frame; return None if invalid."""
     encoded = line.encode("utf-8", errors="replace")
@@ -152,7 +159,7 @@ def _extract_cookie_pair(set_cookie_header: str | None) -> str:
 
 
 class LoopbackActionClient:
-    """RAM-only authenticated client for `/api/call/start` and `/api/call/end`."""
+    """RAM-only authenticated client for loopback call and shutdown endpoints."""
 
     def __init__(self, base_url: str, *, timeout_sec: float = 3.0) -> None:
         host, port = validate_loopback_url(base_url)
@@ -222,9 +229,7 @@ class LoopbackActionClient:
         finally:
             conn.close()
 
-    def trigger_call(self, action: Literal["start", "end"]) -> bool:
-        """Send authenticated `POST /api/call/<action>` over loopback."""
-        endpoint = "/api/call/start" if action == "start" else "/api/call/end"
+    def _post_authenticated(self, endpoint: str) -> bool:
         with self._lock:
             try:
                 if not self._cookie or not self._csrf_token:
@@ -241,6 +246,15 @@ class LoopbackActionClient:
             except (OSError, http.client.HTTPException, ValueError):
                 return False
 
+    def trigger_call(self, action: Literal["start", "end"]) -> bool:
+        """Send authenticated `POST /api/call/<action>` over loopback."""
+        endpoint = "/api/call/start" if action == "start" else "/api/call/end"
+        return self._post_authenticated(endpoint)
+
+    def trigger_shutdown(self) -> bool:
+        """Send authenticated `POST /api/shutdown` over loopback (`OP-1` / `OP-3`)."""
+        return self._post_authenticated("/api/shutdown")
+
 
 class DesktopShellController:
     """Pure hexagonal coordinator for shell IPC frames, fallback orb and child reaping."""
@@ -253,18 +267,26 @@ class DesktopShellController:
         trigger_call_action: Callable[[Literal["start", "end"]], None],
         activate_fallback_orb: Callable[[], None],
         quit_shell: Callable[[], None],
+        trigger_daemon_shutdown: Callable[[], None] | None = None,
     ) -> None:
         self._is_panel_visible = is_panel_visible
         self._set_panel_visible = set_panel_visible
         self._trigger_call_action = trigger_call_action
         self._activate_fallback_orb = activate_fallback_orb
         self._quit_shell = quit_shell
+        self._trigger_daemon_shutdown = trigger_daemon_shutdown
         self.overlay_ready: bool = False
         self.fallback_orb_active: bool = False
 
     def toggle_panel(self) -> None:
         """Flip conversation panel visibility without mutating call state (`AC-6`)."""
         self._set_panel_visible(not self._is_panel_visible())
+
+    def request_full_quit(self) -> None:
+        """Propagate shutdown to `nova-desktop` daemon before quitting the local Qt shell."""
+        if self._trigger_daemon_shutdown is not None:
+            self._trigger_daemon_shutdown()
+        self._quit_shell()
 
     def handle_ipc_line(self, line: str) -> bool:
         """Dispatch one `shell_ipc.v1` line; return False if ignored."""
@@ -283,7 +305,7 @@ class DesktopShellController:
         if action == "call_end":
             self._trigger_call_action("end")
             return True
-        self._quit_shell()
+        self.request_full_quit()
         return True
 
     def handle_overlay_exit(self, exit_code: int, *, shutting_down: bool) -> None:
@@ -382,15 +404,25 @@ def _create_fallback_orb_widget(
     *,
     on_left_click: Callable[[], None],
     on_right_click: Callable[[], None],
+    on_quit: Callable[[], None] | None = None,
 ) -> Any:
     """Create frameless translucent `PyQt6` fallback orb when `zwlr_layer_shell_v1` is absent."""
     visual_ref: list[OrbVisualState] = [build_orb_visual_state("standby")]
     phase_ref: list[float] = [0.0]
+    badge_cx, badge_cy = 260.0, 34.0
 
     def _mouse_press(_self: Any, event: Any) -> None:
         btn = event.button()
+        pos = event.position()
+        px, py = float(pos.x()), float(pos.y())
         if btn == qt.core.Qt.MouseButton.LeftButton:
+            if on_quit is not None and (px - badge_cx) ** 2 + (py - badge_cy) ** 2 <= 12.0**2:
+                on_quit()
+                return
             on_left_click()
+        elif btn == qt.core.Qt.MouseButton.MiddleButton:
+            if on_quit is not None:
+                on_quit()
         elif btn == qt.core.Qt.MouseButton.RightButton:
             on_right_click()
 
@@ -462,6 +494,21 @@ def _create_fallback_orb_widget(
 
         icon = _render_tray_icon(qt, active=visual.in_call)
         icon.paint(painter, int(cx - 22), int(cy - 22), 44, 44)
+
+        painter.setBrush(qt.gui.QColor(18, 25, 43, 240))
+        painter.setPen(qt.gui.QPen(qt.gui.QColor(240, 108, 122, 175), 1.3))
+        painter.drawEllipse(qt.core.QPointF(badge_cx, badge_cy), 10.5, 10.5)
+        x_pen = qt.gui.QPen(qt.gui.QColor(242, 245, 250, 235), 1.8)
+        x_pen.setCapStyle(qt.core.Qt.PenCapStyle.RoundCap)
+        painter.setPen(x_pen)
+        painter.drawLine(
+            qt.core.QPointF(badge_cx - 3.6, badge_cy - 3.6),
+            qt.core.QPointF(badge_cx + 3.6, badge_cy + 3.6),
+        )
+        painter.drawLine(
+            qt.core.QPointF(badge_cx + 3.6, badge_cy - 3.6),
+            qt.core.QPointF(badge_cx - 3.6, badge_cy + 3.6),
+        )
         painter.end()
 
     orb_cls: Any = type(
@@ -625,6 +672,7 @@ def _run_pyqt6_shell(
             on_right_click=lambda: _run_call_async(
                 "end" if current_orb_state.in_call else "start"
             ),
+            on_quit=controller.request_full_quit,
         )
         fallback_orb.set_visual_state(current_orb_state)
         fallback_orb.show()
@@ -634,16 +682,22 @@ def _run_pyqt6_shell(
         shutting_down = True
         app.quit()
 
+    def _propagate_daemon_shutdown() -> None:
+        action_client.trigger_shutdown()
+
     controller = DesktopShellController(
         is_panel_visible=panel.isVisible,
         set_panel_visible=_set_panel_visible,
         trigger_call_action=_run_call_async,
         activate_fallback_orb=_activate_fallback_orb,
         quit_shell=_quit_shell,
+        trigger_daemon_shutdown=_propagate_daemon_shutdown,
     )
 
     def _on_title_changed(title: str) -> None:
-        if should_hide_panel_for_title(title):
+        if should_quit_for_title(title):
+            controller.request_full_quit()
+        elif should_hide_panel_for_title(title):
             _set_panel_visible(False)
 
     web_view.titleChanged.connect(_on_title_changed)
@@ -653,7 +707,7 @@ def _run_pyqt6_shell(
         toggle_menu_action.triggered.connect(controller.toggle_panel)
         start_call_action.triggered.connect(lambda: _run_call_async("start"))
         end_call_action.triggered.connect(lambda: _run_call_async("end"))
-        quit_action.triggered.connect(_quit_shell)
+        quit_action.triggered.connect(controller.request_full_quit)
 
         def _on_tray_activated(reason: Any) -> None:
             if reason == qt.widgets.QSystemTrayIcon.ActivationReason.Trigger:

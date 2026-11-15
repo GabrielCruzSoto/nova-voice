@@ -1299,9 +1299,63 @@ html[data-shell-frameless="true"] .nova-layout[data-ui-mode="panel"] {
 
 .nova-settings-footer {
   display: flex;
+  align-items: center;
   justify-content: flex-end;
   gap: 0.5rem;
   margin-top: 0.35rem;
   padding-top: 0.65rem;
   border-top: 1px solid var(--border-subtle);
+}
+
+.btn-quit-drawer {
+  margin-right: auto;
+}
+
+.btn-quit-app {
+  padding: 0.25rem 0.5rem;
+  line-height: 1;
+  border-color: rgba(248, 113, 113, 0.32);
+  color: var(--text-primary);
+}
+
+.btn-quit-app:hover {
+  background: rgba(220, 38, 38, 0.28);
+  border-color: var(--accent-danger);
+  color: #fecaca;
+}
+
+.nova-widget-close-btn {
+  position: absolute;
+  top: -4px;
+  right: -4px;
+  z-index: 3;
+  width: 22px;
+  height: 22px;
+  padding: 0;
+  border-radius: 50%;
+  border: 1.3px solid rgba(248, 113, 113, 0.68);
+  background: rgba(18, 25, 43, 0.94);
+  color: var(--text-primary);
+  font-size: 0.88rem;
+  font-weight: 700;
+  line-height: 1;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: transform 150ms ease, background 150ms ease;
+}
+
+.nova-widget-close-btn:hover {
+  background: rgba(220, 38, 38, 0.85);
+  transform: scale(1.08);
+}
+
+.nova-notice-container[data-error-code="APP_SHUTDOWN"] {
+  background: rgba(15, 23, 42, 0.88);
+  border-color: rgba(56, 189, 248, 0.45);
+}
+
+.nova-notice-container[data-error-code="APP_SHUTDOWN"] .notice-message {
+  color: #bae6fd;
 }

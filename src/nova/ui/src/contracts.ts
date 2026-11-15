@@ -210,4 +210,5 @@ export interface PresentationalAppModel {
   readonly settingsNotice?: string | null;
   readonly settingsError?: string | null;
   readonly shortcutStatus?: ShortcutRegisterResponse | null;
+  readonly appShuttingDown?: boolean;
 }

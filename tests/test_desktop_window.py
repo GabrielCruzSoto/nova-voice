@@ -24,6 +24,7 @@ from nova.adapters.desktop_window import (
     parse_shell_ipc_line,
     parse_window_args,
     should_hide_panel_for_title,
+    should_quit_for_title,
 )
 
 
@@ -219,3 +220,88 @@ def test_loopback_action_client_authenticates_cookie_and_csrf_in_ram() -> None:
         server.shutdown()
         server.server_close()
         thread.join(timeout=2.0)
+
+
+def test_quit_sentinel_and_trigger_shutdown_propagate_daemon_shutdown() -> None:
+    """NOVA-011 AC-3: Nova::QUIT_APP & IPC quit trigger POST /api/shutdown; hide never quits."""
+    assert should_quit_for_title("Nova::QUIT_APP") is True
+    assert should_quit_for_title("  Nova::QUIT_APP ") is True
+    assert should_quit_for_title("Nova::HIDE_PANEL") is False
+    assert should_hide_panel_for_title("Nova::QUIT_APP") is False
+
+    daemon_shutdowns = 0
+    shell_quits = 0
+
+    def _on_daemon_shutdown() -> None:
+        nonlocal daemon_shutdowns
+        daemon_shutdowns += 1
+
+    def _on_shell_quit() -> None:
+        nonlocal shell_quits
+        shell_quits += 1
+
+    controller = DesktopShellController(
+        is_panel_visible=lambda: True,
+        set_panel_visible=lambda _v: None,
+        trigger_call_action=lambda _a: None,
+        activate_fallback_orb=lambda: None,
+        quit_shell=_on_shell_quit,
+        trigger_daemon_shutdown=_on_daemon_shutdown,
+    )
+
+    # Toggle panel does NOT trigger daemon shutdown
+    controller.toggle_panel()
+    assert daemon_shutdowns == 0
+    assert shell_quits == 0
+
+    # IPC 'quit' from floating orb triggers both daemon shutdown and shell quit
+    assert controller.handle_ipc_line(format_shell_ipc_message("quit")) is True
+    assert daemon_shutdowns == 1
+    assert shell_quits == 1
+
+    # LoopbackActionClient.trigger_shutdown posts to /api/shutdown and accepts 202
+    recorded_paths: list[str] = []
+
+    class _FakeShutdownHandler(http.server.BaseHTTPRequestHandler):
+        def log_message(self, format: str, *args: object) -> None:  # noqa: A002
+            return
+
+        def do_GET(self) -> None:  # noqa: N802
+            if self.path == "/":
+                self.send_response(200)
+                self.send_header(
+                    "Set-Cookie",
+                    "nova_ui_session=syn-sess-quit; HttpOnly; SameSite=Strict; Path=/",
+                )
+                self.end_headers()
+                self.wfile.write(b"ok")
+                return
+            if self.path == "/api/state":
+                self.send_response(200)
+                self.send_header("Content-Type", "application/json")
+                self.end_headers()
+                self.wfile.write(b'{"csrf_token":"syn-csrf-quit"}')
+                return
+            self.send_response(404)
+            self.end_headers()
+
+        def do_POST(self) -> None:  # noqa: N802
+            recorded_paths.append(self.path)
+            self.send_response(202)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            self.wfile.write(b'{"status":"shutting_down"}')
+
+    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), _FakeShutdownHandler)
+    port = server.server_address[1]
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        client = LoopbackActionClient(f"http://127.0.0.1:{port}")
+        assert client.trigger_shutdown() is True
+        assert recorded_paths == ["/api/shutdown"]
+    finally:
+        server.shutdown()
+        server.server_close()
+        thread.join(timeout=2.0)
+
