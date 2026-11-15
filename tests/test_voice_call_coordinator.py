@@ -1352,4 +1352,346 @@ async def test_wake_word_and_ptt_play_earcon_chime() -> None:
     await coordinator.shutdown()
 
 
+async def test_nova012_ac1_capture_loop_survives_wakeword_vad_and_standby_stt_errors() -> None:
+    bus = OrchestratorEventBus()
+    failures: list[RunnerFailureEvent] = []
+
+    async def _collect_failures(ev: OrchestratorEvent) -> None:
+        if isinstance(ev, RunnerFailureEvent):
+            failures.append(ev)
+
+    bus.subscribe(_collect_failures)
+
+    audio_in = _ScriptedAudioInput()
+    audio_out = _ControlledAudioOutput()
+
+    class _FlakyWakeWord(_FakeWakeWord):
+        def __init__(self) -> None:
+            super().__init__()
+            self.fail_once = True
+
+        async def detect(self, frame: AudioFrame) -> WakeWordDetection:
+            if self.fail_once:
+                self.fail_once = False
+                raise VoicePipelineError(
+                    code="VOICE_WAKEWORD_TIMEOUT",
+                    message="wakeword inference timed out",
+                )
+            return await super().detect(frame)
+
+    class _FlakyVad(_FakeVad):
+        def __init__(self) -> None:
+            super().__init__()
+            self.fail_once = True
+
+        async def speech_probability(self, frame: AudioFrame) -> float:
+            if self.fail_once:
+                self.fail_once = False
+                raise VoicePipelineError(
+                    code="VOICE_VAD_FAILED",
+                    message="silero transient failure",
+                )
+            return await super().speech_probability(frame)
+
+    wake = _FlakyWakeWord()
+    vad = _FlakyVad()
+    stt = _FakeStt()
+    stt.fail_error = VoicePipelineError(
+        code="VOICE_TRANSCRIPTION_TIMEOUT",
+        message="cold start stt timeout",
+    )
+    orch = _FakeOrchestrator(event_bus=bus)
+
+    coordinator = VoiceCallCoordinator(
+        audio_input=audio_in,
+        audio_output=audio_out,
+        wake_word=wake,
+        vad=vad,
+        stt=stt,
+        tts=_FakeTts(),
+        orchestrator=orch,
+        event_bus=bus,
+        settings=VoiceCoordinatorSettings(
+            min_speech_frames=2,
+            end_silence_frames=2,
+            enable_wake_earcon=False,
+        ),
+    )
+    await coordinator.start()
+
+    # 1. Frame 1 triggers wake_word VoicePipelineError -> loop must stay alive
+    audio_in.push_frame(_frame(tag=1))
+    await asyncio.sleep(0.03)
+
+    # 2. Frame 2 triggers vad VoicePipelineError -> loop must stay alive
+    audio_in.push_frame(_frame(tag=2))
+    await asyncio.sleep(0.03)
+
+    # 3. Standby speech + silence triggers standby STT VoicePipelineError -> loop stays alive
+    vad.probs = [0.9, 0.9, 0.05, 0.05]
+    for idx in range(4):
+        audio_in.push_frame(_frame(tag=10 + idx))
+    await asyncio.sleep(0.05)
+
+    codes = [f.error_code for f in failures]
+    assert "VOICE_WAKEWORD_TIMEOUT" in codes
+    assert "VOICE_VAD_FAILED" in codes
+    assert "VOICE_TRANSCRIPTION_TIMEOUT" in codes
+    assert all(f.recoverable for f in failures)
+
+    # 4. Subsequent wake word still opens the call without restarting coordinator
+    stt.fail_error = None
+    wake.next_score = 0.91
+    audio_in.push_frame(_frame(tag=50))
+    await asyncio.sleep(0.03)
+    assert _state_of(coordinator) == "listening"
+
+    await coordinator.shutdown()
+
+
+async def test_nova012_ac2_nonblocking_standby_spotter_and_post_wake_dispatch() -> None:
+    bus = OrchestratorEventBus()
+    state_events: list[CallStateChangedEvent] = []
+
+    async def _collect_states(ev: OrchestratorEvent) -> None:
+        if isinstance(ev, CallStateChangedEvent):
+            state_events.append(ev)
+
+    bus.subscribe(_collect_states)
+
+    audio_in = _ScriptedAudioInput()
+    audio_out = _ControlledAudioOutput()
+    wake = _FakeWakeWord()
+    vad = _FakeVad()
+    orch = _FakeOrchestrator(event_bus=bus)
+
+    spotter_started = asyncio.Event()
+    release_spotter = asyncio.Event()
+    inflight_count = 0
+    max_inflight = 0
+
+    class _SlowSpotterStt(_FakeStt):
+        async def transcribe(
+            self,
+            pcm_s16le: bytes,
+            sample_rate_hz: int = 16000,
+        ) -> TranscriptionResult:
+            nonlocal inflight_count, max_inflight
+            inflight_count += 1
+            max_inflight = max(max_inflight, inflight_count)
+            spotter_started.set()
+            try:
+                await release_spotter.wait()
+                return await super().transcribe(pcm_s16le, sample_rate_hz=sample_rate_hz)
+            finally:
+                inflight_count -= 1
+
+    stt = _SlowSpotterStt(
+        transcripts=[
+            "Oye Nova, hola cómo estás",
+            "Oye Nova, comando obsoleto",
+        ]
+    )
+
+    coordinator = VoiceCallCoordinator(
+        audio_input=audio_in,
+        audio_output=audio_out,
+        wake_word=wake,
+        vad=vad,
+        stt=stt,
+        tts=_FakeTts(),
+        orchestrator=orch,
+        event_bus=bus,
+        settings=VoiceCoordinatorSettings(
+            min_speech_frames=2,
+            end_silence_frames=2,
+            enable_wake_earcon=True,
+        ),
+    )
+    await coordinator.start()
+
+    # 1. Speak "Oye Nova, hola cómo estás" in standby -> launches background spotter
+    vad.probs = [0.9, 0.9, 0.05, 0.05]
+    for idx in range(4):
+        audio_in.push_frame(_frame(tag=idx + 1))
+    await asyncio.wait_for(spotter_started.wait(), timeout=1.0)
+
+    # 2. NFR-1 & NFR-2: While spotter STT is blocked, _capture_loop MUST continue draining
+    # audio_input.frames() without blocking and without spawning a second spotter task!
+    vad.probs = [0.9, 0.9, 0.05, 0.05]
+    for idx in range(4):
+        audio_in.push_frame(_frame(tag=20 + idx))
+    await asyncio.sleep(0.04)
+    assert audio_in._queue.empty()
+    assert max_inflight == 1
+
+    # 3. Release spotter -> wakes call AND automatically dispatches "hola cómo estás"
+    release_spotter.set()
+    await asyncio.sleep(0.06)
+
+    assert any(
+        ev.state == "listening" and ev.reason == "wake_word_transcribed"
+        for ev in state_events
+    )
+    assert len(audio_out.played) >= 1
+    assert [u[0] for u in orch.utterances] == ["hola cómo estás"]
+
+    # 4. Return to standby, start another slow spotter, then open call via OpenWakeWord ->
+    # stale spotter must be cancelled and must NOT dispatch "comando obsoleto"
+    await coordinator.end_call(reason="manual_call_end")
+    spotter_started.clear()
+    release_spotter.clear()
+    vad.probs = [0.9, 0.9, 0.05, 0.05]
+    for idx in range(4):
+        audio_in.push_frame(_frame(tag=40 + idx))
+    await asyncio.wait_for(spotter_started.wait(), timeout=1.0)
+
+    wake.next_score = 0.92
+    audio_in.push_frame(_frame(tag=99))
+    await asyncio.sleep(0.03)
+    wake.next_score = 0.05
+    release_spotter.set()
+    await asyncio.sleep(0.04)
+
+    assert _state_of(coordinator) == "listening"
+    assert [u[0] for u in orch.utterances] == ["hola cómo estás"]
+
+    await coordinator.shutdown()
+
+
+async def test_nova012_ac3_capture_loop_reopens_stream_after_transient_eof_or_error() -> None:
+    bus = OrchestratorEventBus()
+    failures: list[RunnerFailureEvent] = []
+
+    async def _collect_failures(ev: OrchestratorEvent) -> None:
+        if isinstance(ev, RunnerFailureEvent):
+            failures.append(ev)
+
+    bus.subscribe(_collect_failures)
+
+    class _CountingAudioInput(_ScriptedAudioInput):
+        def __init__(self) -> None:
+            super().__init__()
+            self.open_count = 0
+
+        async def frames(self) -> AsyncIterator[AudioFrame]:
+            self.open_count += 1
+            async for item in super().frames():
+                yield item
+
+    audio_in = _CountingAudioInput()
+    wake = _FakeWakeWord()
+    orch = _FakeOrchestrator(event_bus=bus)
+
+    coordinator = VoiceCallCoordinator(
+        audio_input=audio_in,
+        audio_output=_ControlledAudioOutput(),
+        wake_word=wake,
+        vad=_FakeVad(),
+        stt=_FakeStt(),
+        tts=_FakeTts(),
+        orchestrator=orch,
+        event_bus=bus,
+        settings=VoiceCoordinatorSettings(
+            capture_retry_delay_seconds=0.02,
+            enable_wake_earcon=False,
+        ),
+    )
+    await coordinator.start()
+    await asyncio.sleep(0.01)
+    assert audio_in.open_count == 1
+
+    # 1. Transient PipeWire error -> publishes recoverable failure and reopens frames()
+    audio_in.push_error(
+        VoicePipelineError(
+            code="VOICE_DEVICE_UNAVAILABLE",
+            message="PipeWire node reset",
+        )
+    )
+    await asyncio.sleep(0.05)
+    assert audio_in.open_count == 2
+
+    # 2. Unexpected stream EOF while still started -> publishes failure and reopens frames()
+    audio_in.close_stream()
+    await asyncio.sleep(0.05)
+    assert audio_in.open_count == 3
+
+    codes = {f.error_code for f in failures}
+    assert "VOICE_DEVICE_UNAVAILABLE" in codes
+    assert "VOICE_AUDIO_STREAM_EOF" in codes
+
+    # 3. Wake word after stream recovery opens call cleanly
+    wake.next_score = 0.90
+    audio_in.push_frame(_frame(tag=7))
+    await asyncio.sleep(0.03)
+    assert _state_of(coordinator) == "listening"
+
+    await coordinator.shutdown()
+
+
+async def test_nova012_ac2_two_breath_wake_then_hola_during_spotter_flight() -> None:
+    bus = OrchestratorEventBus()
+    audio_in = _ScriptedAudioInput()
+    audio_out = _ControlledAudioOutput()
+    vad = _FakeVad()
+    orch = _FakeOrchestrator(event_bus=bus)
+
+    spotter_started = asyncio.Event()
+    release_spotter = asyncio.Event()
+    first_call = True
+
+    class _TwoBreathStt(_FakeStt):
+        async def transcribe(
+            self,
+            pcm_s16le: bytes,
+            sample_rate_hz: int = 16000,
+        ) -> TranscriptionResult:
+            nonlocal first_call
+            if first_call:
+                first_call = False
+                spotter_started.set()
+                await release_spotter.wait()
+            return await super().transcribe(pcm_s16le, sample_rate_hz=sample_rate_hz)
+
+    stt = _TwoBreathStt(transcripts=["Oye Nova", "Hola"])
+
+    coordinator = VoiceCallCoordinator(
+        audio_input=audio_in,
+        audio_output=audio_out,
+        wake_word=_FakeWakeWord(),
+        vad=vad,
+        stt=stt,
+        tts=_FakeTts(),
+        orchestrator=orch,
+        event_bus=bus,
+        settings=VoiceCoordinatorSettings(
+            min_speech_frames=2,
+            end_silence_frames=2,
+            enable_wake_earcon=False,
+        ),
+    )
+    await coordinator.start()
+
+    # 1. User says "Oye Nova" -> background spotter starts
+    vad.probs = [0.9, 0.9, 0.05, 0.05]
+    for idx in range(4):
+        audio_in.push_frame(_frame(tag=idx + 1))
+    await asyncio.wait_for(spotter_started.wait(), timeout=1.0)
+
+    # 2. While Whisper is still transcribing "Oye Nova", user already says "Hola"
+    vad.probs = [0.9, 0.9, 0.05, 0.05]
+    for idx in range(4):
+        audio_in.push_frame(_frame(tag=30 + idx))
+    await asyncio.sleep(0.03)
+
+    # 3. Spotter finishes "Oye Nova" -> opens call AND preserves queued "Hola" turn!
+    release_spotter.set()
+    await asyncio.sleep(0.06)
+
+    assert [u[0] for u in orch.utterances] == ["Hola"]
+    await coordinator.shutdown()
+
+
+
+
 
