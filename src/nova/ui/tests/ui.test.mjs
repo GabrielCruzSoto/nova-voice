@@ -2071,3 +2071,81 @@ test("NOVA-008 T5: Settings drawer, XSS escaping, Hold-to-Talk button, and contr
   ctrl.dispose();
 });
 
+test("NOVA-010: Health check probe and COMPONENTS_MISSING banner alert", async () => {
+  // 1. resolveHumanNotice uses dynamic missing components message
+  const banner = resolveHumanNotice("COMPONENTS_MISSING", "Faltan componentes necesarios: pi, agy.");
+  assert.equal(banner.code, "COMPONENTS_MISSING");
+  assert.equal(banner.message, "Faltan componentes necesarios: pi, agy.");
+  assert.equal(banner.dismissible, true);
+
+  // 2. Fallback when customMessage is omitted
+  const fallbackBanner = resolveHumanNotice("COMPONENTS_MISSING");
+  assert.match(fallbackBanner.message, /Faltan componentes necesarios/);
+
+  // 3. Controller probes /api/health on startup and renders alert
+  const requests = [];
+  const renders = [];
+  const fakeFetch = async (url) => {
+    requests.push(url);
+    if (url === "/api/state") {
+      return new Response(
+        JSON.stringify({
+          schema_version: "1.3.0",
+          csrf_token: "csrf-health-test",
+          voice_enabled: true,
+          call_session: { call_id: "c-1", state: "standby", turn_count: 0 },
+          active_workspace: null,
+          available_workspaces: [],
+          pending_approvals: [],
+          messages: [],
+        }),
+        { status: 200 },
+      );
+    }
+    if (url === "/api/health") {
+      return new Response(
+        JSON.stringify({
+          all_ok: false,
+          missing_critical_count: 2,
+          missing_optional_count: 0,
+          components: [
+            { name: "pi", category: "cli", installed: false, required: true },
+            { name: "audio_capture", category: "audio", installed: false, required: true },
+          ],
+          alert_message: "Faltan componentes necesarios: pi, audio_capture. Por favor instalalos.",
+        }),
+        { status: 200 },
+      );
+    }
+    if (url === "/api/events") {
+      return new Response(new ReadableStream(), { status: 200 });
+    }
+    return new Response("{}", { status: 404 });
+  };
+
+  const ctrl = new DesktopAppController({
+    fetchImpl: fakeFetch,
+    onRender: (html) => renders.push(html),
+  });
+  await ctrl.start();
+
+  assert.ok(requests.includes("/api/health"), "Controller must probe /api/health on startup");
+  assert.equal(ctrl.model.noticeBanner?.code, "COMPONENTS_MISSING");
+  assert.equal(
+    ctrl.model.noticeBanner?.message,
+    "Faltan componentes necesarios: pi, audio_capture. Por favor instalalos.",
+  );
+
+  const lastHtml = renders[renders.length - 1];
+  assert.match(lastHtml, /data-slot="notice"[^>]*\srole="alert"/);
+  assert.match(lastHtml, /data-error-code="COMPONENTS_MISSING"/);
+  assert.match(lastHtml, /pi, audio_capture/);
+
+  // User can dismiss notice
+  ctrl.dismissNotice();
+  assert.equal(ctrl.model.noticeBanner, null);
+
+  ctrl.dispose();
+});
+
+

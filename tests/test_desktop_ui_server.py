@@ -552,3 +552,71 @@ async def test_nfr1_sse_latency_under_50ms_and_full_op3_op4_op5_roundtrip(
         assert hub.subscriber_count == 0
 
     hub.close()
+
+
+async def test_get_api_health_endpoint_returns_diagnostics_report(tmp_path: Path) -> None:
+    from nova.application.health_diagnostics import (
+        ComponentCheckResult,
+        SystemHealthReport,
+    )
+
+    fake_report = SystemHealthReport(
+        all_ok=False,
+        missing_critical_count=1,
+        missing_optional_count=0,
+        components=[
+            ComponentCheckResult(
+                name="pi",
+                category="cli",
+                installed=False,
+                required=True,
+                details="Not found",
+                remedy="Install Pi CLI",
+            )
+        ],
+        alert_message="Faltan componentes necesarios: pi.",
+    )
+
+    root = tmp_path / "Proyectos"
+    root.mkdir()
+    bus = OrchestratorEventBus()
+    resolver = LocalWorkspaceResolver(allowed_roots=[root], event_bus=bus)
+    orch = NovaOrchestrator(
+        workspace_resolver=resolver,
+        tier1_client=_StubTier1(),
+        tier2_runner=_StubTier2(),
+        event_bus=bus,
+    )
+    hub = UiStateHub(event_bus=bus)
+    server = DesktopUiServer(
+        orchestrator=orch,
+        state_hub=hub,
+        event_bus=bus,
+        health_report_provider=lambda: fake_report,
+    )
+    async with server:
+        port = server.port
+        # 1. Unauthenticated -> 403
+        st_unauth, _, _ = await _raw_http_request(port, "GET", "/api/health")
+        assert st_unauth == 403
+
+        # 2. Authenticated -> 200 with report
+        st_idx, hdrs_idx, _ = await _raw_http_request(port, "GET", "/")
+        assert st_idx == 200
+        cookie = hdrs_idx["set-cookie"].split(";")[0]
+
+        st_health, _, body = await _raw_http_request(
+            port,
+            "GET",
+            "/api/health",
+            headers={"Cookie": cookie},
+        )
+        assert st_health == 200
+        payload = json.loads(body)
+        assert payload["all_ok"] is False
+        assert payload["missing_critical_count"] == 1
+        assert payload["alert_message"] == "Faltan componentes necesarios: pi."
+        assert payload["components"][0]["name"] == "pi"
+        assert payload["components"][0]["installed"] is False
+
+    hub.close()

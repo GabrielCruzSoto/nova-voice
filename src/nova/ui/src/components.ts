@@ -432,12 +432,22 @@ const ERROR_CATALOG: Readonly<Record<string, string>> = {
   UI_PAYLOAD_TOO_LARGE: "El tamaño del contenido supera el límite permitido.",
   UI_FORBIDDEN_ORIGIN_OR_CSRF: "La solicitud fue rechazada por seguridad.",
   ORCHESTRATOR_UNEXPECTED_FAILURE: "Ocurrió un error inesperado al procesar la solicitud.",
+  COMPONENTS_MISSING: "Faltan componentes necesarios para el funcionamiento de Nova.",
 };
 
 const GENERIC_ERROR_FALLBACK = "Ocurrió un error inesperado al procesar la solicitud.";
 
-export function resolveHumanNotice(code: string): UiNoticeBanner {
-  const message = ERROR_CATALOG[code] ?? GENERIC_ERROR_FALLBACK;
+export function resolveHumanNotice(code: string, customMessage?: string): UiNoticeBanner {
+  let message: string;
+  if (code === "COMPONENTS_MISSING" && customMessage && customMessage.trim().length > 0) {
+    message = customMessage.trim();
+  } else {
+    message =
+      ERROR_CATALOG[code] ??
+      (customMessage && customMessage.trim().length > 0
+        ? customMessage.trim()
+        : GENERIC_ERROR_FALLBACK);
+  }
   return {
     code,
     message,

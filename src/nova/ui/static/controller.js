@@ -66,6 +66,24 @@ export class DesktopAppController {
             }
             const snapshot = (await resp.json());
             this.#applySnapshot(snapshot);
+            try {
+                const healthResp = await this.#fetch("/api/health", {
+                    method: "GET",
+                    credentials: "same-origin",
+                    signal: this.#abortController.signal,
+                });
+                if (healthResp.ok) {
+                    const healthData = (await healthResp.json());
+                    if (!healthData.all_ok && healthData.alert_message) {
+                        this.#updateModel({
+                            noticeBanner: resolveHumanNotice("COMPONENTS_MISSING", healthData.alert_message),
+                        });
+                    }
+                }
+            }
+            catch {
+                // Non-blocking health probe
+            }
             void this.#consumeSseLoop();
         }
         catch (err) {
@@ -539,7 +557,8 @@ export class DesktopAppController {
         }
         if (env.event_type === "runner_failure") {
             const errorCode = String(p["error_code"] ?? "ORCHESTRATOR_UNEXPECTED_FAILURE");
-            this.#updateModel({ noticeBanner: resolveHumanNotice(errorCode) });
+            const customMsg = typeof p["sanitized_message"] === "string" ? p["sanitized_message"] : "";
+            this.#updateModel({ noticeBanner: resolveHumanNotice(errorCode, customMsg) });
             return;
         }
         if (env.event_type === "command_blocked") {

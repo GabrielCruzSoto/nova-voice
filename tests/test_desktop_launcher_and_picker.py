@@ -527,3 +527,43 @@ async def test_ac10_runtime_close_terminates_and_reaps_spawned_ui_subprocess_wit
         except ProcessLookupError:
             pass
 
+
+async def test_runtime_runs_preflight_health_check_and_publishes_warning(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    empty_home = tmp_path / "empty_home"
+    empty_home.mkdir()
+    monkeypatch.setattr(Path, "home", lambda: empty_home)
+    from nova.domain.events import RunnerFailureEvent
+
+    cfg = NovaDesktopConfig(
+        port=0,
+        allowed_roots=(str(tmp_path),),
+        open_browser=False,
+        enable_voice=False,
+        pi_executable="non_existent_pi_binary",
+        ipc_runtime_dir=str(tmp_path / "sock"),
+    )
+
+    events: list[object] = []
+
+    async def collect(ev: object) -> None:
+        events.append(ev)
+
+    runtime = NovaDesktopRuntime(
+        cfg,
+        which_resolver=lambda _c: None,
+    )
+    runtime.event_bus.subscribe(collect)
+
+    async with runtime:
+        assert runtime.health_report is not None
+        assert runtime.health_report.all_ok is False
+        assert runtime.health_report.missing_critical_count >= 1
+
+        failures = [e for e in events if isinstance(e, RunnerFailureEvent)]
+        assert len(failures) == 1
+        assert failures[0].error_code == "COMPONENTS_MISSING"
+        assert "pi" in failures[0].sanitized_message
+
+
