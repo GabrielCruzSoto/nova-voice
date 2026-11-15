@@ -14,7 +14,7 @@ from typing import Any
 
 CONTROL_IPC_SCHEMA = "nova.control.ipc.v1"
 VALID_CONTROL_ACTIONS: frozenset[str] = frozenset(
-    {"ptt-toggle", "toggle-panel", "barge-in", "ping"}
+    {"ptt-toggle", "toggle-panel", "barge-in", "ping", "quit"}
 )
 MAX_CONTROL_LINE_BYTES = 1024
 

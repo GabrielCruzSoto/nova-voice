@@ -567,3 +567,105 @@ async def test_runtime_runs_preflight_health_check_and_publishes_warning(
         assert "pi" in failures[0].sanitized_message
 
 
+async def test_run_desktop_daemon_exits_cleanly_via_http_shutdown_and_control_quit(
+    tmp_path: Path,
+) -> None:
+    from nova.adapters.control_ipc import resolve_control_socket_path, send_control_command
+    from nova.adapters.desktop_launcher import run_desktop_daemon
+
+    # 1. Shutdown via `nova control quit` (AC-4 & AC-6)
+    sock_dir_ipc = tmp_path / "sock_ipc"
+    cfg_ipc = NovaDesktopConfig(
+        port=0,
+        allowed_roots=(str(tmp_path),),
+        open_browser=False,
+        enable_voice=False,
+        ipc_runtime_dir=str(sock_dir_ipc),
+    )
+    control_sock = resolve_control_socket_path(runtime_base_dir=sock_dir_ipc)
+    daemon_task = asyncio.create_task(run_desktop_daemon(cfg_ipc))
+    try:
+        for _ in range(50):
+            if _path_exists(control_sock):
+                break
+            await asyncio.sleep(0.05)
+        assert _path_exists(control_sock)
+
+        resp = await asyncio.to_thread(
+            send_control_command,
+            "quit",
+            socket_path=control_sock,
+        )
+        assert resp == {
+            "schema": "nova.control.ipc.v1",
+            "ok": True,
+            "action": "quit",
+            "status": "shutting_down",
+        }
+        rc = await asyncio.wait_for(daemon_task, timeout=5.0)
+        assert rc == 0
+        assert not _path_exists(control_sock)
+    finally:
+        if not daemon_task.done():
+            daemon_task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await daemon_task
+
+    # 2. Shutdown via `POST /api/shutdown` with voice disabled (AC-1 & AC-6)
+    sock_dir_http = tmp_path / "sock_http"
+    cfg_http = NovaDesktopConfig(
+        port=0,
+        allowed_roots=(str(tmp_path),),
+        open_browser=False,
+        enable_voice=False,
+        ipc_runtime_dir=str(sock_dir_http),
+    )
+    runtime = NovaDesktopRuntime(cfg_http)
+    async with runtime:
+        import http.client
+
+        def _send_http_shutdown(port: int, base_url: str) -> tuple[int, dict[str, object]]:
+            conn = http.client.HTTPConnection("127.0.0.1", port, timeout=3.0)
+            try:
+                conn.request("GET", "/", headers={"Host": f"127.0.0.1:{port}"})
+                r_idx = conn.getresponse()
+                cookie = (r_idx.getheader("Set-Cookie") or "").split(";")[0]
+                r_idx.read()
+                conn.request(
+                    "GET",
+                    "/api/state",
+                    headers={"Host": f"127.0.0.1:{port}", "Cookie": cookie},
+                )
+                r_st = conn.getresponse()
+                csrf = json.loads(r_st.read().decode("utf-8"))["csrf_token"]
+                conn.request(
+                    "POST",
+                    "/api/shutdown",
+                    body=b"{}",
+                    headers={
+                        "Host": f"127.0.0.1:{port}",
+                        "Origin": base_url,
+                        "Cookie": cookie,
+                        "X-Nova-CSRF": csrf,
+                        "Content-Type": "application/json",
+                    },
+                )
+                r_sh = conn.getresponse()
+                parsed: dict[str, object] = json.loads(r_sh.read().decode("utf-8"))
+                return (r_sh.status, parsed)
+            finally:
+                conn.close()
+
+        status_code, body_dict = await asyncio.to_thread(
+            _send_http_shutdown, runtime.port, runtime.base_url
+        )
+        assert status_code == 202
+        assert body_dict == {"status": "shutting_down"}
+
+        await asyncio.wait_for(runtime.wait_for_shutdown(), timeout=2.0)
+        # Idempotent repeated request_shutdown
+        runtime.request_shutdown("duplicate_check")
+        assert runtime.shutdown_requested is True
+
+
+

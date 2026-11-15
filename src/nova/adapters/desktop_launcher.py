@@ -38,6 +38,7 @@ from nova.adapters.vad_silero import SileroVadAdapter, SileroVadSettings
 from nova.adapters.wakeword_openwakeword import OpenWakeWordAdapter, OpenWakeWordSettings
 from nova.adapters.workspace_resolver import LocalWorkspaceResolver
 from nova.application.health_diagnostics import (
+    SystemHealthReport,
     check_system_components,
     resolve_model_path,
 )
@@ -501,12 +502,28 @@ class NovaDesktopRuntime:
         self._gatekeeper: SecurityGatekeeper | None = None
         self._reap_tasks: set[asyncio.Task[int]] = set()
         self._spawned_processes: set[BrowserProcessProtocol] = set()
+        self._shutdown_event = asyncio.Event()
         self._voice_enabled = False
-        self._health_report: Any = None
+        self._health_report: SystemHealthReport | None = None
         self._started = False
 
     @property
-    def health_report(self) -> Any:
+    def shutdown_requested(self) -> bool:
+        """Return True once an orderly shutdown has been requested."""
+        return self._shutdown_event.is_set()
+
+    def request_shutdown(self, reason: str = "requested") -> None:
+        """Idempotently request orderly runtime shutdown from HTTP, IPC, or POSIX signal."""
+        if not self._shutdown_event.is_set():
+            self._log("desktop_shutdown_requested", reason=reason)
+            self._shutdown_event.set()
+
+    async def wait_for_shutdown(self) -> None:
+        """Wait until `request_shutdown` signals daemon termination."""
+        await self._shutdown_event.wait()
+
+    @property
+    def health_report(self) -> SystemHealthReport | None:
         return self._health_report
 
     @property
@@ -620,6 +637,9 @@ class NovaDesktopRuntime:
             elif self._orchestrator is not None:
                 await self._orchestrator.barge_in()
             return {"ok": True, "action": action}
+        if action == "quit":
+            asyncio.get_running_loop().call_soon(self.request_shutdown, "control_ipc")
+            return {"ok": True, "action": "quit", "status": "shutting_down"}
         return {"ok": False, "action": action}
 
     async def __aenter__(self) -> NovaDesktopRuntime:
@@ -789,6 +809,7 @@ class NovaDesktopRuntime:
                 folder_picker=self._folder_picker,
                 settings_service=settings_service,
                 health_report_provider=lambda: self._health_report,
+                shutdown_callback=self.request_shutdown,
                 settings=DesktopUiServerSettings(host="127.0.0.1", port=self._config.port),
             )
             await ui_server.start()
@@ -807,7 +828,10 @@ class NovaDesktopRuntime:
                     RunnerFailureEvent(
                         correlation_id="corr-startup-health",
                         error_code="COMPONENTS_MISSING",
-                        sanitized_message=self._health_report.alert_message or "Faltan componentes necesarios.",
+                        sanitized_message=(
+                            self._health_report.alert_message
+                            or "Faltan componentes necesarios."
+                        ),
                         recoverable=True,
                     )
                 )
@@ -1298,23 +1322,23 @@ def config_from_namespace(
 
 
 async def run_desktop_daemon(config: NovaDesktopConfig) -> int:
-    """Run `NovaDesktopRuntime` until `SIGINT` or `SIGTERM` triggers orderly teardown."""
-    stop_event = asyncio.Event()
+    """Run `NovaDesktopRuntime` until `SIGINT`, `SIGTERM`, HTTP, or IPC triggers teardown."""
+    runtime = NovaDesktopRuntime(config)
     loop = asyncio.get_running_loop()
     installed_signals: list[signal.Signals] = []
     for sig in (signal.SIGINT, signal.SIGTERM):
         with contextlib.suppress(NotImplementedError, RuntimeError):
-            loop.add_signal_handler(sig, stop_event.set)
+            loop.add_signal_handler(sig, runtime.request_shutdown, "posix_signal")
             installed_signals.append(sig)
 
     try:
-        async with NovaDesktopRuntime(config) as runtime:
+        async with runtime:
             sys.stdout.write(
                 f"Nova Desktop UI ready at {runtime.base_url} "
                 f"(voice_enabled={str(runtime.voice_enabled).lower()})\n"
             )
             sys.stdout.flush()
-            await stop_event.wait()
+            await runtime.wait_for_shutdown()
         return 0
     finally:
         for sig in installed_signals:

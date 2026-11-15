@@ -620,3 +620,98 @@ async def test_get_api_health_endpoint_returns_diagnostics_report(tmp_path: Path
         assert payload["components"][0]["installed"] is False
 
     hub.close()
+
+
+async def test_post_api_shutdown_enforces_csrf_and_triggers_idempotent_callback(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "Proyectos"
+    root.mkdir()
+    bus = OrchestratorEventBus()
+    resolver = LocalWorkspaceResolver(allowed_roots=[root], event_bus=bus)
+    orch = NovaOrchestrator(
+        workspace_resolver=resolver,
+        tier1_client=_StubTier1(),
+        tier2_runner=_StubTier2(),
+        event_bus=bus,
+    )
+    hub = UiStateHub(event_bus=bus)
+    shutdown_reasons: list[str] = []
+
+    server_unconfigured = DesktopUiServer(orchestrator=orch, state_hub=hub, event_bus=bus)
+    async with server_unconfigured:
+        port_u = server_unconfigured.port
+        _, hdrs_u, _ = await _raw_http_request(port_u, "GET", "/")
+        cookie_u = hdrs_u["set-cookie"].split(";")[0]
+        _, _, st_body_u = await _raw_http_request(
+            port_u, "GET", "/api/state", headers={"Cookie": cookie_u}
+        )
+        csrf_u = json.loads(st_body_u)["csrf_token"]
+        st_503, _, body_503 = await _raw_http_request(
+            port_u,
+            "POST",
+            "/api/shutdown",
+            headers={
+                "Cookie": cookie_u,
+                "Origin": f"http://127.0.0.1:{port_u}",
+                "X-Nova-CSRF": csrf_u,
+                "Content-Type": "application/json",
+            },
+            body=b"{}",
+        )
+        assert st_503 == 503
+        assert json.loads(body_503)["error_code"] == "UI_SHUTDOWN_UNAVAILABLE"
+
+    server = DesktopUiServer(
+        orchestrator=orch,
+        state_hub=hub,
+        event_bus=bus,
+        shutdown_callback=shutdown_reasons.append,
+    )
+    async with server:
+        port = server.port
+        _, hdrs_idx, _ = await _raw_http_request(port, "GET", "/")
+        cookie = hdrs_idx["set-cookie"].split(";")[0]
+        _, _, st_body = await _raw_http_request(
+            port, "GET", "/api/state", headers={"Cookie": cookie}
+        )
+        csrf = json.loads(st_body)["csrf_token"]
+
+        # AC-5: Invalid Origin -> 403 UI_FORBIDDEN_ORIGIN_OR_CSRF
+        st_unauth, _, unauth_body = await _raw_http_request(
+            port,
+            "POST",
+            "/api/shutdown",
+            headers={
+                "Cookie": cookie,
+                "Origin": "https://evil.example",
+                "X-Nova-CSRF": csrf,
+                "Content-Type": "application/json",
+            },
+            body=b"{}",
+        )
+        assert st_unauth == 403
+        assert json.loads(unauth_body)["error_code"] == "UI_FORBIDDEN_ORIGIN_OR_CSRF"
+        assert shutdown_reasons == []
+
+        # AC-1 & AC-6: Valid shutdown requests return 202 and invoke callback idempotently
+        valid_headers = {
+            "Cookie": cookie,
+            "Origin": f"http://127.0.0.1:{port}",
+            "X-Nova-CSRF": csrf,
+            "Content-Type": "application/json",
+        }
+        st_ok1, _, ok_body1 = await _raw_http_request(
+            port, "POST", "/api/shutdown", headers=valid_headers, body=b"{}"
+        )
+        st_ok2, _, ok_body2 = await _raw_http_request(
+            port, "POST", "/api/shutdown", headers=valid_headers, body=b"{}"
+        )
+        assert st_ok1 == 202
+        assert st_ok2 == 202
+        assert json.loads(ok_body1) == {"status": "shutting_down"}
+        assert json.loads(ok_body2) == {"status": "shutting_down"}
+        await asyncio.sleep(0.02)
+        assert shutdown_reasons == ["ui_http", "ui_http"]
+    hub.close()
+

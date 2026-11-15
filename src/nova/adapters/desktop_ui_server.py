@@ -158,6 +158,7 @@ class DesktopUiServer:
         folder_picker: FolderPickerPort | None = None,
         settings_service: SettingsService | None = None,
         health_report_provider: Callable[[], Any] | None = None,
+        shutdown_callback: Callable[[str], None] | None = None,
         static_dir: Path | None = None,
         settings: DesktopUiServerSettings | None = None,
         clock: Callable[[], float] = time.monotonic,
@@ -170,6 +171,7 @@ class DesktopUiServer:
         self._folder_picker = folder_picker
         self._settings_service = settings_service
         self._health_report_provider = health_report_provider
+        self._shutdown_callback = shutdown_callback
         self._static_dir = static_dir or _default_static_dir()
         self._settings = settings or DesktopUiServerSettings()
         self._clock = clock
@@ -884,6 +886,25 @@ class DesktopUiServer:
             payload = self._parse_json_object(body_bytes)
         except DesktopUiError as exc:
             await self._write_error(writer, 400, exc.code, exc.sanitized_message, corr_id)
+            return
+
+        if path == "/api/shutdown":
+            if self._shutdown_callback is None:
+                await self._write_error(
+                    writer,
+                    503,
+                    "UI_SHUTDOWN_UNAVAILABLE",
+                    "Runtime shutdown handler is not configured.",
+                    corr_id,
+                )
+                return
+            await self._write_json(
+                writer,
+                202,
+                {"status": "shutting_down"},
+                corr_id,
+            )
+            asyncio.get_running_loop().call_soon(self._shutdown_callback, "ui_http")
             return
 
         if path == "/api/chat":
