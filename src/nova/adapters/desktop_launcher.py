@@ -37,6 +37,10 @@ from nova.adapters.tts_local_onnx import LocalOnnxTtsAdapter, LocalOnnxTtsSettin
 from nova.adapters.vad_silero import SileroVadAdapter, SileroVadSettings
 from nova.adapters.wakeword_openwakeword import OpenWakeWordAdapter, OpenWakeWordSettings
 from nova.adapters.workspace_resolver import LocalWorkspaceResolver
+from nova.application.health_diagnostics import (
+    check_system_components,
+    resolve_model_path,
+)
 from nova.application.orchestrator import NovaOrchestrator, OrchestratorSettings
 from nova.application.security_gatekeeper import SecurityGatekeeper
 from nova.application.settings_service import SettingsService
@@ -636,8 +640,6 @@ class NovaDesktopRuntime:
             return
 
         try:
-            from nova.application.health_diagnostics import check_system_components
-
             self._health_report = check_system_components(
                 self._config,
                 which_resolver=self._which_resolver,
@@ -1098,75 +1100,6 @@ def build_arg_parser() -> argparse.ArgumentParser:
         help="Local wake-word model path to import.",
     )
     return parser
-
-
-def resolve_model_path(
-    filename: str,
-    explicit_param: str | None = None,
-    models_dir: str | None = None,
-    source_root: Path | None = None,
-) -> Path | None:
-    """Resolve a voice model path evaluating canonical 6-step precedence (OP-2, AC-12)."""
-    # Step 1: Explicit parameter for the model
-    if explicit_param:
-        explicit_path = Path(explicit_param).expanduser().resolve()
-        if explicit_path.is_file():
-            return explicit_path
-
-    # Step 2: --models-dir CLI flag
-    if models_dir is not None:
-        md_path = Path(models_dir).expanduser().resolve()
-        if not md_path.is_dir():
-            raise ValueError(f"Models directory not found: {models_dir}")
-        candidate = md_path / filename
-        if candidate.is_file():
-            return candidate
-
-    # Step 3: NOVA_MODELS_DIR environment variable
-    env_models_dir = os.environ.get("NOVA_MODELS_DIR")
-    if env_models_dir:
-        env_path = Path(env_models_dir).expanduser().resolve()
-        if not env_path.is_dir():
-            raise ValueError(f"NOVA_MODELS_DIR directory not found: {env_models_dir}")
-        candidate = env_path / filename
-        if candidate.is_file():
-            return candidate
-
-    # Step 4: User data directory (~/.local/share/nova/models or $XDG_DATA_HOME/nova/models)
-    xdg_data = os.environ.get("XDG_DATA_HOME")
-    user_models_dir = (
-        Path(xdg_data) / "nova" / "models"
-        if xdg_data
-        else Path.home() / ".local" / "share" / "nova" / "models"
-    )
-    user_candidate = user_models_dir / filename
-    if user_candidate.is_file():
-        return user_candidate
-
-    # Step 5: Global system installation (/opt/nova/models)
-    sys_candidate = Path("/opt/nova/models") / filename
-    if sys_candidate.is_file():
-        return sys_candidate
-
-    # Step 6: Source development checkout (<source_root>/models)
-    running_in_packaged_venv = sys.prefix.startswith("/opt/nova") or str(
-        Path(__file__).resolve()
-    ).startswith("/opt/nova")
-    if not running_in_packaged_venv:
-        dev_root = source_root
-        if dev_root is None:
-            for parent in Path(__file__).resolve().parents:
-                if (parent / "pyproject.toml").is_file() or (parent / ".git").is_dir():
-                    dev_root = parent
-                    break
-        if dev_root is not None and (
-            (dev_root / "pyproject.toml").is_file() or (dev_root / ".git").is_dir()
-        ):
-            src_candidate = dev_root / "models" / filename
-            if src_candidate.is_file():
-                return src_candidate
-
-    return None
 
 
 def _pick_setting_str(

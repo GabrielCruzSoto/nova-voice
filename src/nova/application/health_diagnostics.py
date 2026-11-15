@@ -4,14 +4,24 @@ from __future__ import annotations
 
 import os
 import shutil
+import sys
 from collections.abc import Callable
 from pathlib import Path
-from typing import TYPE_CHECKING, Literal
+from typing import Any, Literal, Protocol, runtime_checkable
 
 from pydantic import BaseModel, ConfigDict, Field
 
-if TYPE_CHECKING:
-    from nova.adapters.desktop_launcher import NovaDesktopConfig
+
+@runtime_checkable
+class DiagnosticsConfig(Protocol):
+    """Protocol for desktop launcher configuration needed by diagnostics."""
+
+    pi_executable: str
+    agy_executable: str
+    enable_voice: bool
+    wakeword_models: list[str]
+    silero_vad_model_path: str | None
+    piper_model_path: str | None
 
 
 WhichResolver = Callable[[str], str | None]
@@ -58,14 +68,81 @@ def _resolve_cli_binary(
     return False, None
 
 
+def resolve_model_path(
+    filename: str,
+    explicit_param: str | None = None,
+    models_dir: str | None = None,
+    source_root: Path | None = None,
+) -> Path | None:
+    """Resolve a voice model path evaluating canonical 6-step precedence (OP-2, AC-12)."""
+    # Step 1: Explicit parameter for the model
+    if explicit_param:
+        explicit_path = Path(explicit_param).expanduser().resolve()
+        if explicit_path.is_file():
+            return explicit_path
+
+    # Step 2: --models-dir CLI flag
+    if models_dir is not None:
+        md_path = Path(models_dir).expanduser().resolve()
+        if not md_path.is_dir():
+            raise ValueError(f"Models directory not found: {models_dir}")
+        candidate = md_path / filename
+        if candidate.is_file():
+            return candidate
+
+    # Step 3: NOVA_MODELS_DIR environment variable
+    env_models_dir = os.environ.get("NOVA_MODELS_DIR")
+    if env_models_dir:
+        env_path = Path(env_models_dir).expanduser().resolve()
+        if not env_path.is_dir():
+            raise ValueError(f"NOVA_MODELS_DIR directory not found: {env_models_dir}")
+        candidate = env_path / filename
+        if candidate.is_file():
+            return candidate
+
+    # Step 4: User data directory (~/.local/share/nova/models or $XDG_DATA_HOME/nova/models)
+    xdg_data = os.environ.get("XDG_DATA_HOME")
+    user_models_dir = (
+        Path(xdg_data) / "nova" / "models"
+        if xdg_data
+        else Path.home() / ".local" / "share" / "nova" / "models"
+    )
+    user_candidate = user_models_dir / filename
+    if user_candidate.is_file():
+        return user_candidate
+
+    # Step 5: Global system installation (/opt/nova/models)
+    sys_candidate = Path("/opt/nova/models") / filename
+    if sys_candidate.is_file():
+        return sys_candidate
+
+    # Step 6: Source development checkout (<source_root>/models)
+    running_in_packaged_venv = sys.prefix.startswith("/opt/nova") or str(
+        Path(__file__).resolve()
+    ).startswith("/opt/nova")
+    if not running_in_packaged_venv:
+        dev_root = source_root
+        if dev_root is None:
+            for parent in Path(__file__).resolve().parents:
+                if (parent / "pyproject.toml").is_file() or (parent / ".git").is_dir():
+                    dev_root = parent
+                    break
+        if dev_root is not None and (
+            (dev_root / "pyproject.toml").is_file() or (dev_root / ".git").is_dir()
+        ):
+            src_candidate = dev_root / "models" / filename
+            if src_candidate.is_file():
+                return src_candidate
+
+    return None
+
+
 def check_system_components(
-    config: NovaDesktopConfig | None = None,
+    config: DiagnosticsConfig | Any | None = None,
     *,
     which_resolver: WhichResolver = shutil.which,
 ) -> SystemHealthReport:
     """Audit system dependencies and voice models, producing a structured health report."""
-    from nova.adapters.desktop_launcher import resolve_model_path
-
     checks: list[ComponentCheckResult] = []
 
     # 1. Tier 1 Pi CLI
