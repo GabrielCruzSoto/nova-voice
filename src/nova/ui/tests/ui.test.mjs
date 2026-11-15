@@ -2148,4 +2148,141 @@ test("NOVA-010: Health check probe and COMPONENTS_MISSING banner alert", async (
   ctrl.dispose();
 });
 
+test("NOVA-011: Non-voice quit controls in header, settings drawer, and orb widget shut down daemon cleanly", async () => {
+  const baseModel = {
+    status: "empty",
+    voiceEnabled: false,
+    uiMode: "panel",
+    callSession: {
+      call_id: "c-quit",
+      state: "standby",
+      turn_count: 0,
+      active_correlation_id: null,
+    },
+    activeWorkspace: null,
+    availableWorkspaces: [],
+    pendingApprovals: [],
+    messages: [],
+    errorBanner: null,
+    noticeBanner: null,
+    pickerFallbackOpen: false,
+    lastMilestone: null,
+    settingsDrawerOpen: true,
+    settingsLoading: false,
+    settingsData: {
+      schema_version: 1,
+      general: { remember_workspace: true, last_active_workspace: null },
+      audio: { capture_target: null, playback_target: null },
+      voice: {
+        enable_voice: false,
+        sensitivity_preset: "normal",
+        wakeword_threshold: 0.55,
+        speech_threshold: 0.5,
+        barge_in_threshold: 0.65,
+        whisper_model: "small",
+        whisper_language: null,
+        whisper_device: "auto",
+        tts_engine: "kokoro",
+        tts_speed: 1.1,
+        kokoro_voice: "ef_dora",
+      },
+      models: { pi_provider: "github-copilot", pi_model: "gpt-4.1", tier2_model: "claude-opus-5-5-high" },
+      shortcuts: { global_shortcut: "Super+Shift+Space", ptt_mode: "single_turn" },
+    },
+  };
+
+  // 1. Panel header + Settings drawer expose explicit non-voice quit buttons alongside Modo widget
+  const panelHtml = renderAppShell(baseModel);
+  const headerHtml = panelHtml.slice(panelHtml.indexOf('data-slot="header"'), panelHtml.indexOf("</header>"));
+  assert.match(headerHtml, /<button[^>]+type="button"[^>]+data-action="toggle-ui-mode"[^>]*>\s*Modo widget\s*<\/button>/);
+  assert.match(headerHtml, /<button[^>]+type="button"[^>]+data-action="quit-app"[^>]+aria-label="Cerrar Nova"/);
+
+  const settingsHtml = panelHtml.slice(panelHtml.indexOf('data-slot="settings-drawer"'));
+  assert.match(settingsHtml, /<button[^>]+type="button"[^>]+data-action="quit-app"[^>]*>\s*Cerrar Nova\s*<\/button>/);
+
+  // Loading settings drawer also exposes Cerrar Nova so user is never trapped if /api/settings hangs
+  const loadingSettingsHtml = renderAppShell({
+    ...baseModel,
+    settingsLoading: true,
+    settingsData: null,
+  });
+  assert.match(loadingSettingsHtml, /<button[^>]+type="button"[^>]+data-action="quit-app"[^>]*>\s*Cerrar Nova\s*<\/button>/);
+
+  // 2. Compact widget orb mode exposes explicit × close badge button
+  const orbHtml = renderAppShell({ ...baseModel, uiMode: "orb", settingsDrawerOpen: false });
+  assert.match(orbHtml, /<button[^>]+type="button"[^>]+data-action="quit-app"[^>]+aria-label="Cerrar Nova"/);
+
+  // 3. Controller: Modo widget minimizes without shutting down; quitApplication posts /api/shutdown, aborts SSE, and calls onQuitHost
+  const requests = [];
+  let sseSignal = null;
+  let minimizeCalls = 0;
+  let quitHostCalls = 0;
+
+  const fakeFetch = async (url, init = {}) => {
+    requests.push({ url, method: init.method ?? "GET", headers: init.headers ?? {}, body: init.body });
+    if (url === "/api/state") {
+      return new Response(
+        JSON.stringify({
+          schema_version: "1.3.0",
+          csrf_token: "csrf-quit-011",
+          voice_enabled: false,
+          call_session: { call_id: "c-quit", state: "standby", turn_count: 0, active_correlation_id: null },
+          active_workspace: null,
+          available_workspaces: [],
+          pending_approvals: [],
+          messages: [],
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      );
+    }
+    if (url === "/api/health") {
+      return new Response(JSON.stringify({ all_ok: true, alert_message: null }), { status: 200 });
+    }
+    if (url === "/api/events") {
+      sseSignal = init.signal;
+      return new Response(new ReadableStream(), {
+        status: 200,
+        headers: { "Content-Type": "text/event-stream" },
+      });
+    }
+    if (url === "/api/shutdown") {
+      return new Response(JSON.stringify({ status: "shutting_down" }), {
+        status: 202,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+    return new Response("{}", { status: 404 });
+  };
+
+  const ctrl = new DesktopAppController({
+    fetchImpl: fakeFetch,
+    onMinimizeToHost: () => {
+      minimizeCalls += 1;
+    },
+    onQuitHost: () => {
+      quitHostCalls += 1;
+    },
+  });
+  await ctrl.start();
+  await new Promise((r) => setTimeout(r, 20));
+
+  // Modo widget hides panel only, zero /api/shutdown calls
+  await ctrl.toggleUiMode();
+  assert.equal(minimizeCalls, 1);
+  assert.equal(quitHostCalls, 0);
+  assert.equal(requests.filter((r) => r.url === "/api/shutdown").length, 0);
+
+  // Explicit quitApplication shuts down daemon even with voice_enabled=false
+  await ctrl.quitApplication();
+  const shutdownReqs = requests.filter((r) => r.url === "/api/shutdown");
+  assert.equal(shutdownReqs.length, 1);
+  assert.equal(shutdownReqs[0].method, "POST");
+  assert.equal(shutdownReqs[0].headers["X-Nova-CSRF"], "csrf-quit-011");
+  assert.equal(sseSignal.aborted, true, "SSE stream must abort cleanly without reconnect loop");
+  assert.equal(quitHostCalls, 1, "onQuitHost must notify frameless desktop shell");
+  assert.equal(ctrl.model.callSession.state, "closed");
+  assert.equal(ctrl.model.noticeBanner?.code, "APP_SHUTDOWN");
+});
+
+
 

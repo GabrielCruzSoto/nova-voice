@@ -24,6 +24,11 @@ function bootstrapNovaDesktop() {
                 }, 60);
             }
             : undefined,
+        onQuitHost: isFramelessShell
+            ? () => {
+                document.title = "Nova::QUIT_APP";
+            }
+            : undefined,
     });
     void controller.start();
     window.addEventListener("pagehide", () => {

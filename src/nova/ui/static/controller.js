@@ -16,6 +16,7 @@ export class DesktopAppController {
     #root;
     #onRender;
     #onMinimizeToHost;
+    #onQuitHost;
     #model = {
         status: "loading",
         voiceEnabled: false,
@@ -40,6 +41,7 @@ export class DesktopAppController {
         this.#fetch = options.fetchImpl ?? ((url, init) => globalThis.fetch(url, init));
         this.#onRender = options.onRender;
         this.#onMinimizeToHost = options.onMinimizeToHost;
+        this.#onQuitHost = options.onQuitHost;
     }
     get model() {
         return this.#model;
@@ -158,6 +160,47 @@ export class DesktopAppController {
         }
         const nextMode = (this.#model.uiMode ?? "panel") === "orb" ? "panel" : "orb";
         this.#updateModel({ uiMode: nextMode });
+    }
+    async quitApplication() {
+        if (this.#disposed) {
+            return;
+        }
+        try {
+            const resp = await this.#postJson("/api/shutdown", {});
+            if (!resp.ok) {
+                const errBody = await this.#safeParseError(resp);
+                const code = errBody?.error_code ?? "ORCHESTRATOR_UNEXPECTED_FAILURE";
+                this.#updateModel({
+                    noticeBanner: resolveHumanNotice(code),
+                    errorBanner: null,
+                });
+                return;
+            }
+        }
+        catch {
+            if (this.#disposed) {
+                return;
+            }
+        }
+        this.#updateModel({
+            appShuttingDown: true,
+            settingsDrawerOpen: false,
+            callSession: {
+                ...this.#model.callSession,
+                state: "closed",
+                active_correlation_id: null,
+            },
+            errorBanner: null,
+            noticeBanner: {
+                code: "APP_SHUTDOWN",
+                message: "Nova se cerró correctamente.",
+                dismissible: false,
+            },
+        });
+        this.dispose();
+        if (this.#onQuitHost) {
+            this.#onQuitHost();
+        }
     }
     async handleEscapeKey() {
         if (this.#disposed) {
@@ -714,6 +757,9 @@ export class DesktopAppController {
             const action = target.dataset["action"];
             if (action === "toggle-ui-mode") {
                 void this.toggleUiMode();
+            }
+            else if (action === "quit-app") {
+                void this.quitApplication();
             }
             else if (action === "call-start") {
                 void this.triggerCallAction("start");

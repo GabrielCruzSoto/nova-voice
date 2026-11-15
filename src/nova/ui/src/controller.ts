@@ -43,6 +43,7 @@ export interface DesktopControllerOptions {
   readonly fetchImpl?: FetchLike;
   readonly onRender?: (html: string, model: PresentationalAppModel) => void;
   readonly onMinimizeToHost?: (() => void) | undefined;
+  readonly onQuitHost?: (() => void) | undefined;
 }
 
 export class DesktopAppController {
@@ -56,6 +57,7 @@ export class DesktopAppController {
   readonly #root: HTMLElement | null;
   readonly #onRender: ((html: string, model: PresentationalAppModel) => void) | undefined;
   readonly #onMinimizeToHost: (() => void) | undefined;
+  readonly #onQuitHost: (() => void) | undefined;
 
   #model: PresentationalAppModel = {
     status: "loading",
@@ -82,6 +84,7 @@ export class DesktopAppController {
     this.#fetch = options.fetchImpl ?? ((url, init) => globalThis.fetch(url, init));
     this.#onRender = options.onRender;
     this.#onMinimizeToHost = options.onMinimizeToHost;
+    this.#onQuitHost = options.onQuitHost;
   }
 
   get model(): PresentationalAppModel {
@@ -211,6 +214,47 @@ export class DesktopAppController {
     }
     const nextMode = (this.#model.uiMode ?? "panel") === "orb" ? "panel" : "orb";
     this.#updateModel({ uiMode: nextMode });
+  }
+
+  async quitApplication(): Promise<void> {
+    if (this.#disposed) {
+      return;
+    }
+    try {
+      const resp = await this.#postJson("/api/shutdown", {});
+      if (!resp.ok) {
+        const errBody = await this.#safeParseError(resp);
+        const code = errBody?.error_code ?? "ORCHESTRATOR_UNEXPECTED_FAILURE";
+        this.#updateModel({
+          noticeBanner: resolveHumanNotice(code),
+          errorBanner: null,
+        });
+        return;
+      }
+    } catch {
+      if (this.#disposed) {
+        return;
+      }
+    }
+    this.#updateModel({
+      appShuttingDown: true,
+      settingsDrawerOpen: false,
+      callSession: {
+        ...this.#model.callSession,
+        state: "closed",
+        active_correlation_id: null,
+      },
+      errorBanner: null,
+      noticeBanner: {
+        code: "APP_SHUTDOWN",
+        message: "Nova se cerró correctamente.",
+        dismissible: false,
+      },
+    });
+    this.dispose();
+    if (this.#onQuitHost) {
+      this.#onQuitHost();
+    }
   }
 
   async handleEscapeKey(): Promise<void> {
@@ -830,6 +874,8 @@ export class DesktopAppController {
         const action = target.dataset["action"];
         if (action === "toggle-ui-mode") {
           void this.toggleUiMode();
+        } else if (action === "quit-app") {
+          void this.quitApplication();
         } else if (action === "call-start") {
           void this.triggerCallAction("start");
         } else if (action === "call-end") {

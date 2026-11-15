@@ -289,6 +289,15 @@ export function renderWorkspaceBar(active, options, pickerFallbackOpen, callStat
         >
           Modo widget
         </button>
+        <button
+          type="button"
+          class="btn-toggle-view btn-quit-app"
+          data-action="quit-app"
+          title="Cerrar Nova"
+          aria-label="Cerrar Nova"
+        >
+          ✕
+        </button>
       </div>
       <div class="workspace-selection">
         ${chipHtml}
@@ -376,6 +385,7 @@ const ERROR_CATALOG = {
     UI_EMPTY_UTTERANCE: "El mensaje no puede estar vacío.",
     UI_PAYLOAD_TOO_LARGE: "El tamaño del contenido supera el límite permitido.",
     UI_FORBIDDEN_ORIGIN_OR_CSRF: "La solicitud fue rechazada por seguridad.",
+    UI_SHUTDOWN_UNAVAILABLE: "El servicio de apagado no está disponible en este momento.",
     ORCHESTRATOR_UNEXPECTED_FAILURE: "Ocurrió un error inesperado al procesar la solicitud.",
     COMPONENTS_MISSING: "Faltan componentes necesarios para el funcionamiento de Nova.",
 };
@@ -708,6 +718,9 @@ export function renderSettingsDrawer(model) {
             <button type="button" class="btn-icon" data-action="close-settings" aria-label="Cerrar ajustes">✕</button>
           </div>
           <p class="nova-settings-loading">Cargando configuración…</p>
+          <div class="nova-settings-footer">
+            <button type="button" class="btn btn--reject btn-quit-drawer" data-action="quit-app">Cerrar Nova</button>
+          </div>
         </aside>
       </div>
     `.trim();
@@ -828,6 +841,7 @@ export function renderSettingsDrawer(model) {
           </section>
 
           <div class="nova-settings-footer">
+            <button type="button" class="btn btn--reject btn-quit-drawer" data-action="quit-app">Cerrar Nova</button>
             <button type="button" class="btn btn--ghost" data-action="close-settings">Cancelar</button>
             <button type="submit" class="btn btn--primary"${savingAttr}>${model.settingsSaving ? "Guardando…" : "Guardar"}</button>
           </div>
@@ -858,6 +872,15 @@ export function renderAppShell(model) {
               aria-label="Estado de Nova: ${escapeHtml(meta.title)}"
             >
               ${renderNovaSquircleSvg(48, inCall)}
+            </button>
+            <button
+              type="button"
+              class="nova-widget-close-btn"
+              data-action="quit-app"
+              title="Cerrar Nova"
+              aria-label="Cerrar Nova"
+            >
+              ×
             </button>
           </div>
         </div>
