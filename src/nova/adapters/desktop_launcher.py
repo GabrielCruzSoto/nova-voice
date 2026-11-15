@@ -48,7 +48,11 @@ from nova.domain.errors import (
     VoicePipelineError,
     redact_sensitive_text,
 )
-from nova.domain.events import OrchestratorEventBus, UiPanelToggleRequestedEvent
+from nova.domain.events import (
+    OrchestratorEventBus,
+    RunnerFailureEvent,
+    UiPanelToggleRequestedEvent,
+)
 from nova.domain.models import (
     CallSession,
     InferenceDevice,
@@ -494,7 +498,12 @@ class NovaDesktopRuntime:
         self._reap_tasks: set[asyncio.Task[int]] = set()
         self._spawned_processes: set[BrowserProcessProtocol] = set()
         self._voice_enabled = False
+        self._health_report: Any = None
         self._started = False
+
+    @property
+    def health_report(self) -> Any:
+        return self._health_report
 
     @property
     def port(self) -> int:
@@ -627,6 +636,26 @@ class NovaDesktopRuntime:
             return
 
         try:
+            from nova.application.health_diagnostics import check_system_components
+
+            self._health_report = check_system_components(
+                self._config,
+                which_resolver=self._which_resolver,
+            )
+            if not self._health_report.all_ok:
+                self._log(
+                    "preflight_health_check_failed",
+                    missing_critical=self._health_report.missing_critical_count,
+                    missing_optional=self._health_report.missing_optional_count,
+                    alert_message=self._health_report.alert_message or "",
+                )
+                sys.stderr.write(f"\n[AVISO NOVA] {self._health_report.alert_message}\n")
+                for c in self._health_report.components:
+                    if not c.installed:
+                        sys.stderr.write(f"  - [{c.name}]: {c.details}. Solución: {c.remedy}\n")
+                sys.stderr.write("\n")
+                sys.stderr.flush()
+
             workspace_resolver = LocalWorkspaceResolver(
                 allowed_roots=[Path(r) for r in self._config.allowed_roots],
                 event_bus=self._event_bus,
@@ -757,6 +786,7 @@ class NovaDesktopRuntime:
                 voice_coordinator=voice_coord,
                 folder_picker=self._folder_picker,
                 settings_service=settings_service,
+                health_report_provider=lambda: self._health_report,
                 settings=DesktopUiServerSettings(host="127.0.0.1", port=self._config.port),
             )
             await ui_server.start()
@@ -769,6 +799,16 @@ class NovaDesktopRuntime:
             await control_ipc.start()
             self._control_ipc = control_ipc
             self._started = True
+
+            if self._health_report is not None and not self._health_report.all_ok:
+                await self._event_bus.publish(
+                    RunnerFailureEvent(
+                        correlation_id="corr-startup-health",
+                        error_code="COMPONENTS_MISSING",
+                        sanitized_message=self._health_report.alert_message or "Faltan componentes necesarios.",
+                        recoverable=True,
+                    )
+                )
 
             if self._config.open_browser:
                 await open_local_browser_window(

@@ -157,6 +157,7 @@ class DesktopUiServer:
         voice_coordinator: VoiceControlUiPort | None = None,
         folder_picker: FolderPickerPort | None = None,
         settings_service: SettingsService | None = None,
+        health_report_provider: Callable[[], Any] | None = None,
         static_dir: Path | None = None,
         settings: DesktopUiServerSettings | None = None,
         clock: Callable[[], float] = time.monotonic,
@@ -168,6 +169,7 @@ class DesktopUiServer:
         self._voice_coordinator = voice_coordinator
         self._folder_picker = folder_picker
         self._settings_service = settings_service
+        self._health_report_provider = health_report_provider
         self._static_dir = static_dir or _default_static_dir()
         self._settings = settings or DesktopUiServerSettings()
         self._clock = clock
@@ -587,6 +589,40 @@ class DesktopUiServer:
                 return
             catalog = await self._settings_service.list_audio_devices()
             await self._write_json(writer, 200, catalog.model_dump(), corr_id)
+            return
+
+        if method == "GET" and path == "/api/health":
+            sess = self._validate_session_cookie(headers.get("cookie"))
+            if sess is None:
+                await self._write_error(
+                    writer,
+                    403,
+                    "UI_FORBIDDEN_ORIGIN_OR_CSRF",
+                    "Missing or invalid UI session cookie.",
+                    corr_id,
+                )
+                return
+            report = (
+                self._health_report_provider()
+                if self._health_report_provider is not None
+                else None
+            )
+            if report is None:
+                await self._write_json(
+                    writer,
+                    200,
+                    {
+                        "all_ok": True,
+                        "missing_critical_count": 0,
+                        "missing_optional_count": 0,
+                        "components": [],
+                        "alert_message": None,
+                    },
+                    corr_id,
+                )
+                return
+            data = report.model_dump() if hasattr(report, "model_dump") else report
+            await self._write_json(writer, 200, data, corr_id)
             return
 
         if method == "GET" and path == "/api/events":
