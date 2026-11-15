@@ -136,6 +136,14 @@ fi
 echo "Installing runtime dependencies and nova-voice..."
 "$PIP_BIN" --python "${VENV_TARGET}/bin/python" install --prefer-binary -r "${SCRIPT_DIR}/constraints.txt" >/dev/null
 "$PIP_BIN" --python "${VENV_TARGET}/bin/python" install --no-deps "openwakeword==0.6.0" >/dev/null
+OWW_RESOURCES_DIR="${VENV_TARGET}/lib/python3.12/site-packages/openwakeword/resources/models"
+mkdir -p "${OWW_RESOURCES_DIR}"
+if [[ -f "${REPO_ROOT}/models/melspectrogram.onnx" ]]; then
+  cp "${REPO_ROOT}/models/melspectrogram.onnx" "${OWW_RESOURCES_DIR}/melspectrogram.onnx"
+fi
+if [[ -f "${REPO_ROOT}/models/embedding_model.onnx" ]]; then
+  cp "${REPO_ROOT}/models/embedding_model.onnx" "${OWW_RESOURCES_DIR}/embedding_model.onnx"
+fi
 "$PIP_BIN" --python "${VENV_TARGET}/bin/python" install --no-deps "$REPO_ROOT" >/dev/null
 
 # 6. Hygiene: remove pyc, pycache, models, and leaks

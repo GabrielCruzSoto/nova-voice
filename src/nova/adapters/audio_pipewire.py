@@ -201,7 +201,7 @@ class PipeWireAudioAdapter:
                 "--channels",
                 "1",
                 "--latency",
-                "32ms",
+                "64ms",
             ]
             if self._settings.playback_target is not None:
                 argv.extend(["--target", self._settings.playback_target])
@@ -216,7 +216,7 @@ class PipeWireAudioAdapter:
                 "--format=s16le",
                 f"--rate={rate}",
                 "--channels=1",
-                "--latency-msec=32",
+                "--latency-msec=64",
             ]
             if self._settings.playback_target is not None:
                 argv.append(f"--device={self._settings.playback_target}")

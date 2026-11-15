@@ -460,3 +460,76 @@ async def test_f7_orchestrator_redacts_gatekeeper_ephemeral_secrets_in_chat_stre
     await ms_orchestrator.handle_user_utterance("[delegate_tier2] Probar hito con secreto")
     voice_evs = [e for e in events if isinstance(e, VoiceMilestoneEvent)]
     assert all(bare_ephemeral not in v.summary_text for v in voice_evs)
+
+
+async def test_conversational_utterance_no_workspace_routes_to_tier1(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "Proyectos"
+    root.mkdir(parents=True)
+    bus = OrchestratorEventBus()
+    events: list[OrchestratorEvent] = []
+
+    async def collect1(ev: OrchestratorEvent) -> None:
+        events.append(ev)
+
+    bus.subscribe(collect1)
+    resolver = LocalWorkspaceResolver(allowed_roots=[root], event_bus=bus)
+    assert resolver.active_context is None
+
+    tier1 = _FakeTier1Client(chunks=["Hoy es sábado 14 de noviembre."])
+    tier2 = _FakeTier2Runner()
+
+    orchestrator = NovaOrchestrator(
+        workspace_resolver=resolver,
+        tier1_client=tier1,
+        tier2_runner=tier2,
+        event_bus=bus,
+    )
+
+    await orchestrator.handle_user_utterance("¿En qué día estamos hoy?")
+    assert tier1.prompts == ["¿En qué día estamos hoy?"]
+    assert len(tier2.requests) == 0
+
+    voice_evs = [e for e in events if isinstance(e, VoiceMilestoneEvent)]
+    assert len(voice_evs) == 1
+    assert "Hoy es sábado" in voice_evs[0].summary_text
+
+    chat_evs = [e for e in events if isinstance(e, ChatStreamEvent)]
+    assert len(chat_evs) == 1
+    assert chat_evs[0].delta == "Hoy es sábado 14 de noviembre."
+
+
+async def test_complex_code_utterance_no_workspace_prompts_to_select_project(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "Proyectos"
+    root.mkdir(parents=True)
+    bus = OrchestratorEventBus()
+    events: list[OrchestratorEvent] = []
+
+    async def collect1(ev: OrchestratorEvent) -> None:
+        events.append(ev)
+
+    bus.subscribe(collect1)
+    resolver = LocalWorkspaceResolver(allowed_roots=[root], event_bus=bus)
+    assert resolver.active_context is None
+
+    tier1 = _FakeTier1Client()
+    tier2 = _FakeTier2Runner()
+
+    orchestrator = NovaOrchestrator(
+        workspace_resolver=resolver,
+        tier1_client=tier1,
+        tier2_runner=tier2,
+        event_bus=bus,
+    )
+
+    await orchestrator.handle_user_utterance("[delegate_tier2] Modifica el archivo main.py")
+    assert len(tier1.prompts) == 0
+    assert len(tier2.requests) == 0
+
+    voice_evs = [e for e in events if isinstance(e, VoiceMilestoneEvent)]
+    assert len(voice_evs) == 1
+    assert "por favor seleccioná un proyecto" in voice_evs[0].summary_text
+

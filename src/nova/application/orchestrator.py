@@ -218,14 +218,39 @@ class NovaOrchestrator:
         async with self._turn_lock:
             active_ws = self._workspace_resolver.active_context
             if active_ws is None:
-                raise WorkspaceResolutionError(
-                    code="WORKSPACE_NOT_FOUND",
-                    message="No active workspace selected before handling utterance.",
-                )
+                tier = classify_complexity(utterance)
+                if tier == "high":
+                    self._log(
+                        "utterance_blocked_no_workspace",
+                        correlation_id=corr_id,
+                        tier=tier,
+                    )
+                    await self._event_bus.publish(
+                        VoiceMilestoneEvent(
+                            correlation_id=corr_id,
+                            summary_text=(
+                                "Para modificar archivos o ejecutar código, por favor seleccioná un proyecto en pantalla."
+                            ),
+                            priority="normal",
+                        )
+                    )
+                    await self._event_bus.publish(
+                        ChatStreamEvent(
+                            correlation_id=corr_id,
+                            delta="Para realizar tareas de código o modificar archivos, seleccioná un proyecto primero.",
+                            source="tier1_pi",
+                            step_type="agent_response",
+                        )
+                    )
+                    return
 
-            turn_task = asyncio.create_task(
-                self._execute_utterance(utterance, active_ws, corr_id)
-            )
+                turn_task = asyncio.create_task(
+                    self._execute_conversational_utterance(utterance, corr_id)
+                )
+            else:
+                turn_task = asyncio.create_task(
+                    self._execute_utterance(utterance, active_ws, corr_id)
+                )
             self._active_turn_task = turn_task
             try:
                 await turn_task
@@ -240,6 +265,45 @@ class NovaOrchestrator:
             finally:
                 if self._active_turn_task is turn_task:
                     self._active_turn_task = None
+
+    async def _execute_conversational_utterance(
+        self,
+        utterance: str,
+        corr_id: str,
+    ) -> None:
+        self._log(
+            "utterance_routed",
+            correlation_id=corr_id,
+            tier="low",
+            workspace_name="none",
+        )
+        try:
+            await self._run_tier1(utterance, corr_id)
+        except NovaDomainError as exc:
+            redacted_err = self._redact(exc.sanitized_message)
+            self._log(
+                "runner_failure",
+                correlation_id=corr_id,
+                error_code=exc.code,
+                message=redacted_err,
+            )
+            await self._event_bus.publish(
+                RunnerFailureEvent(
+                    correlation_id=corr_id,
+                    error_code=exc.code,
+                    sanitized_message=redacted_err,
+                    recoverable=True,
+                )
+            )
+            await self._event_bus.publish(
+                VoiceMilestoneEvent(
+                    correlation_id=corr_id,
+                    summary_text=(
+                        "Ocurrio un problema al responder tu consulta."
+                    ),
+                    priority="interrupt",
+                )
+            )
 
     async def _execute_utterance(
         self,

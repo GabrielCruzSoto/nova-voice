@@ -6,6 +6,8 @@ import asyncio
 import contextlib
 import json
 import logging
+import math
+import struct
 import time
 import uuid
 from collections import deque
@@ -31,6 +33,7 @@ from nova.domain.models import (
     CallSession,
     CallSessionState,
     PttMode,
+    SynthesizedAudio,
     TranscriptionResult,
     WorkspaceContext,
     WorkspaceQueryMode,
@@ -87,6 +90,48 @@ class OrchestratorVoiceTargetPort(Protocol):
     ) -> CommandApprovalResolvedEvent: ...
 
 
+def generate_earcon_chime(sample_rate_hz: int = 16000) -> SynthesizedAudio:
+    """Generate a low-latency ascending two-tone earcon chime (587 Hz -> 880 Hz, 80 ms)."""
+    tone1_freq = 587.33  # D5
+    tone2_freq = 880.0  # A5
+    tone1_duration = 0.035  # 35 ms
+    tone2_duration = 0.045  # 45 ms
+    fade_duration = 0.005  # 5 ms linear envelope to prevent clicks
+    volume = 0.22
+
+    total_samples_1 = int(sample_rate_hz * tone1_duration)
+    total_samples_2 = int(sample_rate_hz * tone2_duration)
+    fade_samples = max(1, int(sample_rate_hz * fade_duration))
+
+    pcm_bytes = bytearray()
+
+    # Tone 1
+    for i in range(total_samples_1):
+        envelope = 1.0
+        if i < fade_samples:
+            envelope = i / fade_samples
+        elif i > total_samples_1 - fade_samples:
+            envelope = (total_samples_1 - i) / fade_samples
+        val = int(32767.0 * volume * envelope * math.sin(2.0 * math.pi * tone1_freq * (i / sample_rate_hz)))
+        pcm_bytes.extend(struct.pack("<h", max(-32768, min(32767, val))))
+
+    # Tone 2
+    for i in range(total_samples_2):
+        envelope = 1.0
+        if i < fade_samples:
+            envelope = i / fade_samples
+        elif i > total_samples_2 - fade_samples:
+            envelope = (total_samples_2 - i) / fade_samples
+        val = int(32767.0 * volume * envelope * math.sin(2.0 * math.pi * tone2_freq * (i / sample_rate_hz)))
+        pcm_bytes.extend(struct.pack("<h", max(-32768, min(32767, val))))
+
+    return SynthesizedAudio(
+        pcm_s16le=bytes(pcm_bytes),
+        sample_rate_hz=sample_rate_hz,
+        channels=1,
+    )
+
+
 class VoiceCoordinatorSettings(BaseModel):
     """Bounded memory, threshold, and timeout configuration for VoiceCallCoordinator."""
 
@@ -101,6 +146,8 @@ class VoiceCoordinatorSettings(BaseModel):
     max_tts_queue: int = Field(default=16, ge=1, le=64)
     call_idle_timeout_seconds: float = Field(default=180.0, gt=0.0, le=3600.0)
     allow_barge_in_during_tts: bool = True
+    barge_in_grace_seconds: float = Field(default=0.35, ge=0.0, le=2.0)
+    enable_wake_earcon: bool = True
     ptt_mode: PttMode = "single_turn"
 
 
@@ -148,6 +195,8 @@ class VoiceCallCoordinator:
         self._single_turn_active = False
         self._ptt_hold_active = False
         self._flush_ptt_hold = False
+        self._speaking_started_at = 0.0
+        self._earcon_audio: SynthesizedAudio | None = generate_earcon_chime(sample_rate_hz=16000)
 
         self._tts_queue: deque[VoiceMilestoneEvent] = deque()
         self._tts_wakeup = asyncio.Event()
@@ -247,6 +296,24 @@ class VoiceCallCoordinator:
             }
         )
         await self._transition_state("listening", reason=reason, correlation_id=corr_id)
+        if self._settings.enable_wake_earcon and reason in (
+            "wake_word_detected",
+            "wake_word_transcribed",
+            "ptt_single_turn_start",
+            "ptt_toggle_start",
+            "ptt_hold_start",
+        ):
+            asyncio.create_task(self._play_earcon_safe())
+
+    async def _play_earcon_safe(self) -> None:
+        if not self._settings.enable_wake_earcon or self._earcon_audio is None:
+            return
+        try:
+            await self._audio_output.play_pcm(self._earcon_audio)
+        except asyncio.CancelledError:
+            pass
+        except Exception as exc:
+            logger.debug("Failed to play wake earcon: %s", exc)
 
     async def end_call(self, reason: str = "manual_call_end") -> None:
         """Return an open CallSession back to 'standby' hands-free wake-word mode."""
@@ -258,6 +325,8 @@ class VoiceCallCoordinator:
         self._single_turn_active = False
         self._ptt_hold_active = False
         self._flush_ptt_hold = False
+        self._speaking_started_at = 0.0
+        self._earcon_audio: SynthesizedAudio | None = generate_earcon_chime(sample_rate_hz=16000)
         self._purge_segment_queue()
 
         stt_task = self._current_stt_task
@@ -333,6 +402,8 @@ class VoiceCallCoordinator:
         ptt_mode: PttMode | None = None,
         speech_threshold: float | None = None,
         barge_in_threshold: float | None = None,
+        barge_in_grace_seconds: float | None = None,
+        enable_wake_earcon: bool | None = None,
     ) -> None:
         """Update dynamic voice coordinator thresholds and PTT mode in RAM."""
         updates: dict[str, object] = {}
@@ -342,6 +413,10 @@ class VoiceCallCoordinator:
             updates["speech_threshold"] = speech_threshold
         if barge_in_threshold is not None:
             updates["barge_in_threshold"] = barge_in_threshold
+        if barge_in_grace_seconds is not None:
+            updates["barge_in_grace_seconds"] = barge_in_grace_seconds
+        if enable_wake_earcon is not None:
+            updates["enable_wake_earcon"] = enable_wake_earcon
         if updates:
             self._settings = self._settings.model_copy(update=updates)
 
@@ -354,6 +429,8 @@ class VoiceCallCoordinator:
         self._single_turn_active = False
         self._ptt_hold_active = False
         self._flush_ptt_hold = False
+        self._speaking_started_at = 0.0
+        self._earcon_audio: SynthesizedAudio | None = generate_earcon_chime(sample_rate_hz=16000)
         self._purge_segment_queue()
         self._tts_queue.clear()
         self._started = False
@@ -406,6 +483,9 @@ class VoiceCallCoordinator:
                 }
             )
             return
+
+        if new_state == "speaking":
+            self._speaking_started_at = now
 
         self._session = self._session.model_copy(
             update={
@@ -602,6 +682,12 @@ class VoiceCallCoordinator:
                             pre_roll.clear()
                             self._vad.reset()
                         continue
+
+                    if state == "speaking" and (self._clock() - self._speaking_started_at < self._settings.barge_in_grace_seconds):
+                        if not in_speech:
+                            barge_in_run = 0
+                            pre_roll.clear()
+                            continue
 
                     if in_speech:
                         # F5: User was already speaking in "listening" when async TTS started;

@@ -7,7 +7,11 @@ import time
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
 
-from nova.application.voice_coordinator import VoiceCallCoordinator, VoiceCoordinatorSettings
+from nova.application.voice_coordinator import (
+    VoiceCallCoordinator,
+    VoiceCoordinatorSettings,
+    generate_earcon_chime,
+)
 from nova.domain.errors import VoicePipelineError
 from nova.domain.events import (
     CallStateChangedEvent,
@@ -397,7 +401,11 @@ async def test_ac3_spoken_gatekeeper_approval_ambiguous_hold_workspace_switch_an
         tts=tts,
         orchestrator=orch,
         event_bus=bus,
-        settings=VoiceCoordinatorSettings(min_speech_frames=2, end_silence_frames=2),
+        settings=VoiceCoordinatorSettings(
+            min_speech_frames=2,
+            end_silence_frames=2,
+            barge_in_grace_seconds=0.0,
+        ),
     )
     await coordinator.start()
     await coordinator.start_call()
@@ -544,6 +552,7 @@ async def test_ac5_nfr1_barge_in_stops_playback_and_aborts_turn_in_under_100ms()
             min_speech_frames=5,
             end_silence_frames=3,
             barge_in_threshold=0.60,
+            barge_in_grace_seconds=0.0,
         ),
     )
     await coordinator.start()
@@ -627,7 +636,11 @@ async def test_ac6_voice_failures_publish_sanitized_runner_failure_without_crash
         tts=tts,
         orchestrator=orch,
         event_bus=bus,
-        settings=VoiceCoordinatorSettings(min_speech_frames=2, end_silence_frames=2),
+        settings=VoiceCoordinatorSettings(
+            min_speech_frames=2,
+            end_silence_frames=2,
+            barge_in_grace_seconds=0.0,
+        ),
     )
     await coordinator.start()
     await coordinator.start_call()
@@ -755,7 +768,11 @@ async def test_end_to_end_real_orchestrator_and_gatekeeper_spoken_approval_flow(
         orchestrator=real_orchestrator,
         event_bus=bus,
         security_gatekeeper=gatekeeper,
-        settings=VoiceCoordinatorSettings(min_speech_frames=2, end_silence_frames=2),
+        settings=VoiceCoordinatorSettings(
+            min_speech_frames=2,
+            end_silence_frames=2,
+            barge_in_grace_seconds=0.0,
+        ),
     )
     await coordinator.start()
     await coordinator.start_call()
@@ -819,7 +836,11 @@ async def test_f2_fifo_approvals_and_anti_toctou_blocks_stale_speech() -> None:
         tts=_FakeTts(),
         orchestrator=orch,
         event_bus=bus,
-        settings=VoiceCoordinatorSettings(min_speech_frames=2, end_silence_frames=2),
+        settings=VoiceCoordinatorSettings(
+            min_speech_frames=2,
+            end_silence_frames=2,
+            barge_in_grace_seconds=0.0,
+        ),
         clock=fake_clock,
     )
     await coordinator.start()
@@ -1077,7 +1098,11 @@ async def test_t7_f3_end_call_purges_inflight_and_queued_segments_preventing_hot
         tts=_FakeTts(),
         orchestrator=orch,
         event_bus=bus,
-        settings=VoiceCoordinatorSettings(min_speech_frames=2, end_silence_frames=2),
+        settings=VoiceCoordinatorSettings(
+            min_speech_frames=2,
+            end_silence_frames=2,
+            barge_in_grace_seconds=0.0,
+        ),
     )
     await coordinator.start()
     await coordinator.start_call()
@@ -1171,7 +1196,11 @@ async def test_t7_f5_tts_synth_failure_recovers_listening_and_barge_in_keeps_rea
         tts=_FlakyTts(),
         orchestrator=orch,
         event_bus=bus,
-        settings=VoiceCoordinatorSettings(min_speech_frames=2, end_silence_frames=2),
+        settings=VoiceCoordinatorSettings(
+            min_speech_frames=2,
+            end_silence_frames=2,
+            barge_in_grace_seconds=0.0,
+        ),
     )
     await coordinator.start()
     await coordinator.start_call()
@@ -1206,4 +1235,121 @@ async def test_t7_f5_tts_synth_failure_recovers_listening_and_barge_in_keeps_rea
     listening_reasons = [ev.reason for ev in state_events if ev.state == "listening"]
     assert listening_reasons == ["user_barge_in"]
     await coordinator.shutdown()
+
+
+async def test_barge_in_grace_period_suppresses_initial_loudspeaker_echo() -> None:
+    bus = OrchestratorEventBus()
+    audio_in = _ScriptedAudioInput()
+    audio_out = _ControlledAudioOutput(hold_playback=True)
+    vad = _FakeVad()
+    vad.default_prob = 0.05
+    stt = _FakeStt()
+    orch = _FakeOrchestrator(event_bus=bus)
+
+    coordinator = VoiceCallCoordinator(
+        audio_input=audio_in,
+        audio_output=audio_out,
+        wake_word=_FakeWakeWord(),
+        vad=vad,
+        stt=stt,
+        tts=_FakeTts(),
+        orchestrator=orch,
+        event_bus=bus,
+        settings=VoiceCoordinatorSettings(
+            min_speech_frames=2,
+            end_silence_frames=2,
+            barge_in_grace_seconds=0.15,
+        ),
+    )
+    await coordinator.start()
+    await coordinator.start_call()
+
+    await bus.publish(
+        VoiceMilestoneEvent(
+            correlation_id="c-speak",
+            summary_text="Hablando...",
+            priority="normal",
+        )
+    )
+    await asyncio.wait_for(audio_out.started_ev.wait(), timeout=1.0)
+    assert _state_of(coordinator) == "speaking"
+
+    # Within grace window (t < 0.15s), speech frames from loudspeaker echo are ignored
+    vad.probs = [0.95, 0.95]
+    audio_in.push_frame(_frame())
+    audio_in.push_frame(_frame())
+    await asyncio.sleep(0.03)
+    assert _state_of(coordinator) == "speaking"
+    assert audio_out.stop_calls == 0
+
+    # After grace window expires, new speech frames trigger barge-in
+    await asyncio.sleep(0.15)
+    audio_in.push_frame(_frame())
+    audio_in.push_frame(_frame())
+    await asyncio.sleep(0.04)
+    assert _state_of(coordinator) == "listening"
+    assert audio_out.stop_calls == 1
+
+    await coordinator.shutdown()
+
+
+def test_generate_earcon_chime_produces_valid_80ms_pcm() -> None:
+    audio = generate_earcon_chime(sample_rate_hz=16000)
+    assert audio.sample_rate_hz == 16000
+    assert audio.channels == 1
+    # 80 ms at 16 kHz = 1280 samples * 2 bytes = 2560 bytes
+    sample_count = len(audio.pcm_s16le) // 2
+    duration_s = sample_count / 16000
+    assert 0.079 <= duration_s <= 0.081
+    assert len(audio.pcm_s16le) == 2560
+
+
+async def test_wake_word_and_ptt_play_earcon_chime() -> None:
+    bus = OrchestratorEventBus()
+    audio_in = _ScriptedAudioInput()
+    audio_out = _ControlledAudioOutput()
+    vad = _FakeVad()
+    stt = _FakeStt()
+    orch = _FakeOrchestrator(event_bus=bus)
+
+    coordinator = VoiceCallCoordinator(
+        audio_input=audio_in,
+        audio_output=audio_out,
+        wake_word=_FakeWakeWord(),
+        vad=vad,
+        stt=stt,
+        tts=_FakeTts(),
+        orchestrator=orch,
+        event_bus=bus,
+        settings=VoiceCoordinatorSettings(
+            enable_wake_earcon=True,
+            barge_in_grace_seconds=0.0,
+        ),
+    )
+    await coordinator.start()
+
+    # 1. Wake word triggers earcon playback
+    await coordinator.start_call(reason="wake_word_detected")
+    await asyncio.sleep(0.02)
+    assert len(audio_out.played) == 1
+    assert len(audio_out.played[0].pcm_s16le) == 2560
+
+    # 2. Return to standby
+    await coordinator.end_call(reason="manual_call_end")
+    assert _state_of(coordinator) == "standby"
+
+    # 3. PTT toggle triggers earcon playback
+    await coordinator.trigger_ptt_toggle()
+    await asyncio.sleep(0.02)
+    assert len(audio_out.played) == 2
+
+    # 4. Manual call start does NOT trigger earcon
+    await coordinator.end_call(reason="manual_call_end")
+    await coordinator.start_call(reason="manual_call_start")
+    await asyncio.sleep(0.02)
+    assert len(audio_out.played) == 2
+
+    await coordinator.shutdown()
+
+
 

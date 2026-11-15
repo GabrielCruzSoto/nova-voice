@@ -120,7 +120,15 @@ def test_models_resolution_step4_user_data_dir(
     assert resolved == model_file.resolve()
 
 
-def test_models_resolution_step6_source_root_when_in_dev_checkout(tmp_path: Path) -> None:
+def test_models_resolution_step6_source_root_when_in_dev_checkout(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    empty_home = tmp_path / "empty_home"
+    empty_home.mkdir()
+    monkeypatch.setattr(Path, "home", lambda: empty_home)
+    monkeypatch.delenv("XDG_DATA_HOME", raising=False)
+    monkeypatch.delenv("NOVA_MODELS_DIR", raising=False)
+
     dev_root = tmp_path / "dev_repo"
     dev_root.mkdir()
     (dev_root / "pyproject.toml").write_text("[project]\nname='test'\n")

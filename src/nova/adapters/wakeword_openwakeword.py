@@ -49,6 +49,23 @@ class _OpenWakeWordRuntimeBackend:
         kwargs: dict[str, Any] = {"inference_framework": "onnx"}
         if model_paths:
             kwargs["wakeword_models"] = list(model_paths)
+            first_parent = Path(model_paths[0]).parent
+            melspec_candidate = first_parent / "melspectrogram.onnx"
+            embedding_candidate = first_parent / "embedding_model.onnx"
+            if melspec_candidate.is_file():
+                kwargs["melspec_model_path"] = str(melspec_candidate)
+            if embedding_candidate.is_file():
+                kwargs["embedding_model_path"] = str(embedding_candidate)
+
+        if "melspec_model_path" not in kwargs:
+            user_melspec = Path.home() / ".local" / "share" / "nova" / "models" / "melspectrogram.onnx"
+            if user_melspec.is_file():
+                kwargs["melspec_model_path"] = str(user_melspec)
+        if "embedding_model_path" not in kwargs:
+            user_embedding = Path.home() / ".local" / "share" / "nova" / "models" / "embedding_model.onnx"
+            if user_embedding.is_file():
+                kwargs["embedding_model_path"] = str(user_embedding)
+
         try:
             self._model: Any = oww_mod.Model(**kwargs)
         except Exception as exc:

@@ -4,7 +4,11 @@ set -euo pipefail
 
 if [[ "${1:-}" == "purge" ]]; then
   # Remove global package directory only; user files in $HOME are never touched
-  rm -rf /opt/nova
+  if [[ "$(id -u)" -eq 0 ]]; then
+    rm -rf /opt/nova
+  else
+    rm -rf /opt/nova 2>/dev/null || true
+  fi
 fi
 
 if command -v update-desktop-database >/dev/null 2>&1; then
