@@ -30,6 +30,13 @@ EXIT_LAYER_SHELL_UNSUPPORTED = 75
 SHELL_IPC_SCHEMA = "nova.desktop.shell_ipc.v1"
 ShellIpcAction = Literal["ready", "toggle_panel", "call_start", "call_end", "quit"]
 
+ORB_CENTER_X = 238.0
+ORB_CENTER_Y = 77.0
+ORB_HIT_RADIUS = 54.0
+ORB_CLOSE_BADGE_CX = 270.0
+ORB_CLOSE_BADGE_CY = 43.0
+ORB_CLOSE_BADGE_RADIUS = 12.0
+
 _LOOPBACK_URL_RE = re.compile(r"^http://127\.0\.0\.1:([1-9][0-9]{0,4})/?$")
 
 _ACTIVE_CALL_SUBTITLES: dict[str, str] = {
@@ -167,6 +174,29 @@ def format_shell_ipc_message(action: ShellIpcAction, **extra: str) -> str:
     payload: dict[str, str] = {"schema": SHELL_IPC_SCHEMA, "action": action}
     payload.update(extra)
     return json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+
+
+def resolve_orb_click_action(
+    *,
+    x: float,
+    y: float,
+    button: int,
+    in_call: bool,
+) -> ShellIpcAction | None:
+    """Resolve a pointer press on the floating orb surface into a `ShellIpcAction`."""
+    badge_dist_sq = (x - ORB_CLOSE_BADGE_CX) ** 2 + (y - ORB_CLOSE_BADGE_CY) ** 2
+    if badge_dist_sq <= ORB_CLOSE_BADGE_RADIUS**2 and button == 1:
+        return "quit"
+    orb_dist_sq = (x - ORB_CENTER_X) ** 2 + (y - ORB_CENTER_Y) ** 2
+    if orb_dist_sq > ORB_HIT_RADIUS**2:
+        return None
+    if button == 1:
+        return "toggle_panel"
+    if button == 2:
+        return "quit"
+    if button == 3:
+        return "call_end" if in_call else "call_start"
+    return None
 
 
 def parse_sse_frame(raw_frame: str) -> tuple[str, dict[str, Any]] | None:
@@ -676,6 +706,7 @@ def _draw_orb_scene(
             cairo, cr, state.subtitle, bx + bw / 2.0, by + 45.0, 12.2, bold=False,
             rgba=(0.796, 0.835, 0.882, 0.95),
         )
+        _draw_close_badge(cairo, cr)
         return
 
     # Standby / Closed: frosted translucent glass sphere (0% continuous animation)
@@ -733,6 +764,29 @@ def _draw_orb_scene(
         cairo, cr, state.subtitle, px + pw / 2.0, py + 41.5, 11.8, bold=False,
         rgba=(0.796, 0.835, 0.882, 0.88),
     )
+    _draw_close_badge(cairo, cr)
+
+
+def _draw_close_badge(cairo: ctypes.CDLL, cr: int) -> None:
+    """Render deterministic `×` close badge inside the top-right orb input region."""
+    cairo.cairo_new_path(cr)
+    cairo.cairo_arc(cr, ORB_CLOSE_BADGE_CX, ORB_CLOSE_BADGE_CY, 10.5, 0.0, 2.0 * math.pi)
+    cairo.cairo_set_source_rgba(cr, 0.071, 0.098, 0.169, 0.94)
+    cairo.cairo_fill_preserve(cr)
+    cairo.cairo_set_line_width(cr, 1.3)
+    cairo.cairo_set_source_rgba(cr, 0.941, 0.424, 0.478, 0.68)
+    cairo.cairo_stroke(cr)
+
+    arm = 3.6
+    cairo.cairo_set_line_cap(cr, 1)  # CAIRO_LINE_CAP_ROUND
+    cairo.cairo_set_line_width(cr, 1.8)
+    cairo.cairo_set_source_rgba(cr, 0.949, 0.961, 0.980, 0.92)
+    cairo.cairo_new_path(cr)
+    cairo.cairo_move_to(cr, ORB_CLOSE_BADGE_CX - arm, ORB_CLOSE_BADGE_CY - arm)
+    cairo.cairo_line_to(cr, ORB_CLOSE_BADGE_CX + arm, ORB_CLOSE_BADGE_CY + arm)
+    cairo.cairo_move_to(cr, ORB_CLOSE_BADGE_CX + arm, ORB_CLOSE_BADGE_CY - arm)
+    cairo.cairo_line_to(cr, ORB_CLOSE_BADGE_CX - arm, ORB_CLOSE_BADGE_CY + arm)
+    cairo.cairo_stroke(cr)
 
 
 def _draw_centered_text(
@@ -886,16 +940,14 @@ def run_orb_overlay(
     click_cb_type = ctypes.CFUNCTYPE(None, vp, ci, ctypes.c_double, ctypes.c_double, vp)
 
     def _on_pressed(gesture: int, _n_press: int, x: float, y: float, _data: int) -> None:
-        dist_sq = (x - 238.0) ** 2 + (y - 77.0) ** 2
-        if dist_sq > 54.0**2:
-            return
         btn = int(gtk.gtk_gesture_single_get_current_button(gesture))
-        if btn == 1:
-            _emit_ipc("toggle_panel", stop_event=stop_event)
-        elif btn == 3:
-            with state_lock:
-                in_call = current_visual.in_call
-            _emit_ipc("call_end" if in_call else "call_start", stop_event=stop_event)
+        with state_lock:
+            in_call = current_visual.in_call
+        action = resolve_orb_click_action(x=x, y=y, button=btn, in_call=in_call)
+        if action is not None:
+            _emit_ipc(action, stop_event=stop_event)
+            if action == "quit":
+                stop_event.set()
 
     c_on_pressed = click_cb_type(_on_pressed)
     gesture = gtk.gtk_gesture_click_new()

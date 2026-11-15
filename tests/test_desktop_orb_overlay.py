@@ -14,12 +14,15 @@ import pytest
 from nova.adapters.desktop_orb_overlay import (
     EXIT_INVALID_ARGS,
     EXIT_LAYER_SHELL_UNSUPPORTED,
+    ORB_CLOSE_BADGE_CX,
+    ORB_CLOSE_BADGE_CY,
     SHELL_IPC_SCHEMA,
     LoopbackOrbStateSubscriber,
     build_orb_visual_state,
     compute_radial_equalizer_bars,
     format_shell_ipc_message,
     parse_sse_frame,
+    resolve_orb_click_action,
     run_orb_overlay,
     validate_loopback_url,
 )
@@ -311,3 +314,32 @@ async def test_f8_subscriber_detects_reparenting_while_sse_stream_stays_idle() -
         subscriber.join(timeout=1.0)
         server.close()
         await server.wait_closed()
+
+
+def test_resolve_orb_click_action_routes_close_badge_middle_click_and_call_toggle() -> None:
+    """NOVA-011 AC-3: Close badge and middle-click emit 'quit'; center left-click toggles panel."""
+    # Top-right close badge inside input_region (184..292 x 23..131) emits 'quit'
+    assert 184 <= ORB_CLOSE_BADGE_CX <= 292
+    assert 23 <= ORB_CLOSE_BADGE_CY <= 131
+    assert (
+        resolve_orb_click_action(
+            x=ORB_CLOSE_BADGE_CX, y=ORB_CLOSE_BADGE_CY, button=1, in_call=False
+        )
+        == "quit"
+    )
+    assert (
+        resolve_orb_click_action(
+            x=ORB_CLOSE_BADGE_CX + 5.0, y=ORB_CLOSE_BADGE_CY - 4.0, button=1, in_call=True
+        )
+        == "quit"
+    )
+
+    # Center left-click toggles panel; middle-click quits; right-click toggles call
+    assert resolve_orb_click_action(x=238.0, y=77.0, button=1, in_call=False) == "toggle_panel"
+    assert resolve_orb_click_action(x=238.0, y=77.0, button=2, in_call=False) == "quit"
+    assert resolve_orb_click_action(x=238.0, y=77.0, button=3, in_call=False) == "call_start"
+    assert resolve_orb_click_action(x=238.0, y=77.0, button=3, in_call=True) == "call_end"
+
+    # Outside orb hit radius returns None
+    assert resolve_orb_click_action(x=50.0, y=50.0, button=1, in_call=False) is None
+
