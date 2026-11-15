@@ -10,6 +10,7 @@ from typing import Literal
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 MAX_SPOKEN_WORDS = 25
+DEFAULT_PI_MODEL = "nvidia/nemotron-3.5-lightning-30b-a3b"
 
 
 def utc_now_iso() -> str:
@@ -350,7 +351,7 @@ class ModelsSettingsSection(BaseModel):
     model_config = ConfigDict(frozen=True, extra="forbid")
 
     pi_provider: str = Field(default="nvidia", min_length=1, max_length=64)
-    pi_model: str = Field(default="deepseek-ai/deepseek-v4.1-flash", min_length=1, max_length=160)
+    pi_model: str = Field(default=DEFAULT_PI_MODEL, min_length=1, max_length=160)
     tier2_model: str = Field(default="claude-opus-5-5-high", min_length=1, max_length=160)
 
     @field_validator("pi_provider", "pi_model", "tier2_model")

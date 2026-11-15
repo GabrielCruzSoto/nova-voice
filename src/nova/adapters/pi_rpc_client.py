@@ -15,6 +15,7 @@ from typing import Any
 from pydantic import BaseModel, ConfigDict, Field
 
 from nova.domain.errors import PiRpcError
+from nova.domain.models import DEFAULT_PI_MODEL
 
 MAX_PENDING_COMMANDS = 32
 MAX_STDERR_BYTES = 16 * 1024
@@ -32,7 +33,7 @@ class PiRpcConfig(BaseModel):
     executable: str = Field(default="pi", min_length=1)
     extra_leading_args: tuple[str, ...] = ()
     provider: str = Field(default="nvidia", min_length=1)
-    model: str = Field(default="deepseek-ai/deepseek-v4.1-flash", min_length=1)
+    model: str = Field(default=DEFAULT_PI_MODEL, min_length=1)
     workspace_path: str = Field(min_length=1)
     no_session: bool = False
     ack_timeout_seconds: float = Field(default=5.0, gt=0.0)
@@ -95,6 +96,10 @@ class PiRpcClient:
             *self._config.extra_leading_args,
             "--mode",
             "rpc",
+            "--no-extensions",
+            "--no-mcp",
+            "--thinking",
+            "off",
             "--provider",
             self._config.provider,
             "--model",

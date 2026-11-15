@@ -243,3 +243,57 @@ async def test_f3_pi_rpc_handles_jsonl_over_64kib_and_fails_cleanly_on_overrun(
             async for _ in client2.stream_prompt("Demasiado grande"):
                 pass
         assert exc_info.value.code == "PI_RPC_SUBPROCESS_UNAVAILABLE"
+
+
+async def test_nova012_ac4_pi_rpc_passes_headless_isolation_flags_and_default_model(
+    tmp_path: Path,
+) -> None:
+    argv_dump = tmp_path / "rpc_argv.txt"
+    fake_pi = tmp_path / "fake_pi_isolated.py"
+    argv = _write_fake_pi_script(
+        fake_pi,
+        f"""
+        import json, pathlib, sys
+        pathlib.Path({str(argv_dump)!r}).write_text("\\n".join(sys.argv[1:]), encoding="utf-8")
+        raw = sys.stdin.buffer.readline()
+        if raw:
+            req = json.loads(raw.decode("utf-8"))
+            ack = {{
+                "id": req.get("id"),
+                "type": "response",
+                "command": "prompt",
+                "success": True,
+                "data": {{"disposition": "started"}},
+            }}
+            ev = {{
+                "type": "message_update",
+                "assistantMessageEvent": {{"type": "text_delta", "delta": "Hola"}},
+            }}
+            settled = {{"type": "agent_settled"}}
+            sys.stdout.buffer.write((json.dumps(ack) + "\\n").encode("utf-8"))
+            sys.stdout.buffer.write((json.dumps(ev) + "\\n").encode("utf-8"))
+            sys.stdout.buffer.write((json.dumps(settled) + "\\n").encode("utf-8"))
+            sys.stdout.buffer.flush()
+        """,
+    )
+
+    cfg = PiRpcConfig(
+        executable=argv[0],
+        extra_leading_args=tuple(argv[1:]),
+        workspace_path=str(tmp_path),
+        gatekeeper_ipc_env={"NOVA_GATEKEEPER_SOCK": str(tmp_path / "gk.sock")},
+    )
+    assert cfg.model == "nvidia/nemotron-3.5-lightning-30b-a3b"
+
+    async with PiRpcClient(cfg) as client:
+        chunks = [c async for c in client.stream_prompt("Hola")]
+    assert "".join(chunks) == "Hola"
+
+    recorded = argv_dump.read_text(encoding="utf-8").splitlines()
+    assert "--no-extensions" in recorded
+    assert "--no-mcp" in recorded
+    thinking_idx = recorded.index("--thinking")
+    assert recorded[thinking_idx + 1] == "off"
+    ext_idx = recorded.index("-e")
+    assert recorded[ext_idx + 1].endswith("pi_gatekeeper.ts")
+

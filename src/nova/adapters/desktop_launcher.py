@@ -59,6 +59,7 @@ from nova.domain.events import (
     UiPanelToggleRequestedEvent,
 )
 from nova.domain.models import (
+    DEFAULT_PI_MODEL,
     CallSession,
     InferenceDevice,
     NovaPersistedSettings,
@@ -205,7 +206,7 @@ class NovaDesktopConfig(BaseModel):
 
     pi_executable: str = Field(default="pi", min_length=1)
     pi_provider: str = Field(default="nvidia", min_length=1)
-    pi_model: str = Field(default="deepseek-ai/deepseek-v4.1-flash", min_length=1)
+    pi_model: str = Field(default=DEFAULT_PI_MODEL, min_length=1)
     agy_executable: str = Field(default="agy", min_length=1)
     tier2_model: str = Field(default="claude-opus-5-5-high", min_length=1)
 
@@ -1028,7 +1029,7 @@ def build_arg_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--pi-model",
-        default="deepseek-ai/deepseek-v4.1-flash",
+        default=DEFAULT_PI_MODEL,
         action=_TrackStoreAction,
         help="Model identifier passed to Tier 1 Pi CLI.",
     )
@@ -1147,14 +1148,35 @@ def _pick_setting_str(
     return default_value
 
 
+def _resolve_cli_executable(
+    raw_executable: str,
+    *,
+    default_name: str,
+    fallback_paths: Sequence[Path],
+    which_resolver: Callable[[str], str | None] = shutil.which,
+) -> str:
+    if raw_executable != default_name:
+        return raw_executable
+    found = which_resolver(raw_executable)
+    if found:
+        return found
+    for candidate in fallback_paths:
+        if candidate.is_file() and os.access(candidate, os.X_OK):
+            return str(candidate)
+    return raw_executable
+
+
 def config_from_namespace(
     ns: argparse.Namespace,
     *,
     persisted_settings: NovaPersistedSettings | None = None,
     env: Mapping[str, str] | None = None,
+    which_resolver: Callable[[str], str | None] = shutil.which,
+    home_dir: Path | None = None,
 ) -> NovaDesktopConfig:
     """Build `NovaDesktopConfig` applying precedence CLI > ENV > config.toml > defaults."""
     effective_env = env if env is not None else os.environ
+    effective_home = home_dir if home_dir is not None else Path.home()
     explicit_fields: set[str] = set(getattr(ns, "_explicit_cli_fields", set()))
 
     raw_cfg_path = getattr(ns, "config_path", None)
@@ -1256,7 +1278,7 @@ def config_from_namespace(
         cli_value=ns.pi_model,
         env_var="NOVA_PI_MODEL",
         toml_value=persisted.models.pi_model,
-        default_value="deepseek-ai/deepseek-v4.1-flash",
+        default_value=DEFAULT_PI_MODEL,
         env=effective_env,
     )
     tier2_model = _pick_setting_str(
@@ -1267,6 +1289,21 @@ def config_from_namespace(
         toml_value=persisted.models.tier2_model,
         default_value="claude-opus-5-5-high",
         env=effective_env,
+    )
+    pi_bin = _resolve_cli_executable(
+        ns.pi_executable,
+        default_name="pi",
+        fallback_paths=(
+            effective_home / ".local" / "bin" / "pi",
+            effective_home / ".pi" / "agent" / "bin" / "pi",
+        ),
+        which_resolver=which_resolver,
+    )
+    agy_bin = _resolve_cli_executable(
+        ns.agy_executable,
+        default_name="agy",
+        fallback_paths=(effective_home / ".local" / "bin" / "agy",),
+        which_resolver=which_resolver,
     )
 
     initial_ws = ns.workspace
@@ -1291,10 +1328,10 @@ def config_from_namespace(
         browser_preference=ns.browser,
         enable_voice=enable_voice,
         ipc_runtime_dir=ns.ipc_runtime_dir,
-        pi_executable=ns.pi_executable,
+        pi_executable=pi_bin,
         pi_provider=pi_provider,
         pi_model=pi_model,
-        agy_executable=ns.agy_executable,
+        agy_executable=agy_bin,
         tier2_model=tier2_model,
         wakeword_models=wake_models,
         silero_vad_model_path=vad_model,

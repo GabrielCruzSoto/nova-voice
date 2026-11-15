@@ -668,4 +668,41 @@ async def test_run_desktop_daemon_exits_cleanly_via_http_shutdown_and_control_qu
         assert runtime.shutdown_requested is True
 
 
+def test_nova012_ac4_config_from_namespace_resolves_cli_fallbacks_and_default_model(
+    tmp_path: Path,
+) -> None:
+    from nova.adapters.desktop_launcher import build_arg_parser, config_from_namespace
+
+    fake_home = tmp_path / "home"
+    pi_fallback = fake_home / ".pi" / "agent" / "bin" / "pi"
+    agy_fallback = fake_home / ".local" / "bin" / "agy"
+    pi_fallback.parent.mkdir(parents=True, exist_ok=True)
+    agy_fallback.parent.mkdir(parents=True, exist_ok=True)
+    pi_fallback.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    pi_fallback.chmod(0o755)
+    agy_fallback.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    agy_fallback.chmod(0o755)
+
+    parser = build_arg_parser()
+    ns = parser.parse_args(
+        [
+            "--config",
+            str(tmp_path / "config.toml"),
+            "--allowed-root",
+            str(tmp_path),
+            "--no-voice",
+        ]
+    )
+    cfg = config_from_namespace(
+        ns,
+        env={},
+        which_resolver=lambda _name: None,
+        home_dir=fake_home,
+    )
+    assert cfg.pi_model == "nvidia/nemotron-3.5-lightning-30b-a3b"
+    assert cfg.pi_executable == str(pi_fallback)
+    assert cfg.agy_executable == str(agy_fallback)
+
+
+
 
