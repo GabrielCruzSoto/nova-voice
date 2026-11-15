@@ -170,7 +170,10 @@ def check_system_components(
             remedy=(
                 ""
                 if pi_ok
-                else "Instalá Pi CLI o creá un enlace en ~/.local/bin/pi (ej: ln -sf ~/.pi/agent/bin/pi ~/.local/bin/pi)"
+                else (
+                    "Instalá Pi CLI o creá un enlace en ~/.local/bin/pi "
+                    "(ej: ln -sf ~/.pi/agent/bin/pi ~/.local/bin/pi)"
+                )
             ),
         )
     )
@@ -197,7 +200,10 @@ def check_system_components(
             remedy=(
                 ""
                 if agy_ok
-                else "Instalá Antigravity CLI en ~/.local/bin/agy para tareas de programación profunda"
+                else (
+                    "Instalá Antigravity CLI en ~/.local/bin/agy "
+                    "para tareas de programación profunda"
+                )
             ),
         )
     )
@@ -267,7 +273,11 @@ def check_system_components(
                     if ww_path
                     else "Modelo 'oye_nova.onnx' no encontrado"
                 ),
-                remedy="" if ww_path else "Ejecutá 'nova-desktop --download-models' para descargar modelos",
+                remedy=(
+                    ""
+                    if ww_path
+                    else "Ejecutá 'nova-desktop --download-models' para descargar modelos"
+                ),
             )
         )
 

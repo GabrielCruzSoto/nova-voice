@@ -18,7 +18,6 @@ from pydantic import BaseModel, ConfigDict, Field
 from nova.domain.errors import (
     GatekeeperError,
     NovaDomainError,
-    WorkspaceResolutionError,
     redact_sensitive_text,
 )
 from nova.domain.events import (
@@ -229,7 +228,8 @@ class NovaOrchestrator:
                         VoiceMilestoneEvent(
                             correlation_id=corr_id,
                             summary_text=(
-                                "Para modificar archivos o ejecutar código, por favor seleccioná un proyecto en pantalla."
+                                "Para modificar archivos o ejecutar código, "
+                                "por favor seleccioná un proyecto en pantalla."
                             ),
                             priority="normal",
                         )
@@ -237,7 +237,10 @@ class NovaOrchestrator:
                     await self._event_bus.publish(
                         ChatStreamEvent(
                             correlation_id=corr_id,
-                            delta="Para realizar tareas de código o modificar archivos, seleccioná un proyecto primero.",
+                            delta=(
+                                "Para realizar tareas de código o modificar archivos, "
+                                "seleccioná un proyecto primero."
+                            ),
                             source="tier1_pi",
                             step_type="agent_response",
                         )

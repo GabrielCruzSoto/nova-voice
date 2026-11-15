@@ -9,8 +9,8 @@ import pytest
 from nova.adapters.desktop_launcher import (
     build_arg_parser,
     config_from_namespace,
-    resolve_model_path,
 )
+from nova.application.health_diagnostics import resolve_model_path
 
 _REPO_ROOT = Path(__file__).resolve().parents[1]
 
