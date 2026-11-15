@@ -6,7 +6,7 @@ build-backend = "setuptools.build_meta"
 name = "nova-voice"
 version = "0.1.0"
 description = "Nova local voice-assisted two-tier agentic orchestrator for Linux"
-readme = "ARCHITECTURE.md"
+readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [
     "pydantic>=2.7.0,<3.0.0",
