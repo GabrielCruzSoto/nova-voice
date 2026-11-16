@@ -79,7 +79,7 @@ async def default_agy_probe_runner(
             executable=executable,
             extra_leading_args=extra_args,
             allowed_models=allowed,
-            timeout_seconds=10.0,
+            timeout_seconds=14.0,
             gatekeeper_ipc_env=gatekeeper_ipc_env
             or {
                 "NOVA_GATEKEEPER_SOCKET": str(Path(probe_dir) / "nova-probe.sock"),

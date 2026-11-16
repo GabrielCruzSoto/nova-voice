@@ -8,6 +8,7 @@ import json
 import os
 import time
 from collections.abc import AsyncIterator
+from pathlib import Path
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -25,6 +26,9 @@ ALLOWED_TIER2_MODELS: frozenset[str] = frozenset(
 )
 MAX_STDERR_BYTES = 16 * 1024
 DEFAULT_MAX_LINE_BYTES = 8 * 1024 * 1024
+_BUNDLED_GATEKEEPER_PLUGIN_DIR = str(
+    Path(__file__).resolve().parents[1] / "plugins" / "agy_gatekeeper"
+)
 
 
 class AntigravityRunnerConfig(BaseModel):
@@ -39,6 +43,11 @@ class AntigravityRunnerConfig(BaseModel):
     max_line_bytes: int = Field(default=DEFAULT_MAX_LINE_BYTES, gt=0)
     gatekeeper_ipc_env: dict[str, str] | None = None
     require_gatekeeper_plugin: bool = True
+    auto_install_gatekeeper_plugin: bool = True
+    bundled_gatekeeper_plugin_dir: str = Field(
+        default=_BUNDLED_GATEKEEPER_PLUGIN_DIR,
+        min_length=1,
+    )
     gatekeeper_plugin_name: str = Field(default="nova-agy-gatekeeper", min_length=1)
     plugin_check_ttl_seconds: float = Field(default=60.0, gt=0.0)
 
@@ -248,8 +257,7 @@ class AntigravityCLIAdapter:
                 with contextlib.suppress(asyncio.CancelledError):
                     await stderr_task
 
-    async def _verify_gatekeeper_plugin_installed(self, cwd: str) -> None:
-        """Fail-closed preflight ensuring nova-agy-gatekeeper is installed and enabled."""
+    async def _query_installed_plugins(self, cwd: str) -> list[Any]:
         check_cmd = [
             self._config.executable,
             *self._config.extra_leading_args,
@@ -306,17 +314,80 @@ class AntigravityCLIAdapter:
                 code="GATEKEEPER_PLUGIN_MISSING",
                 message="Unexpected payload from 'agy plugin list --json' (fail-closed).",
             )
+        return plugins_raw
 
-        matched_entry = next(
+    async def _run_plugin_lifecycle_cmd(self, subargs: tuple[str, ...], cwd: str) -> bool:
+        cmd = [
+            self._config.executable,
+            *self._config.extra_leading_args,
+            "plugin",
+            *subargs,
+        ]
+        try:
+            proc = await asyncio.create_subprocess_exec(
+                *cmd,
+                cwd=cwd,
+                stdin=asyncio.subprocess.DEVNULL,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+            )
+        except OSError:
+            return False
+
+        try:
+            await asyncio.wait_for(
+                proc.communicate(),
+                timeout=min(10.0, self._config.timeout_seconds),
+            )
+        except TimeoutError:
+            await self._terminate_process(proc)
+            return False
+
+        await self._terminate_process(proc)
+        return proc.returncode == 0
+
+    def _find_plugin_entry(
+        self,
+        plugins_raw: list[Any],
+        *,
+        require_enabled: bool,
+    ) -> dict[str, Any] | None:
+        return next(
             (
                 item
                 for item in plugins_raw
                 if isinstance(item, dict)
                 and item.get("name") == self._config.gatekeeper_plugin_name
-                and item.get("enabled") is True
+                and (not require_enabled or item.get("enabled") is True)
             ),
             None,
         )
+
+    async def _attempt_auto_provision_plugin(self, plugins_raw: list[Any], cwd: str) -> None:
+        existing_any = self._find_plugin_entry(plugins_raw, require_enabled=False)
+        if existing_any is not None and existing_any.get("enabled") is False:
+            await self._run_plugin_lifecycle_cmd(
+                ("enable", self._config.gatekeeper_plugin_name),
+                cwd,
+            )
+
+        src_dir = Path(self._config.bundled_gatekeeper_plugin_dir)
+        has_bundle = await asyncio.to_thread(
+            lambda: (src_dir / "plugin.json").is_file() and (src_dir / "hooks.json").is_file()
+        )
+        if has_bundle and existing_any is None:
+            await self._run_plugin_lifecycle_cmd(("install", str(src_dir)), cwd)
+
+    async def _verify_gatekeeper_plugin_installed(self, cwd: str) -> None:
+        """Fail-closed preflight ensuring nova-agy-gatekeeper is installed and enabled."""
+        plugins_raw = await self._query_installed_plugins(cwd)
+        matched_entry = self._find_plugin_entry(plugins_raw, require_enabled=True)
+
+        if matched_entry is None and self._config.auto_install_gatekeeper_plugin:
+            await self._attempt_auto_provision_plugin(plugins_raw, cwd)
+            plugins_raw = await self._query_installed_plugins(cwd)
+            matched_entry = self._find_plugin_entry(plugins_raw, require_enabled=True)
+
         if matched_entry is None:
             raise CodingRunnerError(
                 code="GATEKEEPER_PLUGIN_MISSING",
