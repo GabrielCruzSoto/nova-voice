@@ -11,7 +11,8 @@ from pathlib import Path
 
 import pytest
 
-from nova.application.live_diagnostics import LiveDiagnosticsConfig, LiveDiagnosticsService
+from nova.adapters.diagnostics_probes import build_live_diagnostics_service
+from nova.application.live_diagnostics import LiveDiagnosticsConfig
 from nova.domain.errors import DesktopUiError
 from nova.domain.models import AudioFrame, SynthesizedAudio, TranscriptionResult
 
@@ -88,7 +89,7 @@ async def test_ac7_nfr5_microphone_and_audio_output_run_strictly_in_ram_and_reda
     capture = _FakeAudioCapture(amplitude=10000)
     output = _FakeAudioOutput()
 
-    svc = LiveDiagnosticsService(
+    svc = build_live_diagnostics_service(
         config=LiveDiagnosticsConfig(
             pi_executable="pi",
             agy_executable="agy",
@@ -111,7 +112,7 @@ async def test_ac7_nfr5_microphone_and_audio_output_run_strictly_in_ram_and_reda
     assert _list_wavs(tmp_path) == []
 
     # Silent microphone returns ok=False, status="silent"
-    silent_svc = LiveDiagnosticsService(
+    silent_svc = build_live_diagnostics_service(
         config=LiveDiagnosticsConfig(),
         which_resolver=lambda name: f"/usr/bin/{name}",
         audio_input_factory=lambda _target: _FakeAudioCapture(amplitude=0),
@@ -138,7 +139,7 @@ async def test_ac8_pi_and_antigravity_connectivity_probes_classify_and_redact_se
     tmp_path: Path,
 ) -> None:
     # 1. Missing binaries classify as binary_missing
-    missing_svc = LiveDiagnosticsService(
+    missing_svc = build_live_diagnostics_service(
         config=LiveDiagnosticsConfig(
             pi_executable="nonexistent-pi",
             agy_executable="nonexistent-agy",
@@ -172,7 +173,7 @@ async def test_ac8_pi_and_antigravity_connectivity_probes_classify_and_redact_se
         sys.stdout.buffer.flush()
         """,
     )
-    auth_svc = LiveDiagnosticsService(
+    auth_svc = build_live_diagnostics_service(
         config=LiveDiagnosticsConfig(
             pi_executable=sys.executable,
             pi_extra_args=("-u", str(fake_pi_auth)),
@@ -232,7 +233,7 @@ async def test_ac8_pi_and_antigravity_connectivity_probes_classify_and_redact_se
         """,
     )
 
-    ok_svc = LiveDiagnosticsService(
+    ok_svc = build_live_diagnostics_service(
         config=LiveDiagnosticsConfig(
             pi_executable=sys.executable,
             pi_extra_args=("-u", str(fake_pi_ok)),

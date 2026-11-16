@@ -1,4 +1,4 @@
-"""Interactive live readiness probes for Microphone, Audio Output, Pi RPC, and Antigravity CLI."""
+"""Pure application service for interactive live readiness probes (Hexagonal boundary)."""
 
 from __future__ import annotations
 
@@ -10,18 +10,11 @@ import os
 import shutil
 import tempfile
 import time
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from pathlib import Path
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from nova.adapters.antigravity_adapter import (
-    ALLOWED_TIER2_MODELS,
-    AntigravityCLIAdapter,
-    AntigravityRunnerConfig,
-)
-from nova.adapters.audio_pipewire import PipeWireAudioAdapter, PipeWireAudioSettings
-from nova.adapters.pi_rpc_client import PiRpcClient, PiRpcConfig
 from nova.domain.errors import (
     CodingRunnerError,
     DesktopUiError,
@@ -35,7 +28,6 @@ from nova.domain.models import (
     AntigravityDiagnosticResult,
     AntigravityDiagnosticStatus,
     AudioOutputDiagnosticResult,
-    CodingTaskRequest,
     MicDiagnosticResult,
     PiConnectionDiagnosticResult,
     PiDiagnosticStatus,
@@ -51,6 +43,11 @@ from nova.domain.ports import (
 WhichResolver = Callable[[str], str | None]
 AudioInputFactory = Callable[[str | None], AudioInputPort]
 AudioOutputFactory = Callable[[str | None], AudioOutputPort]
+PiProbeRunner = Callable[[str, tuple[str, ...], str, str, str], Awaitable[None]]
+AgyProbeRunner = Callable[
+    [str, tuple[str, ...], str, str, dict[str, str] | None],
+    Awaitable[None],
+]
 
 _AUTH_ERROR_HINTS: tuple[str, ...] = (
     "401",
@@ -65,14 +62,6 @@ _AUTH_ERROR_HINTS: tuple[str, ...] = (
     "not logged in",
     "login required",
 )
-
-
-def _default_audio_input_factory(capture_target: str | None) -> AudioInputPort:
-    return PipeWireAudioAdapter(PipeWireAudioSettings(capture_target=capture_target))
-
-
-def _default_audio_output_factory(playback_target: str | None) -> AudioOutputPort:
-    return PipeWireAudioAdapter(PipeWireAudioSettings(playback_target=playback_target))
 
 
 def _validate_optional_token(raw: str | None, *, field_name: str) -> str | None:
@@ -140,15 +129,17 @@ class LiveDiagnosticsConfig(BaseModel):
 
 
 class LiveDiagnosticsService:
-    """Executes bounded, RAM-confined live readiness checks for audio and AI engines."""
+    """Executes bounded, RAM-confined live readiness checks via injected hexagonal ports."""
 
     def __init__(
         self,
         *,
         config: LiveDiagnosticsConfig | None = None,
         which_resolver: WhichResolver = shutil.which,
-        audio_input_factory: AudioInputFactory = _default_audio_input_factory,
-        audio_output_factory: AudioOutputFactory = _default_audio_output_factory,
+        audio_input_factory: AudioInputFactory | None = None,
+        audio_output_factory: AudioOutputFactory | None = None,
+        pi_probe_runner: PiProbeRunner | None = None,
+        agy_probe_runner: AgyProbeRunner | None = None,
         stt_port: SpeechToTextPort | None = None,
         tts_port: TextToSpeechPort | None = None,
         extra_secrets_provider: Callable[[], tuple[str, ...]] | None = None,
@@ -157,6 +148,8 @@ class LiveDiagnosticsService:
         self._which = which_resolver
         self._audio_input_factory = audio_input_factory
         self._audio_output_factory = audio_output_factory
+        self._pi_probe_runner = pi_probe_runner
+        self._agy_probe_runner = agy_probe_runner
         self._stt_port = stt_port
         self._tts_port = tts_port
         self._extra_secrets_provider = extra_secrets_provider
@@ -201,7 +194,9 @@ class LiveDiagnosticsService:
                 message="duration_seconds must be between 0.5 and 4.0.",
             )
 
-        if not (self._which("pw-record") or self._which("parecord")):
+        if self._audio_input_factory is None or not (
+            self._which("pw-record") or self._which("parecord")
+        ):
             return MicDiagnosticResult(
                 ok=False,
                 status="binary_missing",
@@ -295,7 +290,9 @@ class LiveDiagnosticsService:
     ) -> AudioOutputDiagnosticResult:
         """Play a short synthesized greeting or clean two-tone test chime in RAM."""
         safe_target = _validate_optional_token(playback_target, field_name="playback_target")
-        if not (self._which("pw-play") or self._which("paplay")):
+        if self._audio_output_factory is None or not (
+            self._which("pw-play") or self._which("paplay")
+        ):
             return AudioOutputDiagnosticResult(
                 ok=False,
                 status="binary_missing",
@@ -368,7 +365,7 @@ class LiveDiagnosticsService:
                 Path.home() / ".pi" / "agent" / "bin" / "pi",
             ),
         )
-        if resolved_bin is None:
+        if resolved_bin is None or self._pi_probe_runner is None:
             return PiConnectionDiagnosticResult(
                 ok=False,
                 status="binary_missing",
@@ -380,28 +377,15 @@ class LiveDiagnosticsService:
 
         started = time.monotonic()
         with tempfile.TemporaryDirectory(prefix="nova-pi-probe-") as probe_dir:
-            client = PiRpcClient(
-                PiRpcConfig(
-                    executable=resolved_bin,
-                    extra_leading_args=self._config.pi_extra_args,
-                    provider=eff_provider,
-                    model=eff_model,
-                    workspace_path=probe_dir,
-                    workspace_active=False,
-                    no_session=True,
-                    enable_gatekeeper_extension=False,
-                    ack_timeout_seconds=5.0,
-                    run_timeout_seconds=8.0,
-                )
-            )
             try:
-                async with client:
-                    chunks = [
-                        delta
-                        async for delta in client.stream_prompt("Responde unicamente OK")
-                    ]
+                await self._pi_probe_runner(
+                    resolved_bin,
+                    self._config.pi_extra_args,
+                    eff_provider,
+                    eff_model,
+                    probe_dir,
+                )
                 elapsed_ms = round((time.monotonic() - started) * 1000.0, 1)
-                _ = chunks
                 return PiConnectionDiagnosticResult(
                     ok=True,
                     status="connected",
@@ -440,7 +424,7 @@ class LiveDiagnosticsService:
             default_name="agy",
             fallbacks=(Path.home() / ".local" / "bin" / "agy",),
         )
-        if resolved_bin is None:
+        if resolved_bin is None or self._agy_probe_runner is None:
             return AntigravityDiagnosticResult(
                 ok=False,
                 status="binary_missing",
@@ -452,36 +436,17 @@ class LiveDiagnosticsService:
                 ),
             )
 
-        allowed = set(ALLOWED_TIER2_MODELS) | {eff_model}
         started = time.monotonic()
         with tempfile.TemporaryDirectory(prefix="nova-agy-probe-") as probe_dir:
-            adapter = AntigravityCLIAdapter(
-                AntigravityRunnerConfig(
-                    executable=resolved_bin,
-                    extra_leading_args=self._config.agy_extra_args,
-                    allowed_models=frozenset(allowed),
-                    timeout_seconds=12.0,
-                    gatekeeper_ipc_env=self._config.gatekeeper_ipc_env or {
-                        "NOVA_GATEKEEPER_SOCKET": "/tmp/nova-probe.sock",
-                        "NOVA_GATEKEEPER_TOKEN": "probe-token",
-                    },
-                    require_gatekeeper_plugin=True,
-                )
-            )
             try:
-                events = [
-                    ev
-                    async for ev in adapter.execute(
-                        CodingTaskRequest(
-                            correlation_id="corr-diag-agy",
-                            workspace_path=probe_dir,
-                            prompt="Responde unicamente OK",
-                            model=eff_model,
-                        )
-                    )
-                ]
+                await self._agy_probe_runner(
+                    resolved_bin,
+                    self._config.agy_extra_args,
+                    eff_model,
+                    probe_dir,
+                    self._config.gatekeeper_ipc_env,
+                )
                 elapsed_ms = round((time.monotonic() - started) * 1000.0, 1)
-                _ = events
                 return AntigravityDiagnosticResult(
                     ok=True,
                     status="connected",

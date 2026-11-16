@@ -27,6 +27,7 @@ from nova.adapters.audio_pipewire import PipeWireAudioAdapter, PipeWireAudioSett
 from nova.adapters.config_store import TomlConfigStore, resolve_config_file_path
 from nova.adapters.control_ipc import UnixControlIpcServer
 from nova.adapters.desktop_ui_server import DesktopUiServer, DesktopUiServerSettings
+from nova.adapters.diagnostics_probes import build_live_diagnostics_service
 from nova.adapters.folder_picker_gtk import GtkFolderPickerAdapter
 from nova.adapters.gatekeeper_ipc import GatekeeperIPCConfig, UnixSocketGatekeeperServer
 from nova.adapters.pi_auditor_adapter import PiAuditorAdapter, PiAuditorConfig
@@ -42,7 +43,7 @@ from nova.application.health_diagnostics import (
     check_system_components,
     resolve_model_path,
 )
-from nova.application.live_diagnostics import LiveDiagnosticsConfig, LiveDiagnosticsService
+from nova.application.live_diagnostics import LiveDiagnosticsConfig
 from nova.application.orchestrator import NovaOrchestrator, OrchestratorSettings
 from nova.application.security_gatekeeper import SecurityGatekeeper
 from nova.application.settings_service import SettingsService
@@ -801,7 +802,7 @@ class NovaDesktopRuntime:
 
             live_stt = getattr(voice_coord, "_stt", None) if voice_coord is not None else None
             live_tts = getattr(voice_coord, "_tts", None) if voice_coord is not None else None
-            diagnostics_service = LiveDiagnosticsService(
+            diagnostics_service = build_live_diagnostics_service(
                 config=LiveDiagnosticsConfig(
                     pi_executable=self._config.pi_executable,
                     pi_provider=self._config.pi_provider,
