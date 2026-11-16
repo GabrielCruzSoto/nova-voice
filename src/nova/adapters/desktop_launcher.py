@@ -42,6 +42,7 @@ from nova.application.health_diagnostics import (
     check_system_components,
     resolve_model_path,
 )
+from nova.application.live_diagnostics import LiveDiagnosticsConfig, LiveDiagnosticsService
 from nova.application.orchestrator import NovaOrchestrator, OrchestratorSettings
 from nova.application.security_gatekeeper import SecurityGatekeeper
 from nova.application.settings_service import SettingsService
@@ -787,21 +788,6 @@ class NovaDesktopRuntime:
 
             self._voice_coordinator = voice_coord
 
-            state_hub = UiStateHub(
-                event_bus=self._event_bus,
-                extra_secrets_provider=self._combined_extra_secrets,
-                available_workspaces_provider=workspace_resolver.list_available_workspaces,
-                call_session_provider=(
-                    (lambda: voice_coord.session) if voice_coord is not None else None
-                ),
-                initial_workspace=initial_ws,
-                initial_call_session=(
-                    voice_coord.session if voice_coord is not None else None
-                ),
-                voice_enabled=self._voice_enabled,
-            )
-            self._state_hub = state_hub
-
             initial_persisted = await asyncio.to_thread(self._config_store.load)
             settings_service = SettingsService(
                 config_store=self._config_store,
@@ -813,6 +799,45 @@ class NovaDesktopRuntime:
             )
             self._settings_service = settings_service
 
+            live_stt = getattr(voice_coord, "_stt", None) if voice_coord is not None else None
+            live_tts = getattr(voice_coord, "_tts", None) if voice_coord is not None else None
+            diagnostics_service = LiveDiagnosticsService(
+                config=LiveDiagnosticsConfig(
+                    pi_executable=self._config.pi_executable,
+                    pi_provider=self._config.pi_provider,
+                    pi_model=self._config.pi_model,
+                    agy_executable=self._config.agy_executable,
+                    tier2_model=self._config.tier2_model,
+                    tts_engine_label=self._config.tts_engine,
+                    gatekeeper_ipc_env=ipc_env,
+                ),
+                which_resolver=self._which_resolver,
+                stt_port=live_stt,
+                tts_port=live_tts,
+                extra_secrets_provider=self._combined_extra_secrets,
+            )
+
+            state_hub = UiStateHub(
+                event_bus=self._event_bus,
+                extra_secrets_provider=self._combined_extra_secrets,
+                available_workspaces_provider=workspace_resolver.list_available_workspaces,
+                workspace_entries_provider=workspace_resolver.list_workspace_entries,
+                onboarding_required_provider=lambda: (
+                    not settings_service.current_settings.general.first_run_completed
+                ),
+                process_cwd_provider=lambda: str(Path.home().resolve()),
+                allowed_roots_provider=lambda: self._config.allowed_roots,
+                call_session_provider=(
+                    (lambda: voice_coord.session) if voice_coord is not None else None
+                ),
+                initial_workspace=initial_ws,
+                initial_call_session=(
+                    voice_coord.session if voice_coord is not None else None
+                ),
+                voice_enabled=self._voice_enabled,
+            )
+            self._state_hub = state_hub
+
             ui_server = DesktopUiServer(
                 orchestrator=orchestrator,
                 state_hub=state_hub,
@@ -820,6 +845,8 @@ class NovaDesktopRuntime:
                 voice_coordinator=voice_coord,
                 folder_picker=self._folder_picker,
                 settings_service=settings_service,
+                workspace_resolver=workspace_resolver,
+                diagnostics_service=diagnostics_service,
                 health_report_provider=lambda: self._health_report,
                 shutdown_callback=self.request_shutdown,
                 settings=DesktopUiServerSettings(host="127.0.0.1", port=self._config.port),
