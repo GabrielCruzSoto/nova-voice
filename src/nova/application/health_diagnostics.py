@@ -58,6 +58,9 @@ def _resolve_cli_binary(
     which_resolver: WhichResolver,
     fallback_paths: tuple[Path, ...] = (),
 ) -> tuple[bool, str | None]:
+    target_path = Path(name).expanduser()
+    if target_path.is_file() and os.access(target_path, os.X_OK):
+        return True, str(target_path.resolve())
     resolved = which_resolver(name)
     if resolved:
         return True, resolved

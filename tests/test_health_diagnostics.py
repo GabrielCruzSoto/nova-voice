@@ -62,9 +62,9 @@ def test_all_components_present_yields_all_ok(
         (models_dir / m).write_bytes(b"model data")
 
     def fake_which(cmd: str) -> str | None:
-        if cmd == "pi":
+        if cmd in ("pi", str(pi_bin)):
             return str(pi_bin)
-        if cmd == "agy":
+        if cmd in ("agy", str(agy_bin)):
             return str(agy_bin)
         if cmd in ("pw-record", "pw-play"):
             return f"/usr/bin/{cmd}"
