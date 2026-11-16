@@ -816,7 +816,7 @@ test("AC-7: Empty workspace state with escaped catalog and pick-native", async (
   app.dispose();
 });
 
-test("AC-8: Composer disabled guard with accessible description and backend race", async () => {
+test("AC-8 (updated in NOVA-013 AC-3): Conversational composer enabled without workspace, accessible hint, and backend error notice", async () => {
   const modelNoWorkspace = {
     status: "empty",
     voiceEnabled: true,
@@ -839,22 +839,22 @@ test("AC-8: Composer disabled guard with accessible description and backend race
 
   const html = renderAppShell(modelNoWorkspace);
 
-  // Textarea and submit have disabled
-  assert.match(html, /<textarea[^>]+id="nova-chat-input"[^>]*\sdisabled\b/);
-  assert.match(html, /<button[^>]+type="submit"[^>]*\sdisabled\b/);
+  // NOVA-013 AC-3: Textarea and submit are ENABLED in conversational ~ mode (activeWorkspace: null)
+  const inputTagMatch0 = html.match(/<textarea[^>]+id="nova-chat-input"[^>]*>/);
+  assert.ok(inputTagMatch0 && !inputTagMatch0[0].includes("disabled"), "Textarea must be enabled in conversational ~ mode");
+  const submitMatch0 = html.match(/<button[^>]+type="submit"[^>]*>/);
+  assert.ok(submitMatch0 && !submitMatch0[0].includes("disabled"), "Submit button must be enabled in conversational ~ mode");
 
-  // Textarea has aria-describedby matching element whose text contains "proyecto"
+  // Textarea has aria-describedby explaining conversational mode without workspace
   const describedByMatch = html.match(/id="nova-chat-input"[^>]+aria-describedby="([^"]+)"/);
-  assert.ok(describedByMatch, "textarea must have aria-describedby");
+  assert.ok(describedByMatch, "textarea must have aria-describedby in conversational mode");
   const descId = describedByMatch[1];
   const descElMatch = html.match(new RegExp(`<[^>]+id="${descId}"[^>]*>([^<]+)<`));
   assert.ok(descElMatch, `Element with id ${descId} must exist`);
-  assert.match(descElMatch[1], /proyecto/i, "Description element must mention 'proyecto'");
+  assert.match(descElMatch[1], /conversacional|workspace/i);
 
-  // Controller guard prevents chat sending when activeWorkspace is null
   const calls = [];
-  let sseControllerRef = null;
-  const encoder = new TextEncoder();
+  let chatShouldFail = false;
 
   const fakeFetch = async (url, init) => {
     calls.push({ url, method: init?.method, body: init?.body });
@@ -874,65 +874,41 @@ test("AC-8: Composer disabled guard with accessible description and backend race
       );
     }
     if (url === "/api/events") {
-      const stream = new ReadableStream({
-        start(controller) {
-          sseControllerRef = controller;
-        },
-      });
-      return new Response(stream, {
+      return new Response(new ReadableStream(), {
         status: 200,
         headers: { "Content-Type": "text/event-stream" },
       });
     }
     if (url === "/api/chat") {
-      return new Response(
-        JSON.stringify({
-          error_code: "WORKSPACE_NOT_FOUND",
-          message: "Workspace path does not exist",
-          correlation_id: "corr-race",
-        }),
-        { status: 404, headers: { "Content-Type": "application/json" } },
-      );
+      if (chatShouldFail) {
+        return new Response(
+          JSON.stringify({
+            error_code: "WORKSPACE_NOT_FOUND",
+            message: "Workspace path does not exist",
+            correlation_id: "corr-race",
+          }),
+          { status: 404, headers: { "Content-Type": "application/json" } },
+        );
+      }
+      return new Response(JSON.stringify({ accepted: true, correlation_id: "corr-ok" }), {
+        status: 202,
+        headers: { "Content-Type": "application/json" },
+      });
     }
     return new Response(JSON.stringify({ ok: true }), { status: 200 });
   };
 
-  const renders = [];
-  const app = new DesktopAppController({
-    fetchImpl: fakeFetch,
-    onRender: (renderedHtml, m) => {
-      renders.push({ renderedHtml, m });
-    },
-  });
+  const app = new DesktopAppController({ fetchImpl: fakeFetch });
   await app.start();
   await new Promise((r) => setTimeout(r, 20));
 
-  // Guard prevents sending without workspace
-  await app.submitChat("hola");
+  // Conversational chat sends POST /api/chat even when activeWorkspace is null
+  await app.submitChat("hola nova");
   const chatCalls = calls.filter((c) => c.url === "/api/chat");
-  assert.equal(chatCalls.length, 0, "0 calls to /api/chat when activeWorkspace is null");
+  assert.equal(chatCalls.length, 1, "Conversational mode sends POST /api/chat without active workspace");
 
-  // SSE emits workspace_changed -> composer enabled
-  const frame = `event: nova_event\ndata: ${JSON.stringify({
-    seq: 1,
-    event_type: "workspace_changed",
-    correlation_id: "corr-ws",
-    timestamp: new Date().toISOString(),
-    payload: {
-      display_name: "valid-ws",
-      canonical_path: "/home/dev/valid-ws",
-      selected_via: "exact_path",
-    },
-  })}\n\n`;
-  sseControllerRef.enqueue(encoder.encode(frame));
-  await new Promise((r) => setTimeout(r, 20));
-
-  const afterWsHtml = renders[renders.length - 1].renderedHtml;
-  assert.match(afterWsHtml, /<textarea[^>]+id="nova-chat-input"/);
-  const inputTagMatch = afterWsHtml.match(/<textarea[^>]+id="nova-chat-input"[^>]*>/);
-  assert.ok(inputTagMatch && !inputTagMatch[0].includes("disabled"), "Textarea must not be disabled once workspace arrives");
-
-  // Backend race: 404 WORKSPACE_NOT_FOUND on chat submit displays notice without adding to messages
+  // Error response displays human notice without polluting messages
+  chatShouldFail = true;
   const msgCountBefore = app.model.messages.length;
   await app.submitChat("hola");
   assert.equal(app.model.messages.length, msgCountBefore, "Messages array must not grow on 404 failure");
@@ -2282,6 +2258,265 @@ test("NOVA-011: Non-voice quit controls in header, settings drawer, and orb widg
   assert.equal(quitHostCalls, 1, "onQuitHost must notify frameless desktop shell");
   assert.equal(ctrl.model.callSession.state, "closed");
   assert.equal(ctrl.model.noticeBanner?.code, "APP_SHUTDOWN");
+});
+
+test("NOVA-013 AC-1..AC-9: First-run onboarding modal, 4 live diagnostics in onboarding & settings, conversational ~ timeline, and multi-project workspace management", async () => {
+  // 1. Conversational messages render even when activeWorkspace === null
+  const convHtml = renderChatTimeline(
+    "success",
+    [
+      {
+        message_id: "m-conv-1",
+        correlation_id: "c-conv",
+        role: "assistant",
+        modality: "tier1_pi",
+        step_type: "agent_response",
+        content: "Hola, estoy en modo conversacional sin workspace.",
+        timestamp: "2026-11-16T10:00:00Z",
+        streaming: false,
+      },
+    ],
+    null,
+    null,
+    [],
+  );
+  assert.ok(convHtml.includes("Hola, estoy en modo conversacional sin workspace."));
+  assert.ok(!convHtml.includes('data-slot="workspace-empty-state"'));
+
+  // 2. WORKSPACE_HOME_FORBIDDEN maps to clear Spanish notice without leaking raw enum
+  const homeNotice = resolveHumanNotice("WORKSPACE_HOME_FORBIDDEN");
+  assert.ok(!homeNotice.message.includes("WORKSPACE_HOME_FORBIDDEN"));
+  assert.match(homeNotice.message, /carpeta personal|workspace/i);
+
+  // 3. Full controller lifecycle: first-run onboarding -> run all 4 diagnostics -> complete -> init workspace -> clear workspace
+  const requests = [];
+  const renders = [];
+  const fakeFetch = async (url, init = {}) => {
+    requests.push({ url, method: init.method ?? "GET", headers: init.headers ?? {}, body: init.body });
+    if (url === "/api/state") {
+      return new Response(
+        JSON.stringify({
+          schema_version: "1.3.0",
+          csrf_token: "csrf-013",
+          voice_enabled: true,
+          onboarding_required: true,
+          process_cwd: "/home/operador",
+          allowed_roots: ["/home/operador/Proyectos"],
+          call_session: { call_id: "c-013", state: "standby", turn_count: 0, active_correlation_id: null },
+          active_workspace: null,
+          available_workspaces: [
+            {
+              display_name: "Cliente Alfa",
+              canonical_path: "/home/operador/Proyectos/cliente-alfa",
+              topology: "multi-project",
+              project_count: 2,
+              projects: [
+                { project_id: "api", name: "api", relative_path: "repositories/api", canonical_path: "/home/operador/Proyectos/cliente-alfa/repositories/api" },
+                { project_id: "web", name: "web", relative_path: "repositories/web", canonical_path: "/home/operador/Proyectos/cliente-alfa/repositories/web" },
+              ],
+            },
+          ],
+          pending_approvals: [],
+          messages: [],
+        }),
+        { status: 200 },
+      );
+    }
+    if (url === "/api/health") {
+      return new Response(JSON.stringify({ all_ok: true, alert_message: null }), { status: 200 });
+    }
+    if (url === "/api/events") {
+      return new Response(new ReadableStream(), {
+        status: 200,
+        headers: { "Content-Type": "text/event-stream" },
+      });
+    }
+    if (url === "/api/settings" && (init.method ?? "GET") === "GET") {
+      return new Response(
+        JSON.stringify({
+          schema_version: 1,
+          config_path: "/home/operador/.config/nova/config.toml",
+          settings: {
+            schema_version: 1,
+            general: { first_run_completed: false, remember_workspace: true, last_active_workspace: null },
+            audio: { capture_target: null, playback_target: null },
+            voice: {
+              enable_voice: true,
+              sensitivity_preset: "normal",
+              wakeword_threshold: 0.6,
+              speech_threshold: 0.5,
+              barge_in_threshold: 0.6,
+              whisper_model: "small",
+              whisper_language: "es",
+              whisper_device: "cuda",
+              tts_engine: "piper",
+              tts_speed: 1.0,
+              kokoro_voice: "ef_dora",
+            },
+            models: { pi_provider: "nvidia", pi_model: "nemotron", tier2_model: "claude-opus-5-5-high" },
+            shortcuts: { global_shortcut: "Super+Shift+Space", ptt_mode: "single_turn" },
+          },
+        }),
+        { status: 200 },
+      );
+    }
+    if (url === "/api/audio/devices") {
+      return new Response(
+        JSON.stringify({
+          available: true,
+          backend: "pipewire",
+          inputs: [{ id: "mic-usb", description: "USB Mic", is_default: true }],
+          outputs: [{ id: "spk-usb", description: "USB Headset", is_default: true }],
+        }),
+        { status: 200 },
+      );
+    }
+    if (url === "/api/diagnostics/microphone") {
+      return new Response(
+        JSON.stringify({
+          ok: true,
+          status: "ok",
+          duration_ms: 500,
+          peak_level: 0.62,
+          rms_level: 0.18,
+          speech_detected: true,
+          transcript_preview: "Hola Nova",
+          message: "Micrófono operativo.",
+        }),
+        { status: 200 },
+      );
+    }
+    if (url === "/api/diagnostics/audio-output") {
+      return new Response(
+        JSON.stringify({ ok: true, status: "ok", engine: "piper", latency_ms: 95, message: "Audio OK." }),
+        { status: 200 },
+      );
+    }
+    if (url === "/api/diagnostics/pi") {
+      return new Response(
+        JSON.stringify({ ok: true, status: "connected", provider: "nvidia", model: "nemotron", latency_ms: 310, message: "Pi conectado." }),
+        { status: 200 },
+      );
+    }
+    if (url === "/api/diagnostics/antigravity") {
+      return new Response(
+        JSON.stringify({ ok: true, status: "connected", model: "claude-opus-5-5-high", plugin_verified: true, latency_ms: 480, message: "Antigravity conectado." }),
+        { status: 200 },
+      );
+    }
+    if (url === "/api/settings" && init.method === "PUT") {
+      const parsed = JSON.parse(init.body);
+      return new Response(
+        JSON.stringify({
+          saved: true,
+          requires_restart: false,
+          restart_fields: [],
+          settings: {
+            schema_version: 1,
+            general: { first_run_completed: Boolean(parsed.general?.first_run_completed), remember_workspace: true, last_active_workspace: null },
+            audio: { capture_target: null, playback_target: null },
+            voice: {
+              enable_voice: true,
+              sensitivity_preset: "normal",
+              wakeword_threshold: 0.6,
+              speech_threshold: 0.5,
+              barge_in_threshold: 0.6,
+              whisper_model: "small",
+              whisper_language: "es",
+              whisper_device: "cuda",
+              tts_engine: "piper",
+              tts_speed: 1.0,
+              kokoro_voice: "ef_dora",
+            },
+            models: { pi_provider: "nvidia", pi_model: "nemotron", tier2_model: "claude-opus-5-5-high" },
+            shortcuts: { global_shortcut: "Super+Shift+Space", ptt_mode: "single_turn" },
+          },
+        }),
+        { status: 200 },
+      );
+    }
+    if (url === "/api/workspace/init") {
+      return new Response(
+        JSON.stringify({
+          created: true,
+          manifest_path: "/home/operador/Proyectos/cliente-nuevo/nova-workspace.toml",
+          workspace: {
+            display_name: "Cliente Nuevo",
+            canonical_path: "/home/operador/Proyectos/cliente-nuevo",
+            selected_via: "ui_picker",
+            topology: "multi-project",
+            projects: [
+              { project_id: "backend", name: "backend", relative_path: "repositories/backend", canonical_path: "/home/operador/Proyectos/cliente-nuevo/repositories/backend" },
+            ],
+          },
+        }),
+        { status: 201 },
+      );
+    }
+    if (url === "/api/workspace/clear") {
+      return new Response(
+        JSON.stringify({ cleared: true, active_workspace: null, process_cwd: "/home/operador" }),
+        { status: 200 },
+      );
+    }
+    return new Response("{}", { status: 404 });
+  };
+
+  const ctrl = new DesktopAppController({
+    fetchImpl: fakeFetch,
+    onRender: (html) => renders.push(html),
+  });
+  await ctrl.start();
+  await new Promise((r) => setTimeout(r, 25));
+
+  // Onboarding modal opened automatically on first run
+  assert.equal(ctrl.model.onboardingOpen, true);
+  const onboardingHtml = renders[renders.length - 1];
+  assert.match(onboardingHtml, /data-slot="onboarding-modal"/);
+  assert.match(onboardingHtml, /data-action="diag-microphone"/);
+  assert.match(onboardingHtml, /data-action="diag-audio-output"/);
+  assert.match(onboardingHtml, /data-action="diag-pi"/);
+  assert.match(onboardingHtml, /data-action="diag-antigravity"/);
+
+  // Run all 4 live diagnostics
+  await ctrl.runAllDiagnostics();
+  assert.equal(ctrl.model.diagnostics?.microphone?.ok, true);
+  assert.equal(ctrl.model.diagnostics?.audioOutput?.ok, true);
+  assert.equal(ctrl.model.diagnostics?.pi?.status, "connected");
+  assert.equal(ctrl.model.diagnostics?.antigravity?.plugin_verified, true);
+
+  // Complete onboarding -> persists general.first_run_completed = true and closes modal
+  await ctrl.completeOnboarding();
+  assert.equal(ctrl.model.onboardingOpen, false);
+  const putOnboarding = requests.find((r) => r.url === "/api/settings" && r.method === "PUT");
+  assert.ok(putOnboarding);
+  assert.equal(JSON.parse(putOnboarding.body).general.first_run_completed, true);
+
+  // Settings drawer also renders the 4 live diagnostic buttons permanently
+  await ctrl.openSettingsDrawer();
+  const drawerHtml = renders[renders.length - 1];
+  assert.match(drawerHtml, /data-action="diag-microphone"/);
+  assert.match(drawerHtml, /data-action="diag-pi"/);
+  assert.match(drawerHtml, /data-action="diag-antigravity"/);
+  ctrl.closeSettingsDrawer();
+
+  // Initialize multi-project workspace and verify active project badges render
+  await ctrl.initializeWorkspace({
+    parentRoot: "/home/operador/Proyectos",
+    workspaceSlug: "cliente-nuevo",
+    displayName: "Cliente Nuevo",
+    projects: ["backend"],
+  });
+  assert.equal(ctrl.model.activeWorkspace?.display_name, "Cliente Nuevo");
+  assert.equal(ctrl.model.activeWorkspace?.projects?.length, 1);
+  const activeWsHtml = renders[renders.length - 1];
+  assert.match(activeWsHtml, /data-action="clear-workspace"/);
+
+  // Clear workspace -> returns to conversational mode (activeWorkspace: null)
+  await ctrl.clearWorkspace();
+  assert.equal(ctrl.model.activeWorkspace, null);
+
+  ctrl.dispose();
 });
 
 

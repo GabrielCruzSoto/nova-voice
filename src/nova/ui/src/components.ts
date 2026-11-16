@@ -7,6 +7,7 @@
 import type {
   AudioDeviceInfo,
   CallSessionState,
+  LiveDiagnosticsState,
   PresentationalAppModel,
   UiApprovalItem,
   UiChatMessage,
@@ -299,9 +300,23 @@ export function renderWorkspaceBar(
   const safeState = escapeHtml(callState);
   const stateMeta = CALL_STATE_LABELS[callState] ?? CALL_STATE_LABELS.standby;
 
+  const projectCount = active?.projects?.length ?? 0;
+  const projectNamesTitle =
+    active?.projects && active.projects.length > 0
+      ? `Proyectos aislados: ${active.projects.map((p) => p.name).join(", ")}`
+      : "";
+  const projectsBadgeHtml =
+    active && active.topology === "multi-project" && projectCount > 0
+      ? `<span class="workspace-projects-badge" title="${escapeHtml(projectNamesTitle)}">${projectCount} ${projectCount === 1 ? "proyecto" : "proyectos"}</span>`
+      : "";
+
   const chipHtml = active
-    ? `<span class="workspace-chip" title="${escapeHtml(active.canonical_path)}">${escapeHtml(active.display_name)}</span>`
-    : `<span class="workspace-chip workspace-chip--empty">Sin proyecto</span>`;
+    ? `<span class="workspace-chip" title="${escapeHtml(active.canonical_path)}">${escapeHtml(active.display_name)}</span>${projectsBadgeHtml}`
+    : `<span class="workspace-chip workspace-chip--empty" title="Modo conversacional en ~ (sin acceso a archivos)">Sin workspace</span>`;
+
+  const clearBtnHtml = active
+    ? `<button type="button" class="btn btn--ghost btn-clear-ws" data-action="clear-workspace" title="Salir del workspace y volver a modo conversacional">Salir</button>`
+    : "";
 
   const optionItems = options
     .map((opt) => {
@@ -370,6 +385,7 @@ export function renderWorkspaceBar(
         >
           Abrir carpeta…
         </button>
+        ${clearBtnHtml}
       </div>
       ${fallbackNote}
     </div>
@@ -433,9 +449,16 @@ export function renderApprovalBanner(approvals: readonly UiApprovalItem[]): stri
 
 const ERROR_CATALOG: Readonly<Record<string, string>> = {
   WORKSPACE_NOT_FOUND: "No se encontró el proyecto indicado.",
+  WORKSPACE_HOME_FORBIDDEN:
+    "La carpeta personal del usuario no puede utilizarse como workspace; seleccioná un workspace aislado.",
   WORKSPACE_OUTSIDE_ALLOWED_ROOTS: "El proyecto se encuentra fuera de las carpetas permitidas.",
+  WORKSPACE_ALREADY_EXISTS: "Ya existe un workspace configurado en esa carpeta.",
+  WORKSPACE_INVALID_MANIFEST:
+    "El manifiesto del workspace o los nombres de proyectos no son válidos.",
   WORKSPACE_AMBIGUOUS: "Se encontraron varios proyectos que coinciden con el nombre.",
   WORKSPACE_RESOLUTION_TIMEOUT: "Se agotó el tiempo al intentar resolver el proyecto.",
+  DIAGNOSTIC_INVALID_PARAMS: "Los parámetros de la prueba de diagnóstico no son válidos.",
+  UI_DIAGNOSTICS_UNAVAILABLE: "El servicio de diagnóstico en vivo no está disponible.",
   UI_VOICE_UNAVAILABLE: "El servicio de voz no está disponible en este momento.",
   UI_EMPTY_UTTERANCE: "El mensaje no puede estar vacío.",
   UI_PAYLOAD_TOO_LARGE: "El tamaño del contenido supera el límite permitido.",
@@ -472,41 +495,82 @@ const ROLE_BADGE_MAP: Readonly<Record<string, string>> = {
   security: "Gatekeeper",
 };
 
-export function renderWorkspaceEmptyState(options: readonly UiWorkspaceOption[]): string {
+export function renderWorkspaceEmptyState(
+  options: readonly UiWorkspaceOption[],
+  initWorkspaceOpen = false,
+  allowedRoots: readonly string[] = [],
+): string {
   const optionsHtml =
     options.length > 0
       ? `
       <div class="workspace-catalog">
         ${options
-          .map(
-            (opt) => `
+          .map((opt) => {
+            const countHint =
+              opt.topology === "multi-project" && typeof opt.project_count === "number"
+                ? ` (${opt.project_count} proy.)`
+                : "";
+            return `
           <button
             type="button"
             class="btn-workspace-option"
             data-action="select-workspace-option"
             data-canonical-path="${escapeHtml(opt.canonical_path)}"
           >
-            ${escapeHtml(opt.display_name)}
+            ${escapeHtml(opt.display_name)}${escapeHtml(countHint)}
           </button>
-        `,
-          )
+        `;
+          })
           .join("")}
       </div>
     `.trim()
       : "";
 
+  const defaultParentRoot = allowedRoots[0] ?? "";
+  const initFormHtml = initWorkspaceOpen
+    ? `
+      <form class="workspace-init-form" data-action="init-workspace-form">
+        <input type="hidden" name="parent_root" value="${escapeHtml(defaultParentRoot)}" />
+        <label class="nova-settings-field">
+          <span>Identificador del workspace (carpeta)</span>
+          <input type="text" name="workspace_slug" placeholder="cliente-acme-workspace" maxlength="80" required />
+        </label>
+        <label class="nova-settings-field">
+          <span>Nombre visible</span>
+          <input type="text" name="display_name" placeholder="Cliente Acme" maxlength="100" />
+        </label>
+        <label class="nova-settings-field">
+          <span>Proyectos aislados (separados por coma)</span>
+          <input type="text" name="projects" placeholder="api-backend, web-portal" maxlength="240" />
+        </label>
+        <div class="workspace-init-actions">
+          <button type="submit" class="btn btn--primary">Crear workspace</button>
+          <button type="button" class="btn btn--ghost" data-action="toggle-init-workspace">Cancelar</button>
+        </div>
+      </form>
+    `.trim()
+    : "";
+
   return `
     <div class="workspace-empty-state" data-slot="workspace-empty-state">
       <h2 class="workspace-empty-title">Elegí un proyecto</h2>
-      <p class="workspace-empty-desc">Para comenzar a trabajar, seleccioná un proyecto del catálogo o abrí una carpeta.</p>
+      <p class="workspace-empty-desc">Modo conversacional activo sin acceso a archivos. Podés conversar ahora mismo o seleccionar un workspace aislado.</p>
       ${optionsHtml}
-      <button
-        type="button"
-        class="btn btn--secondary"
-        data-action="pick-native"
-      >
-        Abrir carpeta…
-      </button>
+      <div class="workspace-empty-actions">
+        <button
+          type="button"
+          class="btn btn--secondary"
+          data-action="pick-native"
+        >
+          Abrir carpeta…
+        </button>
+        ${
+          defaultParentRoot
+            ? `<button type="button" class="btn btn--ghost" data-action="toggle-init-workspace">Nuevo workspace…</button>`
+            : ""
+        }
+      </div>
+      ${initFormHtml}
     </div>
   `.trim();
 }
@@ -517,6 +581,8 @@ export function renderChatTimeline(
   errorBanner: string | null,
   activeWorkspace?: UiWorkspaceView | null,
   availableWorkspaces: readonly UiWorkspaceOption[] = [],
+  initWorkspaceOpen = false,
+  allowedRoots: readonly string[] = [],
 ): string {
   const safeError = errorBanner
     ? `<div class="timeline-error-banner" role="alert">${escapeHtml(errorBanner)}</div>`
@@ -530,11 +596,13 @@ export function renderChatTimeline(
     `.trim();
   }
 
-  if (activeWorkspace === null) {
+  const visibleMessages = messages.filter((msg) => msg.modality !== "error");
+
+  if (activeWorkspace === null && visibleMessages.length === 0) {
     return `
       <div class="chat-timeline chat-timeline--state" data-view-status="${escapeHtml(status)}">
         ${safeError}
-        ${renderWorkspaceEmptyState(availableWorkspaces)}
+        ${renderWorkspaceEmptyState(availableWorkspaces, initWorkspaceOpen, allowedRoots)}
       </div>
     `.trim();
   }
@@ -546,8 +614,6 @@ export function renderChatTimeline(
       </div>
     `.trim();
   }
-
-  const visibleMessages = messages.filter((msg) => msg.modality !== "error");
 
   if (status === "empty" || visibleMessages.length === 0) {
     return `
@@ -703,9 +769,7 @@ export function renderDock(model: PresentationalAppModel): string {
 
   if (!inCall) {
     const hasWorkspace = model.activeWorkspace !== null;
-    const inputDisabledAttr = !hasWorkspace ? ' disabled' : "";
-    const describedByAttr = !hasWorkspace ? ' aria-describedby="composer-no-workspace-hint"' : "";
-    const submitDisabledAttr = !hasWorkspace ? ' disabled' : "";
+    const describedByAttr = !hasWorkspace ? ' aria-describedby="composer-conversational-hint"' : "";
 
     return `
       <div class="nova-dock-content nova-dock-content--standby">
@@ -720,9 +784,9 @@ export function renderDock(model: PresentationalAppModel): string {
               rows="1"
               maxlength="16000"
               placeholder="Pregúntale a Nova…"
-              required${inputDisabledAttr}${describedByAttr}
+              required${describedByAttr}
             ></textarea>
-            ${!hasWorkspace ? `<span id="composer-no-workspace-hint" class="sr-only">Selecciona un proyecto para chatear</span>` : ""}
+            ${!hasWorkspace ? `<span id="composer-conversational-hint" class="sr-only">Modo conversacional activo sin workspace (sin acceso a archivos)</span>` : ""}
             <div class="composer-actions">
               <button
                 type="button"
@@ -738,7 +802,7 @@ export function renderDock(model: PresentationalAppModel): string {
                   <line x1="8" y1="23" x2="16" y2="23" />
                 </svg>
               </button>
-              <button type="submit" class="btn-icon btn-send" title="Enviar mensaje" aria-label="Enviar"${submitDisabledAttr}>
+              <button type="submit" class="btn-icon btn-send" title="Enviar mensaje" aria-label="Enviar">
                 <svg viewBox="0 0 24 24" width="18" height="18" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">
                   <line x1="22" y1="2" x2="11" y2="13" />
                   <polygon points="22 2 15 22 11 13 2 9 22 2" />
@@ -795,6 +859,131 @@ function renderAudioDeviceOptions(
     })
     .join("");
   return `<option value=""${defaultSelected}>Predeterminado del sistema</option>${items}`;
+}
+
+function renderLiveDiagnosticsPanel(diag: LiveDiagnosticsState | null | undefined): string {
+  const running = diag?.runningTarget ?? null;
+  const busyAttr = running !== null ? " disabled" : "";
+  const mic = diag?.microphone ?? null;
+  const out = diag?.audioOutput ?? null;
+  const pi = diag?.pi ?? null;
+  const agy = diag?.antigravity ?? null;
+
+  const micDetail = mic
+    ? `<p class="diag-result ${mic.ok ? "diag-result--ok" : "diag-result--warn"}">${escapeHtml(mic.message)} (pico ${(mic.peak_level * 100).toFixed(0)}%)${mic.transcript_preview ? ` · «${escapeHtml(mic.transcript_preview)}»` : ""}</p>`
+    : "";
+  const outDetail = out
+    ? `<p class="diag-result ${out.ok ? "diag-result--ok" : "diag-result--warn"}">${escapeHtml(out.message)} (${out.latency_ms.toFixed(0)} ms)</p>`
+    : "";
+  const piDetail = pi
+    ? `<p class="diag-result ${pi.ok ? "diag-result--ok" : "diag-result--warn"}">${escapeHtml(pi.message)} (${pi.latency_ms.toFixed(0)} ms)</p>`
+    : "";
+  const agyDetail = agy
+    ? `<p class="diag-result ${agy.ok ? "diag-result--ok" : "diag-result--warn"}">${escapeHtml(agy.message)} (${agy.latency_ms.toFixed(0)} ms)</p>`
+    : "";
+
+  return `
+    <div class="nova-diagnostics-grid">
+      <div class="diag-card">
+        <div class="diag-card-row">
+          <span>1. Micrófono</span>
+          <button type="button" class="btn btn--secondary" data-action="diag-microphone"${busyAttr}>
+            ${running === "microphone" ? "Probando…" : "Probar micrófono"}
+          </button>
+        </div>
+        ${micDetail}
+      </div>
+      <div class="diag-card">
+        <div class="diag-card-row">
+          <span>2. Salida de audio</span>
+          <button type="button" class="btn btn--secondary" data-action="diag-audio-output"${busyAttr}>
+            ${running === "audio-output" ? "Probando…" : "Probar audio"}
+          </button>
+        </div>
+        ${outDetail}
+      </div>
+      <div class="diag-card">
+        <div class="diag-card-row">
+          <span>3. Conexión Nova ↔ Pi</span>
+          <button type="button" class="btn btn--secondary" data-action="diag-pi"${busyAttr}>
+            ${running === "pi" ? "Verificando…" : "Probar Pi"}
+          </button>
+        </div>
+        ${piDetail}
+      </div>
+      <div class="diag-card">
+        <div class="diag-card-row">
+          <span>4. Conexión Nova ↔ Antigravity</span>
+          <button type="button" class="btn btn--secondary" data-action="diag-antigravity"${busyAttr}>
+            ${running === "antigravity" ? "Verificando…" : "Probar Antigravity"}
+          </button>
+        </div>
+        ${agyDetail}
+      </div>
+      <div class="diag-actions-bar">
+        <button type="button" class="btn btn--ghost" data-action="diag-run-all"${busyAttr}>
+          ${running === "all" ? "Ejecutando pruebas…" : "Ejecutar las 4 pruebas"}
+        </button>
+      </div>
+    </div>
+  `.trim();
+}
+
+export function renderOnboardingModal(model: PresentationalAppModel): string {
+  if (!model.onboardingOpen) {
+    return "";
+  }
+  const inputs = model.audioDevices?.inputs ?? [];
+  const outputs = model.audioDevices?.outputs ?? [];
+  const capTarget = model.settingsData?.audio.capture_target ?? null;
+  const playTarget = model.settingsData?.audio.playback_target ?? null;
+  const savingAttr = model.onboardingSaving ? " disabled" : "";
+
+  return `
+    <div class="nova-settings-backdrop" data-slot="onboarding-modal">
+      <section
+        class="nova-onboarding-modal"
+        role="dialog"
+        aria-modal="true"
+        aria-label="Configuración inicial y diagnóstico en vivo"
+      >
+        <div class="nova-settings-header">
+          <h2 class="nova-settings-title">Configuración inicial y diagnóstico</h2>
+        </div>
+        <p class="nova-onboarding-desc">
+          Verificá que tu micrófono, parlantes y conexiones con Pi y Antigravity respondan antes de comenzar. Al finalizar, Nova iniciará en modo conversacional sin workspace activo.
+        </p>
+        <div class="nova-settings-section">
+          <h3 class="nova-settings-section-title">Dispositivos de audio</h3>
+          <label class="nova-settings-field">
+            <span>Micrófono</span>
+            <select name="onboarding.capture_target" data-action="onboarding-audio-select">
+              ${renderAudioDeviceOptions(inputs, capTarget)}
+            </select>
+          </label>
+          <label class="nova-settings-field">
+            <span>Salida de audio</span>
+            <select name="onboarding.playback_target" data-action="onboarding-audio-select">
+              ${renderAudioDeviceOptions(outputs, playTarget)}
+            </select>
+          </label>
+        </div>
+        <div class="nova-settings-section">
+          <h3 class="nova-settings-section-title">Pruebas interactivas en vivo</h3>
+          ${renderLiveDiagnosticsPanel(model.diagnostics)}
+        </div>
+        <div class="nova-settings-footer">
+          <button
+            type="button"
+            class="btn btn--primary"
+            data-action="complete-onboarding"${savingAttr}
+          >
+            ${model.onboardingSaving ? "Guardando…" : "Finalizar configuración"}
+          </button>
+        </div>
+      </section>
+    </div>
+  `.trim();
 }
 
 export function renderSettingsDrawer(model: PresentationalAppModel): string {
@@ -932,8 +1121,13 @@ export function renderSettingsDrawer(model: PresentationalAppModel): string {
             </label>
             <label class="nova-settings-checkbox">
               <input type="checkbox" name="general.remember_workspace"${rememberWs ? " checked" : ""} />
-              <span>Recordar último proyecto al iniciar</span>
+              <span>Recordar último workspace al iniciar</span>
             </label>
+          </section>
+
+          <section class="nova-settings-section">
+            <h3 class="nova-settings-section-title">Diagnóstico y pruebas en vivo</h3>
+            ${renderLiveDiagnosticsPanel(model.diagnostics)}
           </section>
 
           <div class="nova-settings-footer">
@@ -1004,6 +1198,8 @@ export function renderAppShell(model: PresentationalAppModel): string {
             model.errorBanner,
             model.activeWorkspace,
             model.availableWorkspaces,
+            Boolean(model.initWorkspaceOpen),
+            model.allowedRoots ?? [],
           )}
         </div>
 
@@ -1020,6 +1216,7 @@ export function renderAppShell(model: PresentationalAppModel): string {
         </div>
       </main>
       <div data-slot="settings-drawer">${renderSettingsDrawer(model)}</div>
+      <div data-slot="onboarding-container">${renderOnboardingModal(model)}</div>
     </div>
   `.trim();
 }

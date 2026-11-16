@@ -14,14 +14,22 @@ import {
   renderNoticeSlot,
   renderNovaReactiveOrb,
   renderNovaSquircleSvg,
+  renderOnboardingModal,
   renderSettingsDrawer,
   renderSinusoidalWave,
   renderWorkspaceBar,
   resolveHumanNotice,
 } from "./components.js";
 import type {
+  AntigravityDiagnosticResponse,
   AudioDeviceCatalog,
+  AudioOutputDiagnosticResponse,
+  DiagnosticTarget,
   ErrorResponse,
+  InitializeWorkspaceParams,
+  LiveDiagnosticsState,
+  MicDiagnosticResponse,
+  PiDiagnosticResponse,
   PresentationalAppModel,
   SettingsGetResponse,
   SettingsPutResponse,
@@ -29,6 +37,7 @@ import type {
   UiApprovalItem,
   UiChatMessage,
   UiEventEnvelope,
+  UiProjectView,
   UiStateSnapshot,
   UiWorkspaceView,
   ViewStatus,
@@ -77,6 +86,18 @@ export class DesktopAppController {
     pickerFallbackOpen: false,
     lastMilestone: null,
     uiMode: "panel",
+    onboardingOpen: false,
+    onboardingSaving: false,
+    processCwd: "",
+    allowedRoots: [],
+    initWorkspaceOpen: false,
+    diagnostics: {
+      runningTarget: null,
+      microphone: null,
+      audioOutput: null,
+      pi: null,
+      antigravity: null,
+    },
   };
 
   constructor(options: DesktopControllerOptions = {}) {
@@ -114,6 +135,10 @@ export class DesktopAppController {
       }
       const snapshot = (await resp.json()) as UiStateSnapshot;
       this.#applySnapshot(snapshot);
+
+      if (snapshot.onboarding_required) {
+        await this.#preloadSettingsAndDevices();
+      }
 
       try {
         const healthResp = await this.#fetch("/api/health", {
@@ -168,7 +193,7 @@ export class DesktopAppController {
 
   async submitChat(utterance: string): Promise<void> {
     const trimmed = utterance.trim();
-    if (!trimmed || this.#disposed || !this.#model.activeWorkspace) {
+    if (!trimmed || this.#disposed) {
       return;
     }
     const resp = await this.#postJson("/api/chat", { utterance: trimmed });
@@ -273,6 +298,284 @@ export class DesktopAppController {
     }
     if ((this.#model.uiMode ?? "panel") === "orb") {
       this.#updateModel({ uiMode: "panel" });
+    }
+  }
+
+  toggleInitWorkspaceForm(): void {
+    if (this.#disposed) {
+      return;
+    }
+    this.#updateModel({ initWorkspaceOpen: !this.#model.initWorkspaceOpen });
+  }
+
+  async clearWorkspace(): Promise<void> {
+    if (this.#disposed) {
+      return;
+    }
+    const resp = await this.#postJson("/api/workspace/clear", {});
+    if (!resp.ok) {
+      const errBody = await this.#safeParseError(resp);
+      const code = errBody?.error_code ?? "ORCHESTRATOR_UNEXPECTED_FAILURE";
+      this.#updateModel({ noticeBanner: resolveHumanNotice(code), errorBanner: null });
+      return;
+    }
+    this.#updateModel({
+      activeWorkspace: null,
+      initWorkspaceOpen: false,
+      pickerFallbackOpen: false,
+      errorBanner: null,
+      noticeBanner: null,
+    });
+  }
+
+  async initializeWorkspace(params: InitializeWorkspaceParams): Promise<void> {
+    if (this.#disposed) {
+      return;
+    }
+    const slug = params.workspaceSlug.trim();
+    const parent = params.parentRoot.trim();
+    if (!slug || !parent) {
+      return;
+    }
+    const resp = await this.#postJson("/api/workspace/init", {
+      parent_root: parent,
+      workspace_slug: slug,
+      display_name: params.displayName?.trim() || null,
+      projects: params.projects.map((p) => p.trim()).filter((p) => p.length > 0),
+      activate: true,
+    });
+    if (!resp.ok) {
+      const errBody = await this.#safeParseError(resp);
+      const code = errBody?.error_code ?? "WORKSPACE_INVALID_MANIFEST";
+      this.#updateModel({ noticeBanner: resolveHumanNotice(code), errorBanner: null });
+      return;
+    }
+    const data = (await resp.json()) as {
+      created: boolean;
+      workspace: UiWorkspaceView;
+    };
+    if (data.created && data.workspace) {
+      const existsInList = this.#model.availableWorkspaces.some(
+        (w) => w.canonical_path === data.workspace.canonical_path,
+      );
+      const nextAvailable = existsInList
+        ? this.#model.availableWorkspaces
+        : [
+            ...this.#model.availableWorkspaces,
+            {
+              display_name: data.workspace.display_name,
+              canonical_path: data.workspace.canonical_path,
+              topology: data.workspace.topology,
+              project_count: data.workspace.projects?.length ?? 0,
+              projects: data.workspace.projects,
+            },
+          ];
+      this.#updateModel({
+        activeWorkspace: data.workspace,
+        availableWorkspaces: nextAvailable,
+        initWorkspaceOpen: false,
+        pickerFallbackOpen: false,
+        errorBanner: null,
+        noticeBanner: null,
+      });
+    }
+  }
+
+  #currentDiagState(): LiveDiagnosticsState {
+    return (
+      this.#model.diagnostics ?? {
+        runningTarget: null,
+        microphone: null,
+        audioOutput: null,
+        pi: null,
+        antigravity: null,
+      }
+    );
+  }
+
+  async runDiagnostic(
+    target: DiagnosticTarget,
+    options?: { keepRunningAll?: boolean },
+  ): Promise<void> {
+    if (this.#disposed) {
+      return;
+    }
+    const baseDiag = this.#currentDiagState();
+    this.#updateModel({
+      diagnostics: {
+        ...baseDiag,
+        runningTarget: options?.keepRunningAll ? "all" : target,
+      },
+    });
+
+    const s = this.#model.settingsData;
+    try {
+      if (target === "microphone") {
+        const resp = await this.#postJson("/api/diagnostics/microphone", {
+          capture_target: s?.audio.capture_target ?? null,
+          duration_seconds: 2.0,
+        });
+        if (resp.ok) {
+          const payload = (await resp.json()) as MicDiagnosticResponse;
+          this.#updateModel({
+            diagnostics: {
+              ...this.#currentDiagState(),
+              runningTarget: options?.keepRunningAll ? "all" : null,
+              microphone: payload,
+            },
+          });
+          return;
+        }
+      } else if (target === "audio-output") {
+        const resp = await this.#postJson("/api/diagnostics/audio-output", {
+          playback_target: s?.audio.playback_target ?? null,
+        });
+        if (resp.ok) {
+          const payload = (await resp.json()) as AudioOutputDiagnosticResponse;
+          this.#updateModel({
+            diagnostics: {
+              ...this.#currentDiagState(),
+              runningTarget: options?.keepRunningAll ? "all" : null,
+              audioOutput: payload,
+            },
+          });
+          return;
+        }
+      } else if (target === "pi") {
+        const resp = await this.#postJson("/api/diagnostics/pi", {
+          provider: s?.models.pi_provider ?? null,
+          model: s?.models.pi_model ?? null,
+        });
+        if (resp.ok) {
+          const payload = (await resp.json()) as PiDiagnosticResponse;
+          this.#updateModel({
+            diagnostics: {
+              ...this.#currentDiagState(),
+              runningTarget: options?.keepRunningAll ? "all" : null,
+              pi: payload,
+            },
+          });
+          return;
+        }
+      } else if (target === "antigravity") {
+        const resp = await this.#postJson("/api/diagnostics/antigravity", {
+          model: s?.models.tier2_model ?? null,
+        });
+        if (resp.ok) {
+          const payload = (await resp.json()) as AntigravityDiagnosticResponse;
+          this.#updateModel({
+            diagnostics: {
+              ...this.#currentDiagState(),
+              runningTarget: options?.keepRunningAll ? "all" : null,
+              antigravity: payload,
+            },
+          });
+          return;
+        }
+      }
+    } catch {
+      // Handled by resetting runningTarget below
+    }
+
+    if (!options?.keepRunningAll && !this.#disposed) {
+      this.#updateModel({
+        diagnostics: {
+          ...this.#currentDiagState(),
+          runningTarget: null,
+        },
+      });
+    }
+  }
+
+  async runAllDiagnostics(): Promise<void> {
+    if (this.#disposed) {
+      return;
+    }
+    const order: readonly DiagnosticTarget[] = [
+      "microphone",
+      "audio-output",
+      "pi",
+      "antigravity",
+    ];
+    for (const target of order) {
+      if (this.#disposed) {
+        return;
+      }
+      await this.runDiagnostic(target, { keepRunningAll: true });
+    }
+    if (!this.#disposed) {
+      this.#updateModel({
+        diagnostics: {
+          ...this.#currentDiagState(),
+          runningTarget: null,
+        },
+      });
+    }
+  }
+
+  async completeOnboarding(audioOverride?: {
+    captureTarget?: string;
+    playbackTarget?: string;
+  }): Promise<void> {
+    if (this.#disposed) {
+      return;
+    }
+    this.#updateModel({ onboardingSaving: true });
+    const patch: Record<string, unknown> = {
+      general: { first_run_completed: true },
+    };
+    if (audioOverride) {
+      patch["audio"] = {
+        capture_target: audioOverride.captureTarget ?? "",
+        playback_target: audioOverride.playbackTarget ?? "",
+      };
+    }
+    const resp = await this.#sendJson("PUT", "/api/settings", patch);
+    if (!resp.ok) {
+      const err = await this.#safeParseError(resp);
+      this.#updateModel({
+        onboardingSaving: false,
+        noticeBanner: resolveHumanNotice(
+          err?.error_code ?? "ORCHESTRATOR_UNEXPECTED_FAILURE",
+          err?.message,
+        ),
+      });
+      return;
+    }
+    const payload = (await resp.json()) as SettingsPutResponse;
+    this.#updateModel({
+      onboardingSaving: false,
+      onboardingOpen: false,
+      settingsData: payload.settings,
+      lastMilestone: "Configuración inicial completada.",
+    });
+  }
+
+  async #preloadSettingsAndDevices(): Promise<void> {
+    try {
+      const [settingsResp, audioResp] = await Promise.all([
+        this.#fetch("/api/settings", {
+          method: "GET",
+          credentials: "same-origin",
+          signal: this.#abortController.signal,
+        }),
+        this.#fetch("/api/audio/devices", {
+          method: "GET",
+          credentials: "same-origin",
+          signal: this.#abortController.signal,
+        }),
+      ]);
+      const nextSettings = settingsResp.ok
+        ? ((await settingsResp.json()) as SettingsGetResponse).settings
+        : (this.#model.settingsData ?? null);
+      const nextAudio = audioResp.ok
+        ? ((await audioResp.json()) as AudioDeviceCatalog)
+        : (this.#model.audioDevices ?? null);
+      if (!this.#disposed) {
+        this.#updateModel({ settingsData: nextSettings, audioDevices: nextAudio });
+      }
+    } catch {
+      // Non-blocking onboarding preload
     }
   }
 
@@ -594,9 +897,18 @@ export class DesktopAppController {
     }
     const capped = snap.messages.slice(-MAX_CLIENT_MESSAGES);
     const nextStatus: ViewStatus = capped.length > 0 ? "success" : "empty";
+    const nextOnboarding =
+      snap.onboarding_required === true
+        ? true
+        : snap.onboarding_required === false
+          ? false
+          : Boolean(this.#model.onboardingOpen);
     this.#updateModel({
       status: nextStatus,
       voiceEnabled: snap.voice_enabled,
+      onboardingOpen: nextOnboarding,
+      processCwd: snap.process_cwd ?? this.#model.processCwd ?? "",
+      allowedRoots: snap.allowed_roots ?? this.#model.allowedRoots ?? [],
       callSession: snap.call_session,
       activeWorkspace: snap.active_workspace,
       availableWorkspaces: snap.available_workspaces,
@@ -610,12 +922,30 @@ export class DesktopAppController {
     const p = env.payload;
 
     if (env.event_type === "workspace_changed") {
+      const rawProjects = Array.isArray(p["projects"]) ? (p["projects"] as UiProjectView[]) : [];
+      const rawTopo = p["topology"] === "multi-project" ? "multi-project" : "single-repo";
       const ws: UiWorkspaceView = {
         display_name: String(p["display_name"] ?? ""),
         canonical_path: String(p["canonical_path"] ?? ""),
         selected_via: (p["selected_via"] as UiWorkspaceView["selected_via"]) ?? "exact_path",
+        topology: rawTopo,
+        projects: rawProjects,
       };
-      this.#updateModel({ activeWorkspace: ws, pickerFallbackOpen: false });
+      this.#updateModel({
+        activeWorkspace: ws,
+        pickerFallbackOpen: false,
+        initWorkspaceOpen: false,
+      });
+      return;
+    }
+
+    if (env.event_type === "workspace_cleared") {
+      this.#updateModel({
+        activeWorkspace: null,
+        pickerFallbackOpen: false,
+        initWorkspaceOpen: false,
+        processCwd: String(p["process_cwd"] ?? this.#model.processCwd ?? ""),
+      });
       return;
     }
 
@@ -791,6 +1121,8 @@ export class DesktopAppController {
         this.#model.errorBanner,
         this.#model.activeWorkspace,
         this.#model.availableWorkspaces,
+        Boolean(this.#model.initWorkspaceOpen),
+        this.#model.allowedRoots ?? [],
       );
       timelineSlot.scrollTop = timelineSlot.scrollHeight;
     }
@@ -855,6 +1187,12 @@ export class DesktopAppController {
     if (settingsSlot) {
       settingsSlot.innerHTML = renderSettingsDrawer(this.#model);
     }
+    const onboardingSlot = this.#root.querySelector<HTMLElement>(
+      '[data-slot="onboarding-container"]',
+    );
+    if (onboardingSlot) {
+      onboardingSlot.innerHTML = renderOnboardingModal(this.#model);
+    }
   }
 
   #bindDomEvents(): void {
@@ -907,6 +1245,35 @@ export class DesktopAppController {
           );
           const shortcut = shortcutInput?.value.trim() || "Super+Shift+Space";
           void this.registerGlobalShortcut(shortcut);
+        } else if (action === "clear-workspace") {
+          void this.clearWorkspace();
+        } else if (action === "toggle-init-workspace") {
+          this.toggleInitWorkspaceForm();
+        } else if (action === "diag-microphone") {
+          void this.runDiagnostic("microphone");
+        } else if (action === "diag-audio-output") {
+          void this.runDiagnostic("audio-output");
+        } else if (action === "diag-pi") {
+          void this.runDiagnostic("pi");
+        } else if (action === "diag-antigravity") {
+          void this.runDiagnostic("antigravity");
+        } else if (action === "diag-run-all") {
+          void this.runAllDiagnostics();
+        } else if (action === "complete-onboarding") {
+          const capEl = root.querySelector<HTMLSelectElement>(
+            'select[name="onboarding.capture_target"]',
+          );
+          const playEl = root.querySelector<HTMLSelectElement>(
+            'select[name="onboarding.playback_target"]',
+          );
+          const audioOverride =
+            capEl || playEl
+              ? {
+                  captureTarget: capEl?.value ?? "",
+                  playbackTarget: playEl?.value ?? "",
+                }
+              : undefined;
+          void this.completeOnboarding(audioOverride);
         }
       },
       { signal: sig },
@@ -951,6 +1318,29 @@ export class DesktopAppController {
     root.addEventListener(
       "submit",
       (ev) => {
+        const initWsForm = (ev.target as HTMLElement | null)?.closest<HTMLFormElement>(
+          '[data-action="init-workspace-form"]',
+        );
+        if (initWsForm) {
+          ev.preventDefault();
+          const fd = new FormData(initWsForm);
+          const parentRoot = String(fd.get("parent_root") ?? "").trim();
+          const workspaceSlug = String(fd.get("workspace_slug") ?? "").trim();
+          const displayName = String(fd.get("display_name") ?? "").trim();
+          const rawProjects = String(fd.get("projects") ?? "");
+          const projects = rawProjects
+            .split(",")
+            .map((x) => x.trim())
+            .filter((x) => x.length > 0);
+          void this.initializeWorkspace({
+            parentRoot,
+            workspaceSlug,
+            displayName: displayName || undefined,
+            projects,
+          });
+          return;
+        }
+
         const settingsForm = (ev.target as HTMLElement | null)?.closest<HTMLFormElement>(
           '[data-action="settings-form"]',
         );
