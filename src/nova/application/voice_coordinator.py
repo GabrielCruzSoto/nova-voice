@@ -7,6 +7,7 @@ import contextlib
 import json
 import logging
 import math
+import re
 import struct
 import time
 import uuid
@@ -54,6 +55,25 @@ _HOLD_REMINDER_TEXT = (
     "Hay un comando pendiente de aprobacion. Responde aprobar comando o rechazar comando."
 )
 _MAX_TRACKED_APPROVALS = 64
+_STANDBY_SPOTTER_MAX_CHUNK_BYTES = 64_000
+_WAKE_PHRASE_RE = re.compile(
+    r"\b(?:(?:oye|hola|hey|ok|okay)\s*[,.:;¡!¿?-]*\s+(?:nova|no\s+va|noba|nava)|nova)\b",
+    re.IGNORECASE,
+)
+
+
+def _extract_post_wake_utterance(raw_text: str) -> tuple[bool, str]:
+    """Return (wake_detected, post_wake_remainder) for a standby STT transcript."""
+    text = raw_text.strip()
+    if not text:
+        return False, ""
+    match = _WAKE_PHRASE_RE.search(text)
+    if match is None:
+        return False, ""
+    remainder = text[match.end() :].lstrip(" ,.:;¡!¿?-").strip()
+    if any(ch.isalnum() for ch in remainder):
+        return True, remainder
+    return True, ""
 
 
 @dataclass(slots=True, frozen=True)
@@ -112,7 +132,8 @@ def generate_earcon_chime(sample_rate_hz: int = 16000) -> SynthesizedAudio:
             envelope = i / fade_samples
         elif i > total_samples_1 - fade_samples:
             envelope = (total_samples_1 - i) / fade_samples
-        val = int(32767.0 * volume * envelope * math.sin(2.0 * math.pi * tone1_freq * (i / sample_rate_hz)))
+        angle = 2.0 * math.pi * tone1_freq * (i / sample_rate_hz)
+        val = int(32767.0 * volume * envelope * math.sin(angle))
         pcm_bytes.extend(struct.pack("<h", max(-32768, min(32767, val))))
 
     # Tone 2
@@ -122,7 +143,8 @@ def generate_earcon_chime(sample_rate_hz: int = 16000) -> SynthesizedAudio:
             envelope = i / fade_samples
         elif i > total_samples_2 - fade_samples:
             envelope = (total_samples_2 - i) / fade_samples
-        val = int(32767.0 * volume * envelope * math.sin(2.0 * math.pi * tone2_freq * (i / sample_rate_hz)))
+        angle = 2.0 * math.pi * tone2_freq * (i / sample_rate_hz)
+        val = int(32767.0 * volume * envelope * math.sin(angle))
         pcm_bytes.extend(struct.pack("<h", max(-32768, min(32767, val))))
 
     return SynthesizedAudio(
@@ -147,6 +169,7 @@ class VoiceCoordinatorSettings(BaseModel):
     call_idle_timeout_seconds: float = Field(default=180.0, gt=0.0, le=3600.0)
     allow_barge_in_during_tts: bool = True
     barge_in_grace_seconds: float = Field(default=0.35, ge=0.0, le=2.0)
+    capture_retry_delay_seconds: float = Field(default=0.25, ge=0.01, le=5.0)
     enable_wake_earcon: bool = True
     ptt_mode: PttMode = "single_turn"
 
@@ -208,6 +231,8 @@ class VoiceCallCoordinator:
             maxsize=8
         )
         self._current_stt_task: asyncio.Task[TranscriptionResult] | None = None
+        self._standby_spotter_task: asyncio.Task[None] | None = None
+        self._pending_standby_followup: tuple[bytes, int, float] | None = None
         self._capture_task: asyncio.Task[None] | None = None
         self._segment_worker_task: asyncio.Task[None] | None = None
         self._tts_worker_task: asyncio.Task[None] | None = None
@@ -277,10 +302,30 @@ class VoiceCallCoordinator:
             with contextlib.suppress(asyncio.QueueEmpty):
                 _ = self._segment_queue.get_nowait()
 
-    async def start_call(self, reason: str = "manual_call_start") -> None:
+    async def _cancel_standby_spotter(self) -> None:
+        spotter_task = self._standby_spotter_task
+        self._standby_spotter_task = None
+        if (
+            spotter_task is not None
+            and not spotter_task.done()
+            and spotter_task is not asyncio.current_task()
+        ):
+            spotter_task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await spotter_task
+
+    async def start_call(
+        self,
+        reason: str = "manual_call_start",
+        *,
+        preserve_standby_followup: bool = False,
+    ) -> None:
         """Explicitly open a continuous CallSession in 'listening' state."""
         if self._session.state == "closed":
             return
+        followup = self._pending_standby_followup if preserve_standby_followup else None
+        self._pending_standby_followup = None
+        await self._cancel_standby_spotter()
         self._call_open = True
         self._call_epoch += 1
         self._capture_reset_epoch += 1
@@ -304,6 +349,9 @@ class VoiceCallCoordinator:
             "ptt_hold_start",
         ):
             asyncio.create_task(self._play_earcon_safe())
+        if followup is not None:
+            seg_bytes, seg_rate, seg_started = followup
+            self._enqueue_segment(seg_bytes, seg_rate, seg_started)
 
     async def _play_earcon_safe(self) -> None:
         if not self._settings.enable_wake_earcon or self._earcon_audio is None:
@@ -322,11 +370,13 @@ class VoiceCallCoordinator:
         self._call_open = False
         self._call_epoch += 1
         self._capture_reset_epoch += 1
+        self._pending_standby_followup = None
+        await self._cancel_standby_spotter()
         self._single_turn_active = False
         self._ptt_hold_active = False
         self._flush_ptt_hold = False
         self._speaking_started_at = 0.0
-        self._earcon_audio: SynthesizedAudio | None = generate_earcon_chime(sample_rate_hz=16000)
+        self._earcon_audio = generate_earcon_chime(sample_rate_hz=16000)
         self._purge_segment_queue()
 
         stt_task = self._current_stt_task
@@ -430,11 +480,13 @@ class VoiceCallCoordinator:
         self._ptt_hold_active = False
         self._flush_ptt_hold = False
         self._speaking_started_at = 0.0
-        self._earcon_audio: SynthesizedAudio | None = generate_earcon_chime(sample_rate_hz=16000)
+        self._earcon_audio = generate_earcon_chime(sample_rate_hz=16000)
         self._purge_segment_queue()
         self._tts_queue.clear()
+        self._pending_standby_followup = None
         self._started = False
 
+        await self._cancel_standby_spotter()
         stt_task = self._current_stt_task
         if stt_task is not None and not stt_task.done():
             stt_task.cancel()
@@ -580,6 +632,9 @@ class VoiceCallCoordinator:
             with contextlib.suppress(asyncio.CancelledError):
                 await item_task
 
+    def _should_keep_capturing(self) -> bool:
+        return self._started and self._session.state != "closed"
+
     async def _capture_loop(self) -> None:
         pre_roll: deque[bytes] = deque(maxlen=self._settings.pre_roll_frames)
         utterance_buf = bytearray()
@@ -587,31 +642,19 @@ class VoiceCallCoordinator:
         speech_run = 0
         silence_run = 0
         barge_in_run = 0
+        standby_speech_frames = 0
         onset_started_at = 0.0
         barge_in_started_at = 0.0
         speech_started_at = 0.0
         seen_reset_epoch = self._capture_reset_epoch
 
-        try:
-            async for frame in self._audio_input.frames():
-                if seen_reset_epoch != self._capture_reset_epoch:
-                    seen_reset_epoch = self._capture_reset_epoch
-                    pre_roll.clear()
-                    utterance_buf.clear()
-                    in_speech = False
-                    speech_run = 0
-                    silence_run = 0
-                    barge_in_run = 0
+        while self._should_keep_capturing():
+            try:
+                async for frame in self._audio_input.frames():
+                    if not self._should_keep_capturing():
+                        return
 
-                state = self._session.state
-                if state == "closed":
-                    break
-
-                if state == "standby":
-                    pre_roll.append(frame.pcm_s16le)
-                    det = await self._wake_word.detect(frame)
-                    if det.detected:
-                        await self.start_call(reason="wake_word_detected")
+                    if seen_reset_epoch != self._capture_reset_epoch:
                         seen_reset_epoch = self._capture_reset_epoch
                         pre_roll.clear()
                         utterance_buf.clear()
@@ -619,209 +662,364 @@ class VoiceCallCoordinator:
                         speech_run = 0
                         silence_run = 0
                         barge_in_run = 0
-                        continue
+                        standby_speech_frames = 0
 
-                    # Hybrid acoustic + VAD/STT keyword spotter for "Oye Nova" / "Nova"
-                    prob = await self._vad.speech_probability(frame)
-                    if prob >= self._settings.speech_threshold:
-                        utterance_buf.extend(frame.pcm_s16le)
-                        silence_run = 0
-                        if len(utterance_buf) >= 32000:  # ~1 second of speech
-                            res = await self._stt.transcribe(bytes(utterance_buf))
-                            cleaned_txt = res.text.lower().strip()
-                            logger.info("Standby spotter (chunk) heard: '%s'", cleaned_txt)
-                            if any(k in cleaned_txt for k in ("nova", "oye", "hola", "hey")):
-                                logger.info("Wake word activated via STT: '%s'", cleaned_txt)
-                                await self.start_call(reason="wake_word_transcribed")
+                    state = self._session.state
+                    if state == "closed":
+                        return
+
+                    try:
+                        if state == "standby":
+                            pre_roll.append(frame.pcm_s16le)
+                            det = await self._wake_word.detect(frame)
+                            if det.detected:
+                                await self.start_call(reason="wake_word_detected")
                                 seen_reset_epoch = self._capture_reset_epoch
                                 pre_roll.clear()
                                 utterance_buf.clear()
+                                in_speech = False
+                                speech_run = 0
+                                silence_run = 0
+                                barge_in_run = 0
+                                standby_speech_frames = 0
+                                continue
+
+                            standby_end_silence = min(8, self._settings.end_silence_frames)
+                            prob = await self._vad.speech_probability(frame)
+                            if prob >= self._settings.speech_threshold:
+                                if standby_speech_frames == 0:
+                                    speech_started_at = self._clock()
+                                    seeded = b"".join(pre_roll)
+                                    utterance_buf = bytearray(
+                                        seeded[: self._settings.max_utterance_bytes]
+                                    )
+                                standby_speech_frames += 1
+                                remaining = self._settings.max_utterance_bytes - len(utterance_buf)
+                                if remaining > 0:
+                                    utterance_buf.extend(frame.pcm_s16le[:remaining])
+                                silence_run = 0
+                                if len(utterance_buf) >= _STANDBY_SPOTTER_MAX_CHUNK_BYTES:
+                                    segment = bytes(utterance_buf)
+                                    utterance_buf.clear()
+                                    standby_speech_frames = 0
+                                    self._launch_or_queue_standby_spotter(
+                                        segment,
+                                        frame.sample_rate_hz,
+                                        speech_started_at,
+                                    )
+                            elif utterance_buf:
+                                silence_run += 1
+                                if silence_run >= standby_end_silence:
+                                    if standby_speech_frames >= self._settings.min_speech_frames:
+                                        segment = bytes(utterance_buf)
+                                        self._launch_or_queue_standby_spotter(
+                                            segment,
+                                            frame.sample_rate_hz,
+                                            speech_started_at,
+                                        )
+                                    utterance_buf.clear()
+                                    standby_speech_frames = 0
+                                    silence_run = 0
+                            continue
+
+                        # Active call states: monitor for <100 ms barge-in
+                        if state in ("speaking", "thinking", "executing"):
+                            if state == "speaking" and not self._settings.allow_barge_in_during_tts:
+                                if (
+                                    in_speech
+                                    or utterance_buf
+                                    or speech_run
+                                    or silence_run
+                                    or barge_in_run
+                                    or pre_roll
+                                ):
+                                    in_speech = False
+                                    utterance_buf.clear()
+                                    speech_run = 0
+                                    silence_run = 0
+                                    barge_in_run = 0
+                                    pre_roll.clear()
+                                    self._vad.reset()
+                                continue
+
+                            in_grace = (
+                                self._clock() - self._speaking_started_at
+                                < self._settings.barge_in_grace_seconds
+                            )
+                            if state == "speaking" and in_grace:
+                                if not in_speech:
+                                    barge_in_run = 0
+                                    pre_roll.clear()
+                                    continue
+
+                            if in_speech:
+                                await self._execute_barge_in()
+                                seen_reset_epoch = self._capture_reset_epoch
+                                prob = await self._vad.speech_probability(frame)
+                                remaining = self._settings.max_utterance_bytes - len(utterance_buf)
+                                if remaining > 0:
+                                    utterance_buf.extend(frame.pcm_s16le[:remaining])
+                                if prob >= self._settings.speech_threshold:
+                                    silence_run = 0
+                                else:
+                                    silence_run += 1
+                                if (
+                                    silence_run >= self._settings.end_silence_frames
+                                    or len(utterance_buf) >= self._settings.max_utterance_bytes
+                                ):
+                                    segment = bytes(utterance_buf)
+                                    utterance_buf.clear()
+                                    in_speech = False
+                                    silence_run = 0
+                                    speech_run = 0
+                                    self._vad.reset()
+                                    self._enqueue_segment(
+                                        segment,
+                                        frame.sample_rate_hz,
+                                        speech_started_at,
+                                    )
+                                continue
+
+                            pre_roll.append(frame.pcm_s16le)
+                            prob = await self._vad.speech_probability(frame)
+                            if prob >= self._settings.barge_in_threshold:
+                                if barge_in_run == 0:
+                                    barge_in_started_at = self._clock()
+                                barge_in_run += 1
+                            else:
+                                barge_in_run = 0
+
+                            if barge_in_run >= self._settings.min_speech_frames:
+                                barge_in_run = 0
+                                await self._execute_barge_in()
+                                seen_reset_epoch = self._capture_reset_epoch
+                                in_speech = True
+                                speech_started_at = barge_in_started_at
+                                silence_run = 0
+                                speech_run = 0
+                                seeded = b"".join(pre_roll)
+                                pre_roll.clear()
+                                utterance_buf = bytearray(
+                                    seeded[: self._settings.max_utterance_bytes]
+                                )
+                            continue
+
+                        # State == "listening"
+                        if not in_speech:
+                            if self._ptt_hold_active:
                                 in_speech = True
                                 speech_started_at = self._clock()
                                 speech_run = 0
                                 silence_run = 0
+                                seeded = b"".join(pre_roll)
+                                pre_roll.clear()
+                                utterance_buf = bytearray(
+                                    seeded[: self._settings.max_utterance_bytes]
+                                )
+                                remaining = self._settings.max_utterance_bytes - len(utterance_buf)
+                                if remaining > 0:
+                                    utterance_buf.extend(frame.pcm_s16le[:remaining])
                                 continue
-                            utterance_buf.clear()
-                    elif utterance_buf:
-                        silence_run += 1
-                        if silence_run >= 8:
-                            if len(utterance_buf) >= 8000:
-                                res = await self._stt.transcribe(bytes(utterance_buf))
-                                cleaned_txt = res.text.lower().strip()
-                                logger.info("Standby spotter (pause) heard: '%s'", cleaned_txt)
-                                if any(k in cleaned_txt for k in ("nova", "oye", "hola", "hey")):
-                                    logger.info("Wake word activated via STT: '%s'", cleaned_txt)
-                                    await self.start_call(reason="wake_word_transcribed")
-                                    seen_reset_epoch = self._capture_reset_epoch
-                                    pre_roll.clear()
-                                    utterance_buf.clear()
-                                    in_speech = False
-                                    speech_run = 0
-                                    silence_run = 0
-                                    continue
-                            utterance_buf.clear()
-                            silence_run = 0
-                    continue
+                            now = self._clock()
+                            if (
+                                not self._active_turn_tasks
+                                and (now - self._session.last_activity_monotonic)
+                                >= self._settings.call_idle_timeout_seconds
+                            ):
+                                pre_roll.clear()
+                                speech_run = 0
+                                await self.end_call(reason="call_idle_timeout")
+                                seen_reset_epoch = self._capture_reset_epoch
+                                continue
 
-                # Active call states: speaking, thinking, executing -> monitor for <100 ms barge-in
-                if state in ("speaking", "thinking", "executing"):
-                    if state == "speaking" and not self._settings.allow_barge_in_during_tts:
-                        if (
-                            in_speech
-                            or utterance_buf
-                            or speech_run
-                            or silence_run
-                            or barge_in_run
-                            or pre_roll
-                        ):
-                            in_speech = False
-                            utterance_buf.clear()
-                            speech_run = 0
-                            silence_run = 0
-                            barge_in_run = 0
-                            pre_roll.clear()
-                            self._vad.reset()
-                        continue
+                            pre_roll.append(frame.pcm_s16le)
+                            prob = await self._vad.speech_probability(frame)
+                            if prob >= self._settings.speech_threshold:
+                                if speech_run == 0:
+                                    onset_started_at = now
+                                speech_run += 1
+                            else:
+                                speech_run = 0
 
-                    if state == "speaking" and (self._clock() - self._speaking_started_at < self._settings.barge_in_grace_seconds):
-                        if not in_speech:
-                            barge_in_run = 0
-                            pre_roll.clear()
-                            continue
-
-                    if in_speech:
-                        # F5: User was already speaking in "listening" when async TTS started;
-                        # preserve utterance_buf and immediately preempt TTS!
-                        await self._execute_barge_in()
-                        seen_reset_epoch = self._capture_reset_epoch
-                        prob = await self._vad.speech_probability(frame)
-                        remaining = self._settings.max_utterance_bytes - len(utterance_buf)
-                        if remaining > 0:
-                            utterance_buf.extend(frame.pcm_s16le[:remaining])
-                        if prob >= self._settings.speech_threshold:
-                            silence_run = 0
+                            if speech_run >= self._settings.min_speech_frames:
+                                in_speech = True
+                                speech_started_at = onset_started_at
+                                speech_run = 0
+                                silence_run = 0
+                                seeded = b"".join(pre_roll)
+                                pre_roll.clear()
+                                utterance_buf = bytearray(
+                                    seeded[: self._settings.max_utterance_bytes]
+                                )
+                                self._session = self._session.model_copy(
+                                    update={"last_activity_monotonic": now}
+                                )
                         else:
-                            silence_run += 1
-                        if (
-                            silence_run >= self._settings.end_silence_frames
-                            or len(utterance_buf) >= self._settings.max_utterance_bytes
-                        ):
-                            segment = bytes(utterance_buf)
-                            utterance_buf.clear()
-                            in_speech = False
-                            silence_run = 0
-                            speech_run = 0
-                            self._vad.reset()
-                            self._enqueue_segment(
-                                segment,
-                                frame.sample_rate_hz,
-                                speech_started_at,
-                            )
-                        continue
+                            prob = await self._vad.speech_probability(frame)
+                            remaining = self._settings.max_utterance_bytes - len(utterance_buf)
+                            if remaining > 0:
+                                utterance_buf.extend(frame.pcm_s16le[:remaining])
 
-                    pre_roll.append(frame.pcm_s16le)
-                    prob = await self._vad.speech_probability(frame)
-                    if prob >= self._settings.barge_in_threshold:
-                        if barge_in_run == 0:
-                            barge_in_started_at = self._clock()
-                        barge_in_run += 1
-                    else:
-                        barge_in_run = 0
+                            if prob >= self._settings.speech_threshold:
+                                silence_run = 0
+                            else:
+                                silence_run += 1
 
-                    if barge_in_run >= self._settings.min_speech_frames:
-                        barge_in_run = 0
-                        await self._execute_barge_in()
-                        seen_reset_epoch = self._capture_reset_epoch
-                        in_speech = True
-                        speech_started_at = barge_in_started_at
-                        silence_run = 0
-                        speech_run = 0
-                        seeded = b"".join(pre_roll)
+                            if (
+                                (
+                                    not self._ptt_hold_active
+                                    and (
+                                        self._flush_ptt_hold
+                                        or silence_run >= self._settings.end_silence_frames
+                                    )
+                                )
+                                or len(utterance_buf) >= self._settings.max_utterance_bytes
+                            ):
+                                self._flush_ptt_hold = False
+                                segment = bytes(utterance_buf)
+                                utterance_buf.clear()
+                                in_speech = False
+                                silence_run = 0
+                                speech_run = 0
+                                self._vad.reset()
+                                self._enqueue_segment(
+                                    segment,
+                                    frame.sample_rate_hz,
+                                    speech_started_at,
+                                )
+                    except asyncio.CancelledError:
+                        raise
+                    except VoicePipelineError as exc:
                         pre_roll.clear()
-                        utterance_buf = bytearray(seeded[: self._settings.max_utterance_bytes])
-                    continue
-
-                # State == "listening"
-                if not in_speech:
-                    if self._ptt_hold_active:
-                        in_speech = True
-                        speech_started_at = self._clock()
-                        speech_run = 0
-                        silence_run = 0
-                        seeded = b"".join(pre_roll)
-                        pre_roll.clear()
-                        utterance_buf = bytearray(seeded[: self._settings.max_utterance_bytes])
-                        remaining = self._settings.max_utterance_bytes - len(utterance_buf)
-                        if remaining > 0:
-                            utterance_buf.extend(frame.pcm_s16le[:remaining])
-                        continue
-                    now = self._clock()
-                    if (
-                        not self._active_turn_tasks
-                        and (now - self._session.last_activity_monotonic)
-                        >= self._settings.call_idle_timeout_seconds
-                    ):
-                        pre_roll.clear()
-                        speech_run = 0
-                        await self.end_call(reason="call_idle_timeout")
-                        seen_reset_epoch = self._capture_reset_epoch
-                        continue
-
-                    pre_roll.append(frame.pcm_s16le)
-                    prob = await self._vad.speech_probability(frame)
-                    if prob >= self._settings.speech_threshold:
-                        if speech_run == 0:
-                            onset_started_at = now
-                        speech_run += 1
-                    else:
-                        speech_run = 0
-
-                    if speech_run >= self._settings.min_speech_frames:
-                        in_speech = True
-                        speech_started_at = onset_started_at
-                        speech_run = 0
-                        silence_run = 0
-                        seeded = b"".join(pre_roll)
-                        pre_roll.clear()
-                        utterance_buf = bytearray(seeded[: self._settings.max_utterance_bytes])
-                        self._session = self._session.model_copy(
-                            update={"last_activity_monotonic": now}
-                        )
-                else:
-                    prob = await self._vad.speech_probability(frame)
-                    remaining = self._settings.max_utterance_bytes - len(utterance_buf)
-                    if remaining > 0:
-                        utterance_buf.extend(frame.pcm_s16le[:remaining])
-
-                    if prob >= self._settings.speech_threshold:
-                        silence_run = 0
-                    else:
-                        silence_run += 1
-
-                    if (
-                        (
-                            not self._ptt_hold_active
-                            and (
-                                self._flush_ptt_hold
-                                or silence_run >= self._settings.end_silence_frames
-                            )
-                        )
-                        or len(utterance_buf) >= self._settings.max_utterance_bytes
-                    ):
-                        self._flush_ptt_hold = False
-                        segment = bytes(utterance_buf)
                         utterance_buf.clear()
                         in_speech = False
-                        silence_run = 0
                         speech_run = 0
-                        self._vad.reset()
-                        self._enqueue_segment(segment, frame.sample_rate_hz, speech_started_at)
-        except asyncio.CancelledError:
-            raise
-        except VoicePipelineError as exc:
-            await self._publish_voice_failure(exc.code, exc.sanitized_message)
-        except Exception as exc:
-            await self._publish_voice_failure("VOICE_AUDIO_STREAM_FAILED", str(exc))
+                        silence_run = 0
+                        barge_in_run = 0
+                        standby_speech_frames = 0
+                        await self._publish_voice_failure(exc.code, exc.sanitized_message)
+                    except Exception as exc:
+                        pre_roll.clear()
+                        utterance_buf.clear()
+                        in_speech = False
+                        speech_run = 0
+                        silence_run = 0
+                        barge_in_run = 0
+                        standby_speech_frames = 0
+                        await self._publish_voice_failure("VOICE_CAPTURE_FRAME_FAILED", str(exc))
+
+                if not self._should_keep_capturing():
+                    return
+                await self._publish_voice_failure(
+                    "VOICE_AUDIO_STREAM_EOF",
+                    "Audio input stream ended unexpectedly; retrying capture.",
+                )
+            except asyncio.CancelledError:
+                raise
+            except VoicePipelineError as exc:
+                if not self._should_keep_capturing():
+                    return
+                await self._publish_voice_failure(exc.code, exc.sanitized_message)
+            except Exception as exc:
+                if not self._should_keep_capturing():
+                    return
+                await self._publish_voice_failure("VOICE_AUDIO_STREAM_FAILED", str(exc))
+
+            pre_roll.clear()
+            utterance_buf.clear()
+            in_speech = False
+            speech_run = 0
+            silence_run = 0
+            barge_in_run = 0
+            standby_speech_frames = 0
+            if not self._should_keep_capturing():
+                return
+            await asyncio.sleep(self._settings.capture_retry_delay_seconds)
+
+    def _launch_or_queue_standby_spotter(
+        self,
+        pcm_bytes: bytes,
+        sample_rate_hz: int,
+        speech_started_at: float,
+    ) -> None:
+        if self._standby_spotter_task is not None and not self._standby_spotter_task.done():
+            self._pending_standby_followup = (pcm_bytes, sample_rate_hz, speech_started_at)
+            return
+        self._standby_spotter_task = asyncio.create_task(
+            self._run_standby_spotter(
+                pcm_bytes,
+                sample_rate_hz,
+                self._capture_reset_epoch,
+                speech_started_at,
+            )
+        )
+
+    async def _run_standby_spotter(
+        self,
+        pcm_bytes: bytes,
+        sample_rate_hz: int,
+        expected_reset_epoch: int,
+        speech_started_at: float,
+    ) -> None:
+        this_task = asyncio.current_task()
+        current_pcm = pcm_bytes
+        current_rate = sample_rate_hz
+        current_started = speech_started_at
+        try:
+            while (
+                self._started
+                and not self._call_open
+                and self._session.state == "standby"
+                and expected_reset_epoch == self._capture_reset_epoch
+            ):
+                try:
+                    tx = await self._stt.transcribe(current_pcm, sample_rate_hz=current_rate)
+                except asyncio.CancelledError:
+                    raise
+                except VoicePipelineError as exc:
+                    await self._publish_voice_failure(exc.code, exc.sanitized_message)
+                    return
+                except Exception as exc:
+                    await self._publish_voice_failure("VOICE_STT_FAILED", str(exc))
+                    return
+
+                if (
+                    not self._started
+                    or self._call_open
+                    or self._session.state != "standby"
+                    or expected_reset_epoch != self._capture_reset_epoch
+                ):
+                    return
+
+                detected, remainder = _extract_post_wake_utterance(tx.text)
+                self._log(
+                    "standby_spotter_evaluated",
+                    detected=detected,
+                    transcript=tx.text.strip(),
+                )
+                if detected:
+                    await self.start_call(
+                        reason="wake_word_transcribed",
+                        preserve_standby_followup=(not remainder),
+                    )
+                    if remainder and self._call_open:
+                        corr_id = self._session.active_correlation_id or f"corr-{uuid.uuid4()}"
+                        await self._dispatch_transcribed_segment(
+                            tx=tx.model_copy(update={"text": remainder}),
+                            corr_id=corr_id,
+                            speech_started_at=current_started,
+                            segment_epoch=self._call_epoch,
+                        )
+                    return
+
+                next_item = self._pending_standby_followup
+                self._pending_standby_followup = None
+                if next_item is None:
+                    return
+                current_pcm, current_rate, current_started = next_item
+        finally:
+            if self._standby_spotter_task is this_task:
+                self._standby_spotter_task = None
 
     def _enqueue_segment(
         self,
@@ -897,90 +1095,72 @@ class VoiceCallCoordinator:
             if not self._call_open or segment_epoch != self._call_epoch:
                 continue
 
-            raw_text = tx.text.strip()
-            if not raw_text:
-                continue
+            await self._dispatch_transcribed_segment(
+                tx=tx,
+                corr_id=corr_id,
+                speech_started_at=speech_started_at,
+                segment_epoch=segment_epoch,
+            )
 
-            sanitized_text = self._redact(raw_text)
+    async def _dispatch_transcribed_segment(
+        self,
+        *,
+        tx: TranscriptionResult,
+        corr_id: str,
+        speech_started_at: float,
+        segment_epoch: int,
+    ) -> None:
+        raw_text = tx.text.strip()
+        if not raw_text:
+            return
+
+        sanitized_text = self._redact(raw_text)
+        await self._event_bus.publish(
+            VoiceTranscriptionEvent(
+                call_id=self._session.call_id,
+                correlation_id=corr_id,
+                sanitized_text=sanitized_text,
+                backend_device=tx.backend_device,
+                duration_ms=tx.duration_ms,
+            )
+        )
+
+        self._prune_expired_approvals()
+        head_approval = self._pending_approvals[0] if self._pending_approvals else None
+
+        # F2 Anti-TOCTOU: Speech started BEFORE the earliest pending approval was requested
+        # must NEVER authorize or reject that approval, nor dispatch a new prompt while held.
+        if head_approval is not None and speech_started_at < head_approval.requested_at:
             await self._event_bus.publish(
-                VoiceTranscriptionEvent(
-                    call_id=self._session.call_id,
+                VoiceMilestoneEvent(
                     correlation_id=corr_id,
-                    sanitized_text=sanitized_text,
-                    backend_device=tx.backend_device,
-                    duration_ms=tx.duration_ms,
+                    summary_text=_HOLD_REMINDER_TEXT,
+                    priority="interrupt",
                 )
             )
+            return
 
-            self._prune_expired_approvals()
-            head_approval = self._pending_approvals[0] if self._pending_approvals else None
+        has_pending = head_approval is not None
+        intent = classify_voice_control_intent(
+            sanitized_text,
+            has_pending_approval=has_pending,
+        )
 
-            # F2 Anti-TOCTOU: Speech started BEFORE the earliest pending approval was requested
-            # must NEVER authorize or reject that approval, nor dispatch a new prompt while held.
-            if head_approval is not None and speech_started_at < head_approval.requested_at:
-                await self._event_bus.publish(
-                    VoiceMilestoneEvent(
-                        correlation_id=corr_id,
-                        summary_text=_HOLD_REMINDER_TEXT,
-                        priority="interrupt",
-                    )
-                )
-                continue
+        if intent.kind == "ignore_empty":
+            return
 
-            has_pending = head_approval is not None
-            intent = classify_voice_control_intent(
-                sanitized_text,
-                has_pending_approval=has_pending,
-            )
-
-            if intent.kind == "ignore_empty":
-                continue
-
-            if intent.kind in ("approve_command", "reject_command"):
-                if head_approval is not None:
-                    if (
-                        self._pending_approvals
-                        and self._pending_approvals[0].audit_id == head_approval.audit_id
-                    ):
-                        self._pending_approvals.popleft()
-                    try:
-                        await self._orchestrator.resolve_command_approval(
-                            head_approval.audit_id,
-                            approved=(intent.kind == "approve_command"),
-                            resolved_by="user_voice",
-                        )
-                    except asyncio.CancelledError:
-                        raise
-                    except NovaDomainError as exc:
-                        await self._publish_voice_failure(
-                            exc.code,
-                            exc.sanitized_message,
-                            correlation_id=corr_id,
-                        )
-                    except Exception as exc:
-                        await self._publish_voice_failure(
-                            "VOICE_APPROVAL_FAILED",
-                            str(exc),
-                            correlation_id=corr_id,
-                        )
-                continue
-
-            if intent.kind == "hold_pending_approval":
-                await self._event_bus.publish(
-                    VoiceMilestoneEvent(
-                        correlation_id=corr_id,
-                        summary_text=_HOLD_REMINDER_TEXT,
-                        priority="interrupt",
-                    )
-                )
-                continue
-
-            if intent.kind == "select_workspace" and intent.workspace_query:
+        if intent.kind in ("approve_command", "reject_command"):
+            if head_approval is not None:
+                if (
+                    self._pending_approvals
+                    and self._pending_approvals[0].audit_id == head_approval.audit_id
+                ):
+                    self._pending_approvals.popleft()
                 try:
-                    await self._orchestrator.select_workspace(
-                        intent.workspace_query,
-                        mode="voice_fuzzy",
-                        correlation_id=corr_id,
+                    await self._orchestrator.resolve_command_approval(
+                        head_approval.audit_id,
+                        approved=(intent.kind == "approve_command"),
+                        resolved_by="user_voice",
                     )
                 except asyncio.CancelledError:
                     raise
@@ -992,35 +1172,68 @@ class VoiceCallCoordinator:
                     )
                 except Exception as exc:
                     await self._publish_voice_failure(
-                        "WORKSPACE_SELECTION_FAILED",
+                        "VOICE_APPROVAL_FAILED",
                         str(exc),
                         correlation_id=corr_id,
                     )
-                continue
+            return
 
-            if intent.kind == "end_call":
-                await self.end_call(reason="voice_hangup_command")
-                continue
+        if intent.kind == "hold_pending_approval":
+            await self._event_bus.publish(
+                VoiceMilestoneEvent(
+                    correlation_id=corr_id,
+                    summary_text=_HOLD_REMINDER_TEXT,
+                    priority="interrupt",
+                )
+            )
+            return
 
-            if (
-                intent.kind == "user_utterance"
-                and intent.utterance_text
-                and self._call_open
-                and segment_epoch == self._call_epoch
-            ):
-                await self._transition_state(
-                    "thinking",
-                    reason="utterance_dispatched",
+        if intent.kind == "select_workspace" and intent.workspace_query:
+            try:
+                await self._orchestrator.select_workspace(
+                    intent.workspace_query,
+                    mode="voice_fuzzy",
                     correlation_id=corr_id,
                 )
-                self._session = self._session.model_copy(
-                    update={"turn_count": self._session.turn_count + 1}
+            except asyncio.CancelledError:
+                raise
+            except NovaDomainError as exc:
+                await self._publish_voice_failure(
+                    exc.code,
+                    exc.sanitized_message,
+                    correlation_id=corr_id,
                 )
-                turn_task = asyncio.create_task(
-                    self._run_orchestrator_turn(intent.utterance_text, corr_id, segment_epoch)
+            except Exception as exc:
+                await self._publish_voice_failure(
+                    "WORKSPACE_SELECTION_FAILED",
+                    str(exc),
+                    correlation_id=corr_id,
                 )
-                self._active_turn_tasks.add(turn_task)
-                turn_task.add_done_callback(self._active_turn_tasks.discard)
+            return
+
+        if intent.kind == "end_call":
+            await self.end_call(reason="voice_hangup_command")
+            return
+
+        if (
+            intent.kind == "user_utterance"
+            and intent.utterance_text
+            and self._call_open
+            and segment_epoch == self._call_epoch
+        ):
+            await self._transition_state(
+                "thinking",
+                reason="utterance_dispatched",
+                correlation_id=corr_id,
+            )
+            self._session = self._session.model_copy(
+                update={"turn_count": self._session.turn_count + 1}
+            )
+            turn_task = asyncio.create_task(
+                self._run_orchestrator_turn(intent.utterance_text, corr_id, segment_epoch)
+            )
+            self._active_turn_tasks.add(turn_task)
+            turn_task.add_done_callback(self._active_turn_tasks.discard)
 
     async def _run_orchestrator_turn(
         self,

@@ -36,7 +36,10 @@ def test_health_report_models_instantiation() -> None:
     assert report.components[0].name == "test_tool"
 
 
-def test_all_components_present_yields_all_ok(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_all_components_present_yields_all_ok(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     fake_bin = tmp_path / "bin"
     fake_bin.mkdir()
     pi_bin = fake_bin / "pi"
@@ -59,9 +62,9 @@ def test_all_components_present_yields_all_ok(tmp_path: Path, monkeypatch: pytes
         (models_dir / m).write_bytes(b"model data")
 
     def fake_which(cmd: str) -> str | None:
-        if cmd == "pi":
+        if cmd in ("pi", str(pi_bin)):
             return str(pi_bin)
-        if cmd == "agy":
+        if cmd in ("agy", str(agy_bin)):
             return str(agy_bin)
         if cmd in ("pw-record", "pw-play"):
             return f"/usr/bin/{cmd}"
@@ -81,7 +84,10 @@ def test_all_components_present_yields_all_ok(tmp_path: Path, monkeypatch: pytes
     assert all(c.installed for c in report.components)
 
 
-def test_missing_pi_and_audio_tools_generates_alert_message(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_missing_pi_and_audio_tools_generates_alert_message(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     empty_home = tmp_path / "empty_home"
     empty_home.mkdir()
     monkeypatch.setattr(Path, "home", lambda: empty_home)
@@ -108,7 +114,10 @@ def test_missing_pi_and_audio_tools_generates_alert_message(tmp_path: Path, monk
     assert any("pipewire" in r for r in remedies)
 
 
-def test_missing_onnx_model_reported_with_download_remedy(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+def test_missing_onnx_model_reported_with_download_remedy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     empty_models = tmp_path / "empty_models"
     empty_models.mkdir()
     monkeypatch.setenv("NOVA_MODELS_DIR", str(empty_models))

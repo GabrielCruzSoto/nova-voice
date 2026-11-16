@@ -135,6 +135,7 @@ async def test_ac6_desktop_runtime_degrades_gracefully_without_voice_and_serves_
         enable_voice=True,
         ipc_runtime_dir=str(sock_dir),
         pi_executable="nonexistent-pi-binary-for-lazy-test",
+        config_path=str(tmp_path / "config_ac6_degraded.toml"),
     )
 
     runtime = NovaDesktopRuntime(cfg, voice_factory=_failing_voice_factory)
@@ -242,6 +243,7 @@ async def test_ac6_desktop_runtime_starts_and_shuts_down_live_voice_coordinator(
         open_browser=False,
         enable_voice=True,
         ipc_runtime_dir=str(tmp_path / "sock"),
+        config_path=str(tmp_path / "config_live_voice.toml"),
     )
 
     async with NovaDesktopRuntime(cfg, voice_factory=lambda **_: fake_voice) as runtime:
@@ -371,7 +373,12 @@ async def test_s4_open_local_browser_window_enforces_loopback_and_shell_false() 
         spawner=_fake_spawner,
     )
     assert opened_webview is True
-    assert spawned[-1] == (sys.executable, "-m", "nova.adapters.desktop_window", "http://127.0.0.1:8765")
+    assert spawned[-1] == (
+        sys.executable,
+        "-m",
+        "nova.adapters.desktop_window",
+        "http://127.0.0.1:8765",
+    )
 
 
 async def test_ac6_python_m_nova_cli_starts_and_exits_cleanly_on_sigterm(
@@ -406,6 +413,8 @@ async def test_ac6_python_m_nova_cli_starts_and_exits_cleanly_on_sigterm(
         str(tmp_path),
         "--ipc-runtime-dir",
         str(sock_dir),
+        "--config",
+        str(tmp_path / "cli_config.toml"),
         env=child_env,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
@@ -503,6 +512,7 @@ async def test_ac10_runtime_close_terminates_and_reaps_spawned_ui_subprocess_wit
         browser_preference="webview",
         enable_voice=False,
         ipc_runtime_dir=str(tmp_path / "sock"),
+        config_path=str(tmp_path / "config_ac10.toml"),
     )
 
     with pytest.MonkeyPatch.context() as mp:
@@ -543,6 +553,7 @@ async def test_runtime_runs_preflight_health_check_and_publishes_warning(
         enable_voice=False,
         pi_executable="non_existent_pi_binary",
         ipc_runtime_dir=str(tmp_path / "sock"),
+        config_path=str(tmp_path / "config_preflight.toml"),
     )
 
     events: list[object] = []
@@ -581,6 +592,7 @@ async def test_run_desktop_daemon_exits_cleanly_via_http_shutdown_and_control_qu
         open_browser=False,
         enable_voice=False,
         ipc_runtime_dir=str(sock_dir_ipc),
+        config_path=str(tmp_path / "config_ipc.toml"),
     )
     control_sock = resolve_control_socket_path(runtime_base_dir=sock_dir_ipc)
     daemon_task = asyncio.create_task(run_desktop_daemon(cfg_ipc))
@@ -619,6 +631,7 @@ async def test_run_desktop_daemon_exits_cleanly_via_http_shutdown_and_control_qu
         open_browser=False,
         enable_voice=False,
         ipc_runtime_dir=str(sock_dir_http),
+        config_path=str(tmp_path / "config_http.toml"),
     )
     runtime = NovaDesktopRuntime(cfg_http)
     async with runtime:
@@ -666,6 +679,106 @@ async def test_run_desktop_daemon_exits_cleanly_via_http_shutdown_and_control_qu
         # Idempotent repeated request_shutdown
         runtime.request_shutdown("duplicate_check")
         assert runtime.shutdown_requested is True
+
+
+def test_nova012_ac4_config_from_namespace_resolves_cli_fallbacks_and_default_model(
+    tmp_path: Path,
+) -> None:
+    from nova.adapters.desktop_launcher import build_arg_parser, config_from_namespace
+
+    fake_home = tmp_path / "home"
+    pi_fallback = fake_home / ".pi" / "agent" / "bin" / "pi"
+    agy_fallback = fake_home / ".local" / "bin" / "agy"
+    pi_fallback.parent.mkdir(parents=True, exist_ok=True)
+    agy_fallback.parent.mkdir(parents=True, exist_ok=True)
+    pi_fallback.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    pi_fallback.chmod(0o755)
+    agy_fallback.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+    agy_fallback.chmod(0o755)
+
+    parser = build_arg_parser()
+    ns = parser.parse_args(
+        [
+            "--config",
+            str(tmp_path / "config.toml"),
+            "--allowed-root",
+            str(tmp_path),
+            "--no-voice",
+        ]
+    )
+    cfg = config_from_namespace(
+        ns,
+        env={},
+        which_resolver=lambda _name: None,
+        home_dir=fake_home,
+    )
+    assert cfg.pi_model == "nvidia/nemotron-3.5-lightning-30b-a3b"
+    assert cfg.pi_executable == str(pi_fallback)
+    assert cfg.agy_executable == str(agy_fallback)
+
+
+async def test_nova012_ac5_runtime_tests_never_touch_default_home_config(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_home = tmp_path / "protected_home"
+    host_cfg = fake_home / ".config" / "nova" / "config.toml"
+    host_cfg.parent.mkdir(parents=True, exist_ok=True)
+    sentinel = 'schema_version = "1.0"\n[general]\nlast_active_workspace = "/keep/intact"\n'
+    host_cfg.write_text(sentinel, encoding="utf-8")
+
+    monkeypatch.setattr(Path, "home", lambda: fake_home)
+
+    # Even if a caller omits config_path inside pytest, autouse XDG_CONFIG_HOME isolation
+    # must prevent touching ~/.config/nova/config.toml, AND explicit config_path writes
+    # exclusively to the isolated file.
+    proj = tmp_path / "isolated_proj"
+    proj.mkdir()
+    isolated_cfg_file = tmp_path / "local_cfg" / "config.toml"
+    cfg = NovaDesktopConfig(
+        port=0,
+        allowed_roots=(str(tmp_path),),
+        initial_workspace=str(proj),
+        open_browser=False,
+        enable_voice=False,
+        ipc_runtime_dir=str(tmp_path / "sock"),
+        config_path=str(isolated_cfg_file),
+    )
+    async with NovaDesktopRuntime(cfg) as runtime:
+        st_idx, hdr_idx, _ = await _raw_http_request(runtime.port, "GET", "/")
+        assert st_idx == 200
+        cookie_pair = _extract_cookie_pair(hdr_idx["set-cookie"])
+        _, _, raw_state = await _raw_http_request(
+            runtime.port,
+            "GET",
+            "/api/state",
+            headers={"Cookie": cookie_pair},
+        )
+        csrf = json.loads(raw_state.decode("utf-8"))["csrf_token"]
+        st_ws, _, _ = await _raw_http_request(
+            runtime.port,
+            "POST",
+            "/api/workspace/select",
+            headers={
+                "Cookie": cookie_pair,
+                "Origin": runtime.base_url,
+                "X-Nova-CSRF": csrf,
+                "Content-Type": "application/json",
+            },
+            body=json.dumps({"path_or_query": str(proj)}).encode("utf-8"),
+        )
+        assert st_ws == 200
+
+    assert _path_exists(isolated_cfg_file)
+    assert host_cfg.read_text(encoding="utf-8") == sentinel
+
+    # Also verify default resolve_config_file_path() inside pytest points to tmp_path, NOT fake_home
+    from nova.adapters.config_store import resolve_config_file_path
+
+    default_resolved = resolve_config_file_path()
+    assert not default_resolved.is_relative_to(fake_home)
+
+
 
 
 

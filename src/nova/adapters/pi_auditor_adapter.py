@@ -16,7 +16,12 @@ from typing import Any
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
 from nova.domain.errors import redact_sensitive_text
-from nova.domain.models import AuditRiskLevel, CommandAuditInput, CommandAuditResult
+from nova.domain.models import (
+    DEFAULT_PI_MODEL,
+    AuditRiskLevel,
+    CommandAuditInput,
+    CommandAuditResult,
+)
 
 _JSON_BLOCK_RE = re.compile(r"\{.*\}", re.DOTALL)
 _PATH_OR_CODE_RE = re.compile(r"(?:```.*?```|(?:~|/)[\w./-]+)", re.DOTALL)
@@ -42,7 +47,7 @@ class PiAuditorConfig(BaseModel):
     executable: str = Field(default="pi", min_length=1)
     extra_leading_args: tuple[str, ...] = ()
     provider: str = Field(default="nvidia", min_length=1)
-    model: str = Field(default="deepseek-ai/deepseek-v4.1-flash", min_length=1)
+    model: str = Field(default=DEFAULT_PI_MODEL, min_length=1)
     timeout_seconds: float = Field(default=8.0, gt=0.0)
     cache_max_entries: int = Field(default=128, ge=1)
     cache_ttl_seconds: float = Field(default=120.0, gt=0.0)
@@ -184,6 +189,8 @@ class PiAuditorAdapter:
             "--no-skills",
             "--no-context-files",
             "--no-approve",
+            "--thinking",
+            "off",
             "--provider",
             self._config.provider,
             "--model",

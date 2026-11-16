@@ -45,10 +45,10 @@ print("```")
             executable=exe,
             extra_leading_args=extra,
             provider="nvidia",
-            model="deepseek-ai/deepseek-v4.1-flash",
             timeout_seconds=5.0,
         )
     )
+    assert PiAuditorConfig().model == "nvidia/nemotron-3.5-lightning-30b-a3b"
     result = await adapter.audit(
         CommandAuditInput(
             correlation_id="corr-001",
@@ -70,8 +70,10 @@ print("```")
         "--no-skills",
         "--no-context-files",
         "--no-approve",
+        "--thinking",
     ):
         assert required_flag in recorded_args, f"Missing isolation flag {required_flag}"
+    assert recorded_args[recorded_args.index("--thinking") + 1] == "off"
 
     # Verify secret was redacted BEFORE sending payload to subprocess
     joined_args = "\n".join(recorded_args)

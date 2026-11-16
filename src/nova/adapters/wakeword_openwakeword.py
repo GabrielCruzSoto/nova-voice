@@ -57,12 +57,13 @@ class _OpenWakeWordRuntimeBackend:
             if embedding_candidate.is_file():
                 kwargs["embedding_model_path"] = str(embedding_candidate)
 
+        user_models_dir = Path.home() / ".local" / "share" / "nova" / "models"
         if "melspec_model_path" not in kwargs:
-            user_melspec = Path.home() / ".local" / "share" / "nova" / "models" / "melspectrogram.onnx"
+            user_melspec = user_models_dir / "melspectrogram.onnx"
             if user_melspec.is_file():
                 kwargs["melspec_model_path"] = str(user_melspec)
         if "embedding_model_path" not in kwargs:
-            user_embedding = Path.home() / ".local" / "share" / "nova" / "models" / "embedding_model.onnx"
+            user_embedding = user_models_dir / "embedding_model.onnx"
             if user_embedding.is_file():
                 kwargs["embedding_model_path"] = str(user_embedding)
 
