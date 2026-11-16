@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import hmac
+import inspect
 import json
 import os
 import random
@@ -22,6 +23,8 @@ from urllib.parse import urlsplit
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
+from nova.adapters.workspace_resolver import LocalWorkspaceResolver
+from nova.application.live_diagnostics import LiveDiagnosticsService
 from nova.application.settings_service import SettingsService
 from nova.application.ui_state_hub import UiStateHub
 from nova.domain.errors import (
@@ -36,7 +39,12 @@ from nova.domain.events import (
     OrchestratorEventBus,
     RunnerFailureEvent,
 )
-from nova.domain.models import CallSession, WorkspaceContext, WorkspaceQueryMode
+from nova.domain.models import (
+    CallSession,
+    InitializeWorkspaceRequest,
+    WorkspaceContext,
+    WorkspaceQueryMode,
+)
 from nova.domain.ports import FolderPickerPort
 
 MAX_HTTP_BODY_BYTES = 65_536
@@ -57,6 +65,7 @@ _APPROVAL_PATH_RE = re.compile(r"^/api/approvals/([A-Za-z0-9_-]{1,80})/resolve$"
 
 _HTTP_STATUS_TEXT: dict[int, str] = {
     200: "OK",
+    201: "Created",
     202: "Accepted",
     400: "Bad Request",
     403: "Forbidden",
@@ -157,6 +166,8 @@ class DesktopUiServer:
         voice_coordinator: VoiceControlUiPort | None = None,
         folder_picker: FolderPickerPort | None = None,
         settings_service: SettingsService | None = None,
+        workspace_resolver: LocalWorkspaceResolver | None = None,
+        diagnostics_service: LiveDiagnosticsService | None = None,
         health_report_provider: Callable[[], Any] | None = None,
         shutdown_callback: Callable[[str], None] | None = None,
         static_dir: Path | None = None,
@@ -170,6 +181,8 @@ class DesktopUiServer:
         self._voice_coordinator = voice_coordinator
         self._folder_picker = folder_picker
         self._settings_service = settings_service
+        self._workspace_resolver = workspace_resolver
+        self._diagnostics_service = diagnostics_service
         self._health_report_provider = health_report_provider
         self._shutdown_callback = shutdown_callback
         self._static_dir = static_dir or _default_static_dir()
@@ -1042,6 +1055,36 @@ class DesktopUiServer:
             await self._write_json(writer, 200, asdict(reg_result), corr_id)
             return
 
+        if path == "/api/workspace/clear":
+            clear_fn = getattr(self._orchestrator, "clear_workspace", None)
+            if callable(clear_fn):
+                res = clear_fn(correlation_id=corr_id)
+                if inspect.isawaitable(res):
+                    await res
+            elif self._workspace_resolver is not None:
+                await self._workspace_resolver.clear_active_workspace(corr_id)
+            if self._settings_service is not None:
+                await self._settings_service.clear_active_workspace()
+            await self._write_json(
+                writer,
+                200,
+                {
+                    "cleared": True,
+                    "active_workspace": None,
+                    "process_cwd": str(Path.home().resolve()),
+                },
+                corr_id,
+            )
+            return
+
+        if path == "/api/workspace/init":
+            await self._handle_workspace_init(writer, payload, corr_id)
+            return
+
+        if path.startswith("/api/diagnostics/"):
+            await self._handle_live_diagnostic(writer, path, payload, corr_id)
+            return
+
         if path == "/api/workspace/select":
             raw_query = payload.get("path_or_query")
             if not isinstance(raw_query, str) or not raw_query.strip():
@@ -1129,6 +1172,210 @@ class DesktopUiServer:
             corr_id,
         )
 
+    async def _handle_workspace_init(
+        self,
+        writer: asyncio.StreamWriter,
+        payload: dict[str, Any],
+        corr_id: str,
+    ) -> None:
+        if self._workspace_resolver is None:
+            await self._write_error(
+                writer,
+                503,
+                "UI_WORKSPACE_INIT_UNAVAILABLE",
+                "Workspace initializer is not configured.",
+                corr_id,
+            )
+            return
+
+        raw_parent = payload.get("parent_root")
+        raw_slug = payload.get("workspace_slug")
+        raw_display = payload.get("display_name")
+        raw_projects = payload.get("projects", [])
+        raw_activate = payload.get("activate", True)
+
+        if (
+            not isinstance(raw_parent, str)
+            or not raw_parent.strip()
+            or not isinstance(raw_slug, str)
+            or (raw_display is not None and not isinstance(raw_display, str))
+            or not isinstance(raw_projects, list)
+            or not all(isinstance(x, str) for x in raw_projects)
+            or not isinstance(raw_activate, bool)
+        ):
+            await self._write_error(
+                writer,
+                400,
+                "UI_INVALID_JSON_OR_PAYLOAD",
+                "Invalid fields in workspace initialization payload.",
+                corr_id,
+            )
+            return
+
+        try:
+            init_req = InitializeWorkspaceRequest(
+                correlation_id=corr_id,
+                parent_root=raw_parent.strip(),
+                workspace_slug=raw_slug.strip(),
+                display_name=raw_display.strip() if isinstance(raw_display, str) else None,
+                projects=tuple(x.strip() for x in raw_projects),
+                activate=raw_activate,
+            )
+            ctx = await self._workspace_resolver.initialize_workspace(init_req)
+            if raw_activate:
+                ctx = await self._orchestrator.select_workspace(
+                    ctx.canonical_path,
+                    mode="ui_picker",
+                    correlation_id=corr_id,
+                )
+                if self._settings_service is not None:
+                    await self._settings_service.record_active_workspace(ctx.canonical_path)
+        except WorkspaceResolutionError as exc:
+            status_and_code = {
+                "WORKSPACE_HOME_FORBIDDEN": (403, "WORKSPACE_HOME_FORBIDDEN"),
+                "WORKSPACE_OUTSIDE_ALLOWED_ROOTS": (403, "WORKSPACE_OUTSIDE_ALLOWED_ROOTS"),
+                "WORKSPACE_ALREADY_EXISTS": (409, "WORKSPACE_ALREADY_EXISTS"),
+                "WORKSPACE_INVALID_MANIFEST": (422, "WORKSPACE_INVALID_MANIFEST"),
+                "WORKSPACE_RESOLUTION_TIMEOUT": (504, "WORKSPACE_RESOLUTION_TIMEOUT"),
+            }.get(exc.code, (422, "WORKSPACE_INVALID_MANIFEST"))
+            await self._write_error(
+                writer,
+                status_and_code[0],
+                status_and_code[1],
+                exc.sanitized_message,
+                corr_id,
+            )
+            return
+        except Exception as exc:
+            await self._write_error(
+                writer,
+                422,
+                "WORKSPACE_INVALID_MANIFEST",
+                str(exc),
+                corr_id,
+            )
+            return
+
+        await self._write_json(
+            writer,
+            201,
+            {
+                "created": True,
+                "manifest_path": ctx.manifest_path,
+                "workspace": {
+                    "display_name": ctx.name,
+                    "canonical_path": ctx.canonical_path,
+                    "selected_via": ctx.selected_via,
+                    "topology": ctx.topology,
+                    "projects": [p.model_dump() for p in ctx.projects],
+                },
+            },
+            corr_id,
+        )
+
+    async def _handle_live_diagnostic(
+        self,
+        writer: asyncio.StreamWriter,
+        path: str,
+        payload: dict[str, Any],
+        corr_id: str,
+    ) -> None:
+        if self._diagnostics_service is None:
+            await self._write_error(
+                writer,
+                503,
+                "UI_DIAGNOSTICS_UNAVAILABLE",
+                "Live diagnostics service is not enabled.",
+                corr_id,
+            )
+            return
+
+        try:
+            if path == "/api/diagnostics/microphone":
+                cap = payload.get("capture_target")
+                dur = payload.get("duration_seconds", 2.0)
+                if (cap is not None and not isinstance(cap, str)) or not isinstance(
+                    dur, (int, float)
+                ) or isinstance(dur, bool):
+                    await self._write_error(
+                        writer,
+                        400,
+                        "UI_INVALID_JSON_OR_PAYLOAD",
+                        "Invalid microphone diagnostic parameters.",
+                        corr_id,
+                    )
+                    return
+                res_mic = await self._diagnostics_service.test_microphone(
+                    capture_target=cap,
+                    duration_seconds=float(dur),
+                )
+                await self._write_json(writer, 200, res_mic.model_dump(), corr_id)
+                return
+
+            if path == "/api/diagnostics/audio-output":
+                play = payload.get("playback_target")
+                if play is not None and not isinstance(play, str):
+                    await self._write_error(
+                        writer,
+                        400,
+                        "UI_INVALID_JSON_OR_PAYLOAD",
+                        "Invalid audio-output diagnostic parameters.",
+                        corr_id,
+                    )
+                    return
+                res_out = await self._diagnostics_service.test_audio_output(playback_target=play)
+                await self._write_json(writer, 200, res_out.model_dump(), corr_id)
+                return
+
+            if path == "/api/diagnostics/pi":
+                prov = payload.get("provider")
+                mod = payload.get("model")
+                if (prov is not None and not isinstance(prov, str)) or (
+                    mod is not None and not isinstance(mod, str)
+                ):
+                    await self._write_error(
+                        writer,
+                        400,
+                        "UI_INVALID_JSON_OR_PAYLOAD",
+                        "Invalid Pi diagnostic parameters.",
+                        corr_id,
+                    )
+                    return
+                res_pi = await self._diagnostics_service.test_pi_connection(
+                    provider=prov,
+                    model=mod,
+                )
+                await self._write_json(writer, 200, res_pi.model_dump(), corr_id)
+                return
+
+            if path == "/api/diagnostics/antigravity":
+                agy_mod = payload.get("model")
+                if agy_mod is not None and not isinstance(agy_mod, str):
+                    await self._write_error(
+                        writer,
+                        400,
+                        "UI_INVALID_JSON_OR_PAYLOAD",
+                        "Invalid Antigravity diagnostic parameters.",
+                        corr_id,
+                    )
+                    return
+                res_agy = await self._diagnostics_service.test_antigravity_connection(
+                    model=agy_mod
+                )
+                await self._write_json(writer, 200, res_agy.model_dump(), corr_id)
+                return
+        except DesktopUiError as exc:
+            await self._write_error(writer, 422, exc.code, exc.sanitized_message, corr_id)
+            return
+
+        await self._write_error(
+            writer,
+            404,
+            "UI_ROUTE_NOT_FOUND",
+            f"Unknown diagnostic route: {path}",
+            corr_id,
+        )
+
     async def _select_workspace_and_respond(
         self,
         writer: asyncio.StreamWriter,
@@ -1143,9 +1390,11 @@ class DesktopUiServer:
             )
         except WorkspaceResolutionError as exc:
             status_and_code = {
+                "WORKSPACE_HOME_FORBIDDEN": (403, "WORKSPACE_HOME_FORBIDDEN"),
                 "WORKSPACE_OUTSIDE_ALLOWED_ROOTS": (403, "WORKSPACE_OUTSIDE_ALLOWED_ROOTS"),
                 "WORKSPACE_NOT_FOUND": (404, "WORKSPACE_NOT_FOUND"),
                 "WORKSPACE_AMBIGUOUS_MATCH": (409, "WORKSPACE_AMBIGUOUS"),
+                "WORKSPACE_INVALID_MANIFEST": (422, "WORKSPACE_INVALID_MANIFEST"),
                 "WORKSPACE_RESOLUTION_TIMEOUT": (504, "WORKSPACE_RESOLUTION_TIMEOUT"),
             }.get(exc.code, (400, "UI_INVALID_JSON_OR_PAYLOAD"))
             await self._write_error(
@@ -1168,6 +1417,8 @@ class DesktopUiServer:
                     "display_name": ctx.name,
                     "canonical_path": ctx.canonical_path,
                     "selected_via": ctx.selected_via,
+                    "topology": ctx.topology,
+                    "projects": [p.model_dump() for p in ctx.projects],
                 },
             },
             corr_id,

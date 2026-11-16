@@ -28,14 +28,18 @@ from nova.domain.events import (
     VoiceMilestoneEvent,
     VoiceTranscriptionEvent,
     WorkspaceChangedEvent,
+    WorkspaceClearedEvent,
 )
 from nova.domain.models import (
     AuditRiskLevel,
     CallSession,
     CallSessionState,
     CommandSource,
+    WorkspaceCatalogEntry,
     WorkspaceContext,
+    WorkspaceProject,
     WorkspaceQueryMode,
+    WorkspaceTopology,
     utc_now_iso,
 )
 
@@ -43,6 +47,7 @@ MAX_SINGLE_MESSAGE_CHARS = 65_536
 
 UiEventType = Literal[
     "workspace_changed",
+    "workspace_cleared",
     "chat_stream",
     "voice_milestone",
     "runner_failure",
@@ -77,6 +82,32 @@ class UiCallSessionView(BaseModel):
     active_correlation_id: str | None = None
 
 
+class UiProjectView(BaseModel):
+    """Wire DTO for a project declared inside a multi-project Workspace (NOVA-013)."""
+
+    model_config = ConfigDict(frozen=True, extra="ignore")
+
+    project_id: str = Field(min_length=1)
+    name: str = Field(min_length=1)
+    relative_path: str = Field(min_length=1)
+    canonical_path: str = Field(min_length=1)
+
+
+def _projects_to_views(
+    projects: tuple[WorkspaceProject, ...],
+    redact_fn: Callable[[str], str],
+) -> list[UiProjectView]:
+    return [
+        UiProjectView(
+            project_id=redact_fn(p.project_id),
+            name=redact_fn(p.name),
+            relative_path=redact_fn(p.relative_path),
+            canonical_path=redact_fn(p.canonical_path),
+        )
+        for p in projects
+    ]
+
+
 class UiWorkspaceView(BaseModel):
     """Wire DTO for active workspace inside UiStateSnapshot (OP-1 & OP-4)."""
 
@@ -85,6 +116,8 @@ class UiWorkspaceView(BaseModel):
     display_name: str = Field(min_length=1)
     canonical_path: str = Field(min_length=1)
     selected_via: WorkspaceQueryMode = "exact_path"
+    topology: WorkspaceTopology = "single-repo"
+    projects: list[UiProjectView] = Field(default_factory=list)
 
 
 class UiWorkspaceOption(BaseModel):
@@ -94,6 +127,9 @@ class UiWorkspaceOption(BaseModel):
 
     display_name: str = Field(min_length=1)
     canonical_path: str = Field(min_length=1)
+    topology: WorkspaceTopology = "single-repo"
+    project_count: int = 0
+    projects: list[UiProjectView] = Field(default_factory=list)
 
 
 class UiApprovalItem(BaseModel):
@@ -136,6 +172,9 @@ class UiStateSnapshot(BaseModel):
     schema_version: Literal["1.3.0"] = "1.3.0"
     csrf_token: str
     voice_enabled: bool
+    onboarding_required: bool = False
+    process_cwd: str = ""
+    allowed_roots: list[str] = Field(default_factory=list)
     call_session: UiCallSessionView
     active_workspace: UiWorkspaceView | None = None
     available_workspaces: list[UiWorkspaceOption]
@@ -217,6 +256,12 @@ class UiStateHub:
         settings: UiHubSettings | None = None,
         extra_secrets_provider: Callable[[], tuple[str, ...]] | None = None,
         available_workspaces_provider: Callable[[], Awaitable[list[tuple[str, str]]]] | None = None,
+        workspace_entries_provider: (
+            Callable[[], Awaitable[list[WorkspaceCatalogEntry]]] | None
+        ) = None,
+        onboarding_required_provider: Callable[[], bool] | None = None,
+        process_cwd_provider: Callable[[], str] | None = None,
+        allowed_roots_provider: Callable[[], tuple[str, ...]] | None = None,
         call_session_provider: Callable[[], CallSession] | None = None,
         initial_workspace: WorkspaceContext | None = None,
         initial_call_session: CallSession | None = None,
@@ -227,6 +272,10 @@ class UiStateHub:
         self._settings = settings or UiHubSettings()
         self._extra_secrets_provider = extra_secrets_provider
         self._available_workspaces_provider = available_workspaces_provider
+        self._workspace_entries_provider = workspace_entries_provider
+        self._onboarding_required_provider = onboarding_required_provider
+        self._process_cwd_provider = process_cwd_provider
+        self._allowed_roots_provider = allowed_roots_provider
         self._call_session_provider = call_session_provider
         self._voice_enabled = voice_enabled
         self._clock = clock
@@ -248,6 +297,8 @@ class UiStateHub:
                 display_name=initial_workspace.name,
                 canonical_path=initial_workspace.canonical_path,
                 selected_via=initial_workspace.selected_via,
+                topology=initial_workspace.topology,
+                projects=_projects_to_views(initial_workspace.projects, lambda s: s),
             )
             if initial_workspace is not None
             else None
@@ -384,7 +435,22 @@ class UiStateHub:
         self._prune_approvals()
         call_view = self.sync_call_session()
         options: list[UiWorkspaceOption] = []
-        if self._available_workspaces_provider is not None:
+        if self._workspace_entries_provider is not None:
+            try:
+                entries = await self._workspace_entries_provider()
+                options = [
+                    UiWorkspaceOption(
+                        display_name=self._redact(entry.name),
+                        canonical_path=self._redact(entry.canonical_path),
+                        topology=entry.topology,
+                        project_count=len(entry.projects),
+                        projects=_projects_to_views(entry.projects, self._redact),
+                    )
+                    for entry in entries
+                ]
+            except Exception:
+                options = []
+        elif self._available_workspaces_provider is not None:
             try:
                 pairs = await self._available_workspaces_provider()
                 options = [
@@ -394,9 +460,28 @@ class UiStateHub:
             except Exception:
                 options = []
 
+        onboarding_req = (
+            bool(self._onboarding_required_provider())
+            if self._onboarding_required_provider is not None
+            else False
+        )
+        proc_cwd = (
+            self._redact(self._process_cwd_provider())
+            if self._process_cwd_provider is not None
+            else ""
+        )
+        roots_list = (
+            [self._redact(r) for r in self._allowed_roots_provider()]
+            if self._allowed_roots_provider is not None
+            else []
+        )
+
         return UiStateSnapshot(
             csrf_token=csrf_token,
             voice_enabled=self._voice_enabled,
+            onboarding_required=onboarding_req,
+            process_cwd=proc_cwd,
+            allowed_roots=roots_list,
             call_session=call_view,
             active_workspace=self._active_workspace,
             available_workspaces=options,
@@ -413,6 +498,8 @@ class UiStateHub:
                 display_name=self._redact(event.workspace_name),
                 canonical_path=self._redact(event.canonical_path),
                 selected_via=event.selected_via,
+                topology=event.topology,
+                projects=_projects_to_views(event.projects, self._redact),
             )
             self._emit_envelope(
                 seq=seq,
@@ -420,6 +507,20 @@ class UiStateHub:
                 correlation_id=event.correlation_id,
                 timestamp=event.timestamp,
                 payload=self._active_workspace.model_dump(),
+            )
+            return
+
+        if isinstance(event, WorkspaceClearedEvent):
+            self._active_workspace = None
+            self._emit_envelope(
+                seq=seq,
+                event_type="workspace_cleared",
+                correlation_id=event.correlation_id,
+                timestamp=event.timestamp,
+                payload={
+                    "active_workspace": None,
+                    "process_cwd": self._redact(event.process_cwd),
+                },
             )
             return
 

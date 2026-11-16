@@ -850,3 +850,212 @@ print(json.dumps({{
             )
         ]
     assert ttl_exc.value.code == "GATEKEEPER_PLUGIN_MISSING"
+
+
+@pytest.mark.asyncio
+async def test_nova013_ac3_ac5_pi_gatekeeper_blocks_unscoped_home_and_confines_declared_projects(
+    tmp_path: Path,
+) -> None:
+    node_bin = shutil.which("node")
+    assert node_bin is not None
+
+    fake_home = tmp_path / "fake_home"
+    fake_home.mkdir()
+    ws_dir = tmp_path / "ws_cliente_a"
+    proj_dir = ws_dir / "repositories" / "api_pagos"
+    proj_dir.mkdir(parents=True)
+    outside_sub = ws_dir / "notes"
+    outside_sub.mkdir(parents=True)
+
+    probe_mjs = tmp_path / "probe_nova013_ext.mjs"
+    probe_mjs.write_text(
+        f"""
+import extFactory from {json.dumps(PI_GATEKEEPER_EXTENSION_PATH.as_uri())};
+let handler = null;
+extFactory({{ on(ev, fn) {{ if (ev === "tool_call") handler = fn; }} }});
+const toolName = process.env.TEST_TOOL_NAME;
+const input = JSON.parse(process.env.TEST_TOOL_INPUT);
+const cwd = process.env.TEST_CWD;
+const res = await handler({{ toolName, input }}, {{ cwd }});
+console.log(JSON.stringify(res ?? {{ allowed: true }}));
+""",
+        encoding="utf-8",
+    )
+
+    async def _run_ext(
+        tool_name: str,
+        tool_input: dict[str, str],
+        cwd: Path,
+        extra_env: dict[str, str],
+    ) -> dict[str, object]:
+        proc = await asyncio.create_subprocess_exec(
+            node_bin,
+            str(probe_mjs),
+            cwd=str(tmp_path),
+            env={
+                **os.environ,
+                "HOME": str(fake_home),
+                "NOVA_GATEKEEPER_SOCKET": str(tmp_path / "unused.sock"),
+                "NOVA_GATEKEEPER_TOKEN": "tok",
+                "TEST_TOOL_NAME": tool_name,
+                "TEST_TOOL_INPUT": json.dumps(tool_input),
+                "TEST_CWD": str(cwd),
+                **extra_env,
+            },
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        out, err = await proc.communicate()
+        assert proc.returncode == 0, err.decode("utf-8", errors="replace")
+        return dict(json.loads(out.decode("utf-8")))
+
+    # 1. NOVA_WORKSPACE_ACTIVE=0 blocks read, ls, write, bash immediately
+    for t_name, t_in in (
+        ("read", {"path": "README.md"}),
+        ("ls", {}),
+        ("write", {"path": "x.txt"}),
+        ("bash", {"command": "pwd"}),
+    ):
+        res_unscoped = await _run_ext(t_name, t_in, ws_dir, {"NOVA_WORKSPACE_ACTIVE": "0"})
+        assert res_unscoped.get("block") is True
+        assert "GATEKEEPER_NO_ACTIVE_WORKSPACE" in str(res_unscoped.get("reason", ""))
+
+    # 2. Even if NOVA_WORKSPACE_ACTIVE is omitted, cwd == HOME is unconditionally blocked
+    res_home = await _run_ext("read", {"path": ".bashrc"}, fake_home, {})
+    assert res_home.get("block") is True
+    assert "GATEKEEPER_NO_ACTIVE_WORKSPACE" in str(res_home.get("reason", ""))
+
+    # 3. With active workspace + NOVA_ALLOWED_PROJECT_PATHS, writes outside declared projects block
+    env_active = {
+        "NOVA_WORKSPACE_ACTIVE": "1",
+        "NOVA_ALLOWED_PROJECT_PATHS": json.dumps([str(proj_dir.resolve())]),
+    }
+    res_ok_write = await _run_ext(
+        "write",
+        {"path": "repositories/api_pagos/app.py"},
+        ws_dir,
+        env_active,
+    )
+    assert res_ok_write.get("allowed") is True
+
+    res_bad_write = await _run_ext(
+        "write",
+        {"path": "notes/leak.txt"},
+        ws_dir,
+        env_active,
+    )
+    assert res_bad_write.get("block") is True
+    assert "GATEKEEPER_OUTSIDE_DECLARED_PROJECT" in str(res_bad_write.get("reason", ""))
+
+    # 4. Malformed or unresolvable non-empty NOVA_ALLOWED_PROJECT_PATHS fails closed
+    for broken_raw in ("{malformed-json", json.dumps([str(ws_dir / "missing_repo")])):
+        res_corrupt = await _run_ext(
+            "write",
+            {"path": "notes/leak.txt"},
+            ws_dir,
+            {"NOVA_WORKSPACE_ACTIVE": "1", "NOVA_ALLOWED_PROJECT_PATHS": broken_raw},
+        )
+        assert res_corrupt.get("block") is True
+        assert "GATEKEEPER_OUTSIDE_DECLARED_PROJECT" in str(res_corrupt.get("reason", ""))
+
+
+@pytest.mark.asyncio
+async def test_nova013_agy_adapter_auto_provisions_and_enables_bundled_gatekeeper_plugin(
+    tmp_path: Path,
+) -> None:
+    state_file = tmp_path / "agy_plugins_state.json"
+    await asyncio.to_thread(state_file.write_text, "[]", "utf-8")
+
+    fake_agy = tmp_path / "fake_agy_stateful.py"
+    await asyncio.to_thread(
+        fake_agy.write_text,
+        f"""
+import json, os, sys
+from pathlib import Path
+
+state_path = Path({str(state_file)!r})
+plugins = json.loads(state_path.read_text(encoding="utf-8"))
+
+if sys.argv[1:4] == ["plugin", "list", "--json"]:
+    print(json.dumps(plugins))
+    raise SystemExit(0)
+
+if sys.argv[1:3] == ["plugin", "install"] and len(sys.argv) >= 4:
+    src_dir = Path(sys.argv[3])
+    assert (src_dir / "plugin.json").is_file()
+    assert (src_dir / "hooks.json").is_file()
+    manifest = json.loads((src_dir / "plugin.json").read_text(encoding="utf-8"))
+    plugins = [p for p in plugins if p.get("name") != manifest["name"]]
+    plugins.append({{
+        "name": manifest["name"],
+        "enabled": True,
+        "path": str(src_dir),
+    }})
+    state_path.write_text(json.dumps(plugins), encoding="utf-8")
+    print("[ok] installed")
+    raise SystemExit(0)
+
+if sys.argv[1:3] == ["plugin", "enable"] and len(sys.argv) >= 4:
+    target_name = sys.argv[3]
+    for p in plugins:
+        if p.get("name") == target_name:
+            p["enabled"] = True
+    state_path.write_text(json.dumps(plugins), encoding="utf-8")
+    raise SystemExit(0)
+
+print(json.dumps({{"event": "init", "conversation_id": "c-auto"}}), flush=True)
+print(json.dumps({{
+    "event": "result",
+    "result": {{"conversation_id": "c-auto", "status": "SUCCESS", "response": "OK"}},
+}}), flush=True)
+""",
+        "utf-8",
+    )
+
+    adapter = AntigravityCLIAdapter(
+        AntigravityRunnerConfig(
+            executable=sys.executable,
+            extra_leading_args=(str(fake_agy),),
+            gatekeeper_ipc_env={
+                "NOVA_GATEKEEPER_SOCKET": str(tmp_path / "probe.sock"),
+                "NOVA_GATEKEEPER_TOKEN": "tok",
+            },
+            plugin_check_ttl_seconds=0.01,
+        )
+    )
+
+    # 1. Missing plugin -> auto-installed from bundled nova/plugins/agy_gatekeeper and verified
+    events = [
+        ev
+        async for ev in adapter.execute(
+            CodingTaskRequest(
+                correlation_id="corr-auto-1",
+                workspace_path=str(tmp_path),
+                prompt="Responde OK",
+            )
+        )
+    ]
+    assert any(e.kind == "completed" for e in events)
+    persisted = json.loads(await asyncio.to_thread(state_file.read_text, "utf-8"))
+    assert persisted[0]["name"] == "nova-agy-gatekeeper"
+    assert persisted[0]["enabled"] is True
+
+    # 2. Disabled plugin -> auto-enabled and verified after TTL expiry
+    persisted[0]["enabled"] = False
+    await asyncio.to_thread(state_file.write_text, json.dumps(persisted), "utf-8")
+    await asyncio.sleep(0.02)
+
+    events_reenabled = [
+        ev
+        async for ev in adapter.execute(
+            CodingTaskRequest(
+                correlation_id="corr-auto-2",
+                workspace_path=str(tmp_path),
+                prompt="Responde OK",
+            )
+        )
+    ]
+    assert any(e.kind == "completed" for e in events_reenabled)
+    persisted_after = json.loads(await asyncio.to_thread(state_file.read_text, "utf-8"))
+    assert persisted_after[0]["enabled"] is True
+

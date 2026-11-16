@@ -156,15 +156,50 @@ function touchesGitMetadata(candidateReal: string, workspaceReal: string): boole
   return segments.some((seg) => seg.toLowerCase() === ".git");
 }
 
+interface AllowedProjectPolicy {
+  readonly enforced: boolean;
+  readonly roots: readonly string[];
+}
+
+function parseAllowedProjectRoots(): AllowedProjectPolicy {
+  const raw = process.env.NOVA_ALLOWED_PROJECT_PATHS;
+  if (!raw || !raw.trim()) {
+    return { enforced: false, roots: [] };
+  }
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    if (!Array.isArray(parsed)) {
+      return { enforced: true, roots: [] };
+    }
+    if (parsed.length === 0) {
+      return { enforced: false, roots: [] };
+    }
+    const roots: string[] = [];
+    for (const item of parsed) {
+      if (typeof item === "string" && item.trim()) {
+        try {
+          roots.push(fs.realpathSync(item.trim()));
+        } catch {
+          // Non-resolvable project path is ignored; enforced=true keeps confinement fail-closed
+        }
+      }
+    }
+    return { enforced: true, roots };
+  } catch {
+    return { enforced: true, roots: [] };
+  }
+}
+
 function isPathConfinedToWorkspace(
   rawPath: string,
   workspaceReal: string,
   forbidGitMetadataWrite = false,
-): boolean {
+  projectPolicy: AllowedProjectPolicy = { enforced: false, roots: [] },
+): "ok" | "outside_workspace" | "outside_project" {
   const exactNorm = normalizeExactPiPath(rawPath);
   const defensiveNorm = normalizeDefensivePath(rawPath);
   if (exactNorm === null || defensiveNorm === null) {
-    return false;
+    return "outside_workspace";
   }
 
   const candidateForms = new Set<string>();
@@ -181,13 +216,20 @@ function isPathConfinedToWorkspace(
   for (const candidateAbs of candidateForms) {
     const resolved = resolveAbsoluteRealpath(candidateAbs);
     if (!resolved || !isInsideWorkspace(resolved, workspaceReal)) {
-      return false;
+      return "outside_workspace";
     }
     if (forbidGitMetadataWrite && touchesGitMetadata(resolved, workspaceReal)) {
-      return false;
+      return "outside_workspace";
+    }
+    if (
+      forbidGitMetadataWrite &&
+      projectPolicy.enforced &&
+      !projectPolicy.roots.some((projRoot) => isInsideWorkspace(resolved, projRoot))
+    ) {
+      return "outside_project";
     }
   }
-  return true;
+  return "ok";
 }
 
 function isUnsafeGlobPattern(pattern: string): boolean {
@@ -242,6 +284,8 @@ function checkFileToolConfinement(
     };
   }
 
+  const projectPolicy = parseAllowedProjectRoots();
+
   for (const key of PATH_ARGUMENT_KEYS) {
     const val = input[key];
     if (val === undefined) {
@@ -254,7 +298,19 @@ function checkFileToolConfinement(
       };
     }
     const forbidGitWrite = MUTATING_FILE_TOOLS.has(toolName);
-    if (!isPathConfinedToWorkspace(val, workspaceReal, forbidGitWrite)) {
+    const confinement = isPathConfinedToWorkspace(
+      val,
+      workspaceReal,
+      forbidGitWrite,
+      projectPolicy,
+    );
+    if (confinement === "outside_project") {
+      return {
+        block: true,
+        reason: `GATEKEEPER_OUTSIDE_DECLARED_PROJECT: Mutating file path '${val}' is outside declared workspace projects.`,
+      };
+    }
+    if (confinement !== "ok") {
       return {
         block: true,
         reason: `GATEKEEPER_OUTSIDE_WORKSPACE_FILE: File path '${val}' escapes workspace or mutates protected .git metadata.`,
@@ -368,6 +424,30 @@ export default function (pi: ExtensionAPI) {
     const socketPath = process.env.NOVA_GATEKEEPER_SOCKET;
     if (!socketPath) {
       return undefined;
+    }
+
+    if (process.env.NOVA_WORKSPACE_ACTIVE === "0") {
+      return {
+        block: true,
+        reason:
+          "GATEKEEPER_NO_ACTIVE_WORKSPACE: Nova is in conversational mode (~); file and shell tools are disabled until a workspace is selected.",
+      };
+    }
+
+    let homeReal: string | null = null;
+    let cwdReal: string | null = null;
+    try {
+      homeReal = fs.realpathSync(os.homedir());
+      cwdReal = fs.realpathSync(ctx.cwd);
+    } catch {
+      // Handled downstream if workspace directory cannot be resolved
+    }
+    if (homeReal !== null && cwdReal !== null && cwdReal === homeReal) {
+      return {
+        block: true,
+        reason:
+          "GATEKEEPER_NO_ACTIVE_WORKSPACE: User home directory (~) cannot be used as an active workspace.",
+      };
     }
 
     if (event.input !== undefined && !isPlainObject(event.input)) {

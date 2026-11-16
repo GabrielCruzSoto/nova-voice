@@ -154,3 +154,31 @@ def test_faster_whisper_accepts_none_auto_detect_language() -> None:
     adapter = FasterWhisperSttAdapter(settings)
     adapter.update_settings(language="en")
     adapter.update_settings(language=None)
+
+
+def test_nova013_ac6_first_run_completed_defaults_false_and_roundtrips(tmp_path: Path) -> None:
+    cfg_path = tmp_path / "nova" / "config.toml"
+    store = TomlConfigStore(config_path=cfg_path)
+
+    default_loaded = store.load()
+    assert default_loaded.general.first_run_completed is False
+
+    # Legacy config.toml without first_run_completed loads cleanly as False
+    cfg_path.parent.mkdir(parents=True, exist_ok=True)
+    cfg_path.write_text(
+        'schema_version = "1.0"\n[general]\nremember_workspace = true\n',
+        encoding="utf-8",
+    )
+    legacy_loaded = store.load()
+    assert legacy_loaded.general.first_run_completed is False
+
+    completed = legacy_loaded.model_copy(
+        update={
+            "general": legacy_loaded.general.model_copy(
+                update={"first_run_completed": True}
+            )
+        }
+    )
+    store.save(completed)
+    reloaded = store.load()
+    assert reloaded.general.first_run_completed is True

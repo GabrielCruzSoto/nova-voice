@@ -715,3 +715,223 @@ async def test_post_api_shutdown_enforces_csrf_and_triggers_idempotent_callback(
         assert shutdown_reasons == ["ui_http", "ui_http"]
     hub.close()
 
+
+async def test_nova013_onboarding_diagnostics_and_multiproject_workspace_http_routes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from nova.adapters.config_store import TomlConfigStore
+    from nova.application.live_diagnostics import LiveDiagnosticsConfig, LiveDiagnosticsService
+    from nova.application.settings_service import SettingsService
+    from nova.domain.models import (
+        AntigravityDiagnosticResult,
+        AudioOutputDiagnosticResult,
+        MicDiagnosticResult,
+        PiConnectionDiagnosticResult,
+    )
+
+    fake_home = tmp_path / "home_op"
+    fake_home.mkdir()
+    monkeypatch.setattr(Path, "home", lambda: fake_home)
+
+    root = tmp_path / "Proyectos"
+    root.mkdir()
+    bus = OrchestratorEventBus()
+    resolver = LocalWorkspaceResolver(allowed_roots=[root], event_bus=bus, home_dir=fake_home)
+    tier1 = _StubTier1()
+    orch = NovaOrchestrator(
+        workspace_resolver=resolver,
+        tier1_client=tier1,
+        tier2_runner=_StubTier2(),
+        event_bus=bus,
+    )
+    hub = UiStateHub(
+        event_bus=bus,
+        workspace_entries_provider=resolver.list_workspace_entries,
+        onboarding_required_provider=lambda: True,
+        process_cwd_provider=lambda: str(fake_home),
+    )
+
+    class _StubDiagnostics(LiveDiagnosticsService):
+        def __init__(self) -> None:
+            super().__init__(config=LiveDiagnosticsConfig())
+
+        async def test_microphone(
+            self,
+            capture_target: str | None = None,
+            duration_seconds: float = 2.0,
+        ) -> MicDiagnosticResult:
+            _ = (capture_target, duration_seconds)
+            return MicDiagnosticResult(
+                ok=True,
+                status="ok",
+                duration_ms=500.0,
+                peak_level=0.5,
+                rms_level=0.2,
+                speech_detected=True,
+                transcript_preview="Hola Nova",
+                message="Micrófono operativo.",
+            )
+
+        async def test_audio_output(
+            self,
+            playback_target: str | None = None,
+        ) -> AudioOutputDiagnosticResult:
+            _ = playback_target
+            return AudioOutputDiagnosticResult(
+                ok=True,
+                status="ok",
+                engine="piper",
+                latency_ms=42.0,
+                message="Audio reproducido.",
+            )
+
+        async def test_pi_connection(
+            self,
+            provider: str | None = None,
+            model: str | None = None,
+        ) -> PiConnectionDiagnosticResult:
+            return PiConnectionDiagnosticResult(
+                ok=True,
+                status="connected",
+                provider=provider or "nvidia",
+                model=model or "nemotron",
+                latency_ms=110.0,
+                message="Conectado a Pi.",
+            )
+
+        async def test_antigravity_connection(
+            self,
+            model: str | None = None,
+        ) -> AntigravityDiagnosticResult:
+            return AntigravityDiagnosticResult(
+                ok=True,
+                status="connected",
+                model=model or "claude-opus-5-5-high",
+                plugin_verified=True,
+                latency_ms=220.0,
+                message="Conectado a Antigravity.",
+            )
+
+    settings_svc = SettingsService(
+        config_store=TomlConfigStore(config_path=tmp_path / "config.toml"),
+        event_bus=bus,
+    )
+
+    async with DesktopUiServer(
+        orchestrator=orch,
+        state_hub=hub,
+        event_bus=bus,
+        workspace_resolver=resolver,
+        settings_service=settings_svc,
+        diagnostics_service=_StubDiagnostics(),
+    ) as srv:
+        port = srv.port
+        _, idx_hdrs, _ = await _raw_http_request(port, "GET", "/")
+        cookie = idx_hdrs["set-cookie"].split(";", 1)[0]
+
+        st_state, _, state_body = await _raw_http_request(
+            port, "GET", "/api/state", headers={"Cookie": cookie}
+        )
+        assert st_state == 200
+        snap = json.loads(state_body.decode("utf-8"))
+        assert snap["onboarding_required"] is True
+        assert snap["process_cwd"] == str(fake_home)
+        assert snap["active_workspace"] is None
+        csrf = snap["csrf_token"]
+
+        auth_hdrs = {
+            "Cookie": cookie,
+            "Origin": f"http://127.0.0.1:{port}",
+            "X-Nova-CSRF": csrf,
+            "Content-Type": "application/json",
+        }
+
+        # 1. Selecting ~ returns 403 WORKSPACE_HOME_FORBIDDEN
+        st_home, _, home_body = await _raw_http_request(
+            port,
+            "POST",
+            "/api/workspace/select",
+            headers=auth_hdrs,
+            body=json.dumps({"path_or_query": "~"}).encode("utf-8"),
+        )
+        assert st_home == 403
+        assert json.loads(home_body)["error_code"] == "WORKSPACE_HOME_FORBIDDEN"
+
+        # 2. Initialize multi-project workspace -> 201 Created
+        st_init, _, init_body = await _raw_http_request(
+            port,
+            "POST",
+            "/api/workspace/init",
+            headers=auth_hdrs,
+            body=json.dumps(
+                {
+                    "parent_root": str(root),
+                    "workspace_slug": "cliente-uno",
+                    "display_name": "Cliente Uno",
+                    "projects": ["api-core", "web-ui"],
+                    "activate": True,
+                }
+            ).encode("utf-8"),
+        )
+        assert st_init == 201
+        init_payload = json.loads(init_body.decode("utf-8"))
+        assert init_payload["created"] is True
+        assert init_payload["workspace"]["topology"] == "multi-project"
+        assert len(init_payload["workspace"]["projects"]) == 2
+        assert settings_svc.current_settings.general.last_active_workspace is not None
+
+        # 3. Clear workspace -> 200 OK and active_workspace + persisted last_active_workspace reset
+        st_clr, _, clr_body = await _raw_http_request(
+            port, "POST", "/api/workspace/clear", headers=auth_hdrs, body=b"{}"
+        )
+        assert st_clr == 200
+        assert json.loads(clr_body)["cleared"] is True
+        assert settings_svc.current_settings.general.last_active_workspace is None
+
+        # 4. All 4 live diagnostic endpoints succeed
+        for diag_path in (
+            "/api/diagnostics/microphone",
+            "/api/diagnostics/audio-output",
+            "/api/diagnostics/pi",
+            "/api/diagnostics/antigravity",
+        ):
+            st_d, _, d_body = await _raw_http_request(
+                port, "POST", diag_path, headers=auth_hdrs, body=b"{}"
+            )
+            assert st_d == 200
+            assert json.loads(d_body)["ok"] is True
+
+        # 5. Secret key in workspace manifest returns 422 WORKSPACE_INVALID_MANIFEST (OP-3)
+        bad_manifest_ws = root / "cliente-con-secreto"
+        bad_manifest_ws.mkdir()
+        (bad_manifest_ws / "nova-workspace.toml").write_text(
+            'schema_version = "1.0"\napi_key = "forbidden"\n[workspace]\nid = "x"\n',
+            encoding="utf-8",
+        )
+        st_sec, _, sec_body = await _raw_http_request(
+            port,
+            "POST",
+            "/api/workspace/select",
+            headers=auth_hdrs,
+            body=json.dumps({"path_or_query": str(bad_manifest_ws)}).encode("utf-8"),
+        )
+        assert st_sec == 422
+        assert json.loads(sec_body)["error_code"] == "WORKSPACE_INVALID_MANIFEST"
+
+        # 6. Blank workspace_slug or blank project slug in /api/workspace/init returns 422 (OP-2)
+        for invalid_init in (
+            {"parent_root": str(root), "workspace_slug": "   ", "projects": ["api"]},
+            {"parent_root": str(root), "workspace_slug": "cliente-dos", "projects": ["api", "  "]},
+        ):
+            st_inv, _, inv_body = await _raw_http_request(
+                port,
+                "POST",
+                "/api/workspace/init",
+                headers=auth_hdrs,
+                body=json.dumps(invalid_init).encode("utf-8"),
+            )
+            assert st_inv == 422
+            assert json.loads(inv_body)["error_code"] == "WORKSPACE_INVALID_MANIFEST"
+    hub.close()
+

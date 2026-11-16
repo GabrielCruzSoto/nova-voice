@@ -14,14 +14,23 @@ import {
   renderNoticeSlot,
   renderNovaReactiveOrb,
   renderNovaSquircleSvg,
+  renderOnboardingModal,
   renderSettingsDrawer,
   renderSinusoidalWave,
   renderWorkspaceBar,
   resolveHumanNotice,
 } from "./components.js";
 import type {
+  AntigravityDiagnosticResponse,
   AudioDeviceCatalog,
+  AudioOutputDiagnosticResponse,
+  DiagnosticTarget,
   ErrorResponse,
+  InitializeWorkspaceParams,
+  LiveDiagnosticsState,
+  MicDiagnosticResponse,
+  NovaSettingsDocument,
+  PiDiagnosticResponse,
   PresentationalAppModel,
   SettingsGetResponse,
   SettingsPutResponse,
@@ -29,6 +38,7 @@ import type {
   UiApprovalItem,
   UiChatMessage,
   UiEventEnvelope,
+  UiProjectView,
   UiStateSnapshot,
   UiWorkspaceView,
   ViewStatus,
@@ -46,12 +56,71 @@ export interface DesktopControllerOptions {
   readonly onQuitHost?: (() => void) | undefined;
 }
 
+const SETTINGS_DRAFT_FIELDS = [
+  "audio.capture_target",
+  "audio.playback_target",
+  "voice.sensitivity_preset",
+  "voice.tts_speed",
+  "voice.tts_engine",
+  "voice.whisper_language",
+  "shortcuts.ptt_mode",
+  "shortcuts.global_shortcut",
+  "models.pi_provider",
+  "models.pi_model",
+  "models.tier2_model",
+  "general.remember_workspace",
+] as const;
+
+const ONBOARDING_DRAFT_FIELDS = [
+  "onboarding.capture_target",
+  "onboarding.playback_target",
+] as const;
+
+interface FormFieldDraft {
+  readonly value: string;
+  readonly checked: boolean;
+}
+
+function snapshotFormFields(
+  container: HTMLElement,
+  fieldNames: readonly string[],
+): Map<string, FormFieldDraft> {
+  const out = new Map<string, FormFieldDraft>();
+  for (const name of fieldNames) {
+    const el = container.querySelector<HTMLInputElement | HTMLSelectElement>(`[name="${name}"]`);
+    if (el) {
+      out.set(name, {
+        value: el.value,
+        checked: "checked" in el ? Boolean(el.checked) : false,
+      });
+    }
+  }
+  return out;
+}
+
+function restoreFormFields(
+  container: HTMLElement,
+  snapshot: ReadonlyMap<string, FormFieldDraft>,
+): void {
+  for (const [name, draft] of snapshot.entries()) {
+    const el = container.querySelector<HTMLInputElement | HTMLSelectElement>(`[name="${name}"]`);
+    if (!el) {
+      continue;
+    }
+    el.value = draft.value;
+    if ("checked" in el) {
+      el.checked = draft.checked;
+    }
+  }
+}
+
 export class DesktopAppController {
   #csrfToken = "";
   #abortController = new AbortController();
   #disposed = false;
   #shellMounted = false;
   #pttHolding = false;
+  #lastRenderedSettingsRef: NovaSettingsDocument | null | undefined = undefined;
   #sleepTimer: ReturnType<typeof setTimeout> | null = null;
   readonly #fetch: FetchLike;
   readonly #root: HTMLElement | null;
@@ -77,6 +146,18 @@ export class DesktopAppController {
     pickerFallbackOpen: false,
     lastMilestone: null,
     uiMode: "panel",
+    onboardingOpen: false,
+    onboardingSaving: false,
+    processCwd: "",
+    allowedRoots: [],
+    initWorkspaceOpen: false,
+    diagnostics: {
+      runningTarget: null,
+      microphone: null,
+      audioOutput: null,
+      pi: null,
+      antigravity: null,
+    },
   };
 
   constructor(options: DesktopControllerOptions = {}) {
@@ -114,6 +195,10 @@ export class DesktopAppController {
       }
       const snapshot = (await resp.json()) as UiStateSnapshot;
       this.#applySnapshot(snapshot);
+
+      if (snapshot.onboarding_required) {
+        await this.#preloadSettingsAndDevices();
+      }
 
       try {
         const healthResp = await this.#fetch("/api/health", {
@@ -168,7 +253,7 @@ export class DesktopAppController {
 
   async submitChat(utterance: string): Promise<void> {
     const trimmed = utterance.trim();
-    if (!trimmed || this.#disposed || !this.#model.activeWorkspace) {
+    if (!trimmed || this.#disposed) {
       return;
     }
     const resp = await this.#postJson("/api/chat", { utterance: trimmed });
@@ -273,6 +358,352 @@ export class DesktopAppController {
     }
     if ((this.#model.uiMode ?? "panel") === "orb") {
       this.#updateModel({ uiMode: "panel" });
+    }
+  }
+
+  toggleInitWorkspaceForm(): void {
+    if (this.#disposed) {
+      return;
+    }
+    this.#updateModel({ initWorkspaceOpen: !this.#model.initWorkspaceOpen });
+  }
+
+  async clearWorkspace(): Promise<void> {
+    if (this.#disposed) {
+      return;
+    }
+    const resp = await this.#postJson("/api/workspace/clear", {});
+    if (!resp.ok) {
+      const errBody = await this.#safeParseError(resp);
+      const code = errBody?.error_code ?? "ORCHESTRATOR_UNEXPECTED_FAILURE";
+      this.#updateModel({ noticeBanner: resolveHumanNotice(code), errorBanner: null });
+      return;
+    }
+    this.#updateModel({
+      activeWorkspace: null,
+      initWorkspaceOpen: false,
+      pickerFallbackOpen: false,
+      errorBanner: null,
+      noticeBanner: null,
+    });
+  }
+
+  async initializeWorkspace(params: InitializeWorkspaceParams): Promise<void> {
+    if (this.#disposed) {
+      return;
+    }
+    const slug = params.workspaceSlug.trim();
+    const parent = params.parentRoot.trim();
+    if (!slug || !parent) {
+      return;
+    }
+    const resp = await this.#postJson("/api/workspace/init", {
+      parent_root: parent,
+      workspace_slug: slug,
+      display_name: params.displayName?.trim() || null,
+      projects: params.projects.map((p) => p.trim()).filter((p) => p.length > 0),
+      activate: true,
+    });
+    if (!resp.ok) {
+      const errBody = await this.#safeParseError(resp);
+      const code = errBody?.error_code ?? "WORKSPACE_INVALID_MANIFEST";
+      this.#updateModel({ noticeBanner: resolveHumanNotice(code), errorBanner: null });
+      return;
+    }
+    const data = (await resp.json()) as {
+      created: boolean;
+      workspace: UiWorkspaceView;
+    };
+    if (data.created && data.workspace) {
+      const existsInList = this.#model.availableWorkspaces.some(
+        (w) => w.canonical_path === data.workspace.canonical_path,
+      );
+      const nextAvailable = existsInList
+        ? this.#model.availableWorkspaces
+        : [
+            ...this.#model.availableWorkspaces,
+            {
+              display_name: data.workspace.display_name,
+              canonical_path: data.workspace.canonical_path,
+              topology: data.workspace.topology,
+              project_count: data.workspace.projects?.length ?? 0,
+              projects: data.workspace.projects,
+            },
+          ];
+      this.#updateModel({
+        activeWorkspace: data.workspace,
+        availableWorkspaces: nextAvailable,
+        initWorkspaceOpen: false,
+        pickerFallbackOpen: false,
+        errorBanner: null,
+        noticeBanner: null,
+      });
+    }
+  }
+
+  #currentDiagState(): LiveDiagnosticsState {
+    return (
+      this.#model.diagnostics ?? {
+        runningTarget: null,
+        microphone: null,
+        audioOutput: null,
+        pi: null,
+        antigravity: null,
+      }
+    );
+  }
+
+  #readActiveProbeParams(): {
+    captureTarget: string | null;
+    playbackTarget: string | null;
+    piProvider: string | null;
+    piModel: string | null;
+    tier2Model: string | null;
+  } {
+    const s = this.#model.settingsData;
+    const root = this.#root;
+    let captureTarget: string | null = s?.audio.capture_target ?? null;
+    let playbackTarget: string | null = s?.audio.playback_target ?? null;
+    let piProvider: string | null = s?.models.pi_provider ?? null;
+    let piModel: string | null = s?.models.pi_model ?? null;
+    let tier2Model: string | null = s?.models.tier2_model ?? null;
+
+    if (this.#model.onboardingOpen) {
+      const capDom = root?.querySelector<HTMLSelectElement>('[name="onboarding.capture_target"]');
+      const playDom = root?.querySelector<HTMLSelectElement>('[name="onboarding.playback_target"]');
+      const capVal =
+        capDom !== null && capDom !== undefined
+          ? capDom.value
+          : this.#model.onboardingDraftAudio?.captureTarget;
+      const playVal =
+        playDom !== null && playDom !== undefined
+          ? playDom.value
+          : this.#model.onboardingDraftAudio?.playbackTarget;
+      if (capVal !== undefined) {
+        captureTarget = capVal.trim() || null;
+      }
+      if (playVal !== undefined) {
+        playbackTarget = playVal.trim() || null;
+      }
+    } else if (this.#model.settingsDrawerOpen && root) {
+      const capDom = root.querySelector<HTMLSelectElement>('[name="audio.capture_target"]');
+      const playDom = root.querySelector<HTMLSelectElement>('[name="audio.playback_target"]');
+      const provDom = root.querySelector<HTMLInputElement>('[name="models.pi_provider"]');
+      const modDom = root.querySelector<HTMLInputElement>('[name="models.pi_model"]');
+      const t2Dom = root.querySelector<HTMLInputElement>('[name="models.tier2_model"]');
+      if (capDom) {
+        captureTarget = capDom.value.trim() || null;
+      }
+      if (playDom) {
+        playbackTarget = playDom.value.trim() || null;
+      }
+      if (provDom) {
+        piProvider = provDom.value.trim() || piProvider;
+      }
+      if (modDom) {
+        piModel = modDom.value.trim() || piModel;
+      }
+      if (t2Dom) {
+        tier2Model = t2Dom.value.trim() || tier2Model;
+      }
+    }
+
+    return { captureTarget, playbackTarget, piProvider, piModel, tier2Model };
+  }
+
+  async runDiagnostic(
+    target: DiagnosticTarget,
+    options?: { keepRunningAll?: boolean },
+  ): Promise<void> {
+    if (this.#disposed) {
+      return;
+    }
+    const probeParams = this.#readActiveProbeParams();
+    const baseDiag = this.#currentDiagState();
+    this.#updateModel({
+      diagnostics: {
+        ...baseDiag,
+        runningTarget: options?.keepRunningAll ? "all" : target,
+      },
+    });
+
+    try {
+      if (target === "microphone") {
+        const resp = await this.#postJson("/api/diagnostics/microphone", {
+          capture_target: probeParams.captureTarget,
+          duration_seconds: 2.0,
+        });
+        if (resp.ok) {
+          const payload = (await resp.json()) as MicDiagnosticResponse;
+          this.#updateModel({
+            diagnostics: {
+              ...this.#currentDiagState(),
+              runningTarget: options?.keepRunningAll ? "all" : null,
+              microphone: payload,
+            },
+          });
+          return;
+        }
+      } else if (target === "audio-output") {
+        const resp = await this.#postJson("/api/diagnostics/audio-output", {
+          playback_target: probeParams.playbackTarget,
+        });
+        if (resp.ok) {
+          const payload = (await resp.json()) as AudioOutputDiagnosticResponse;
+          this.#updateModel({
+            diagnostics: {
+              ...this.#currentDiagState(),
+              runningTarget: options?.keepRunningAll ? "all" : null,
+              audioOutput: payload,
+            },
+          });
+          return;
+        }
+      } else if (target === "pi") {
+        const resp = await this.#postJson("/api/diagnostics/pi", {
+          provider: probeParams.piProvider,
+          model: probeParams.piModel,
+        });
+        if (resp.ok) {
+          const payload = (await resp.json()) as PiDiagnosticResponse;
+          this.#updateModel({
+            diagnostics: {
+              ...this.#currentDiagState(),
+              runningTarget: options?.keepRunningAll ? "all" : null,
+              pi: payload,
+            },
+          });
+          return;
+        }
+      } else if (target === "antigravity") {
+        const resp = await this.#postJson("/api/diagnostics/antigravity", {
+          model: probeParams.tier2Model,
+        });
+        if (resp.ok) {
+          const payload = (await resp.json()) as AntigravityDiagnosticResponse;
+          this.#updateModel({
+            diagnostics: {
+              ...this.#currentDiagState(),
+              runningTarget: options?.keepRunningAll ? "all" : null,
+              antigravity: payload,
+            },
+          });
+          return;
+        }
+      }
+    } catch {
+      // Handled by resetting runningTarget below
+    }
+
+    if (!options?.keepRunningAll && !this.#disposed) {
+      this.#updateModel({
+        diagnostics: {
+          ...this.#currentDiagState(),
+          runningTarget: null,
+        },
+      });
+    }
+  }
+
+  async runAllDiagnostics(): Promise<void> {
+    if (this.#disposed) {
+      return;
+    }
+    const order: readonly DiagnosticTarget[] = [
+      "microphone",
+      "audio-output",
+      "pi",
+      "antigravity",
+    ];
+    for (const target of order) {
+      if (this.#disposed) {
+        return;
+      }
+      await this.runDiagnostic(target, { keepRunningAll: true });
+    }
+    if (!this.#disposed) {
+      this.#updateModel({
+        diagnostics: {
+          ...this.#currentDiagState(),
+          runningTarget: null,
+        },
+      });
+    }
+  }
+
+  async completeOnboarding(audioOverride?: {
+    captureTarget?: string;
+    playbackTarget?: string;
+  }): Promise<void> {
+    if (this.#disposed) {
+      return;
+    }
+    const draft = this.#model.onboardingDraftAudio;
+    const effectiveAudio =
+      audioOverride ??
+      (draft !== undefined
+        ? {
+            captureTarget: draft.captureTarget,
+            playbackTarget: draft.playbackTarget,
+          }
+        : undefined);
+    this.#updateModel({ onboardingSaving: true });
+    const patch: Record<string, unknown> = {
+      general: { first_run_completed: true },
+    };
+    if (effectiveAudio) {
+      patch["audio"] = {
+        capture_target: effectiveAudio.captureTarget ?? "",
+        playback_target: effectiveAudio.playbackTarget ?? "",
+      };
+    }
+    const resp = await this.#sendJson("PUT", "/api/settings", patch);
+    if (!resp.ok) {
+      const err = await this.#safeParseError(resp);
+      this.#updateModel({
+        onboardingSaving: false,
+        noticeBanner: resolveHumanNotice(
+          err?.error_code ?? "ORCHESTRATOR_UNEXPECTED_FAILURE",
+          err?.message,
+        ),
+      });
+      return;
+    }
+    const payload = (await resp.json()) as SettingsPutResponse;
+    this.#updateModel({
+      onboardingSaving: false,
+      onboardingOpen: false,
+      onboardingDraftAudio: undefined,
+      settingsData: payload.settings,
+      lastMilestone: "Configuración inicial completada.",
+    });
+  }
+
+  async #preloadSettingsAndDevices(): Promise<void> {
+    try {
+      const [settingsResp, audioResp] = await Promise.all([
+        this.#fetch("/api/settings", {
+          method: "GET",
+          credentials: "same-origin",
+          signal: this.#abortController.signal,
+        }),
+        this.#fetch("/api/audio/devices", {
+          method: "GET",
+          credentials: "same-origin",
+          signal: this.#abortController.signal,
+        }),
+      ]);
+      const nextSettings = settingsResp.ok
+        ? ((await settingsResp.json()) as SettingsGetResponse).settings
+        : (this.#model.settingsData ?? null);
+      const nextAudio = audioResp.ok
+        ? ((await audioResp.json()) as AudioDeviceCatalog)
+        : (this.#model.audioDevices ?? null);
+      if (!this.#disposed) {
+        this.#updateModel({ settingsData: nextSettings, audioDevices: nextAudio });
+      }
+    } catch {
+      // Non-blocking onboarding preload
     }
   }
 
@@ -594,9 +1025,18 @@ export class DesktopAppController {
     }
     const capped = snap.messages.slice(-MAX_CLIENT_MESSAGES);
     const nextStatus: ViewStatus = capped.length > 0 ? "success" : "empty";
+    const nextOnboarding =
+      snap.onboarding_required === true
+        ? true
+        : snap.onboarding_required === false
+          ? false
+          : Boolean(this.#model.onboardingOpen);
     this.#updateModel({
       status: nextStatus,
       voiceEnabled: snap.voice_enabled,
+      onboardingOpen: nextOnboarding,
+      processCwd: snap.process_cwd ?? this.#model.processCwd ?? "",
+      allowedRoots: snap.allowed_roots ?? this.#model.allowedRoots ?? [],
       callSession: snap.call_session,
       activeWorkspace: snap.active_workspace,
       availableWorkspaces: snap.available_workspaces,
@@ -610,12 +1050,30 @@ export class DesktopAppController {
     const p = env.payload;
 
     if (env.event_type === "workspace_changed") {
+      const rawProjects = Array.isArray(p["projects"]) ? (p["projects"] as UiProjectView[]) : [];
+      const rawTopo = p["topology"] === "multi-project" ? "multi-project" : "single-repo";
       const ws: UiWorkspaceView = {
         display_name: String(p["display_name"] ?? ""),
         canonical_path: String(p["canonical_path"] ?? ""),
         selected_via: (p["selected_via"] as UiWorkspaceView["selected_via"]) ?? "exact_path",
+        topology: rawTopo,
+        projects: rawProjects,
       };
-      this.#updateModel({ activeWorkspace: ws, pickerFallbackOpen: false });
+      this.#updateModel({
+        activeWorkspace: ws,
+        pickerFallbackOpen: false,
+        initWorkspaceOpen: false,
+      });
+      return;
+    }
+
+    if (env.event_type === "workspace_cleared") {
+      this.#updateModel({
+        activeWorkspace: null,
+        pickerFallbackOpen: false,
+        initWorkspaceOpen: false,
+        processCwd: String(p["process_cwd"] ?? this.#model.processCwd ?? ""),
+      });
       return;
     }
 
@@ -791,6 +1249,8 @@ export class DesktopAppController {
         this.#model.errorBanner,
         this.#model.activeWorkspace,
         this.#model.availableWorkspaces,
+        Boolean(this.#model.initWorkspaceOpen),
+        this.#model.allowedRoots ?? [],
       );
       timelineSlot.scrollTop = timelineSlot.scrollHeight;
     }
@@ -853,7 +1313,31 @@ export class DesktopAppController {
     }
     const settingsSlot = this.#root.querySelector<HTMLElement>('[data-slot="settings-drawer"]');
     if (settingsSlot) {
+      const preserveSettingsDraft =
+        Boolean(this.#model.settingsDrawerOpen) &&
+        !this.#model.settingsLoading &&
+        this.#lastRenderedSettingsRef === this.#model.settingsData;
+      const settingsDraft = preserveSettingsDraft
+        ? snapshotFormFields(settingsSlot, SETTINGS_DRAFT_FIELDS)
+        : null;
       settingsSlot.innerHTML = renderSettingsDrawer(this.#model);
+      this.#lastRenderedSettingsRef = this.#model.settingsData;
+      if (settingsDraft && settingsDraft.size > 0) {
+        restoreFormFields(settingsSlot, settingsDraft);
+      }
+    }
+    const onboardingSlot = this.#root.querySelector<HTMLElement>(
+      '[data-slot="onboarding-container"]',
+    );
+    if (onboardingSlot) {
+      const onboardingDraft =
+        this.#model.onboardingOpen && this.#model.onboardingDraftAudio === undefined
+          ? snapshotFormFields(onboardingSlot, ONBOARDING_DRAFT_FIELDS)
+          : null;
+      onboardingSlot.innerHTML = renderOnboardingModal(this.#model);
+      if (onboardingDraft && onboardingDraft.size > 0) {
+        restoreFormFields(onboardingSlot, onboardingDraft);
+      }
     }
   }
 
@@ -903,10 +1387,39 @@ export class DesktopAppController {
           this.closeSettingsDrawer();
         } else if (action === "register-shortcut") {
           const shortcutInput = root.querySelector<HTMLInputElement>(
-            'input[name="shortcuts.global_shortcut"]',
+            '[name="shortcuts.global_shortcut"]',
           );
           const shortcut = shortcutInput?.value.trim() || "Super+Shift+Space";
           void this.registerGlobalShortcut(shortcut);
+        } else if (action === "clear-workspace") {
+          void this.clearWorkspace();
+        } else if (action === "toggle-init-workspace") {
+          this.toggleInitWorkspaceForm();
+        } else if (action === "diag-microphone") {
+          void this.runDiagnostic("microphone");
+        } else if (action === "diag-audio-output") {
+          void this.runDiagnostic("audio-output");
+        } else if (action === "diag-pi") {
+          void this.runDiagnostic("pi");
+        } else if (action === "diag-antigravity") {
+          void this.runDiagnostic("antigravity");
+        } else if (action === "diag-run-all") {
+          void this.runAllDiagnostics();
+        } else if (action === "complete-onboarding") {
+          const capEl = root.querySelector<HTMLSelectElement>(
+            '[name="onboarding.capture_target"]',
+          );
+          const playEl = root.querySelector<HTMLSelectElement>(
+            '[name="onboarding.playback_target"]',
+          );
+          const audioOverride =
+            capEl || playEl
+              ? {
+                  captureTarget: capEl?.value ?? "",
+                  playbackTarget: playEl?.value ?? "",
+                }
+              : undefined;
+          void this.completeOnboarding(audioOverride);
         }
       },
       { signal: sig },
@@ -943,6 +1456,34 @@ export class DesktopAppController {
         const target = ev.target as HTMLSelectElement | null;
         if (target?.dataset["action"] === "select-workspace-dropdown" && target.value) {
           void this.selectWorkspace(target.value);
+        } else if (target?.dataset["action"] === "onboarding-audio-select") {
+          const changedName = target.name || target.getAttribute?.("name") || "";
+          const capEl = root.querySelector<HTMLSelectElement>(
+            '[name="onboarding.capture_target"]',
+          );
+          const playEl = root.querySelector<HTMLSelectElement>(
+            '[name="onboarding.playback_target"]',
+          );
+          const nextCapture =
+            changedName === "onboarding.capture_target"
+              ? target.value
+              : (capEl?.value ??
+                this.#model.onboardingDraftAudio?.captureTarget ??
+                this.#model.settingsData?.audio.capture_target ??
+                "");
+          const nextPlayback =
+            changedName === "onboarding.playback_target"
+              ? target.value
+              : (playEl?.value ??
+                this.#model.onboardingDraftAudio?.playbackTarget ??
+                this.#model.settingsData?.audio.playback_target ??
+                "");
+          this.#updateModel({
+            onboardingDraftAudio: {
+              captureTarget: nextCapture,
+              playbackTarget: nextPlayback,
+            },
+          });
         }
       },
       { signal: sig },
@@ -951,6 +1492,29 @@ export class DesktopAppController {
     root.addEventListener(
       "submit",
       (ev) => {
+        const initWsForm = (ev.target as HTMLElement | null)?.closest<HTMLFormElement>(
+          '[data-action="init-workspace-form"]',
+        );
+        if (initWsForm) {
+          ev.preventDefault();
+          const fd = new FormData(initWsForm);
+          const parentRoot = String(fd.get("parent_root") ?? "").trim();
+          const workspaceSlug = String(fd.get("workspace_slug") ?? "").trim();
+          const displayName = String(fd.get("display_name") ?? "").trim();
+          const rawProjects = String(fd.get("projects") ?? "");
+          const projects = rawProjects
+            .split(",")
+            .map((x) => x.trim())
+            .filter((x) => x.length > 0);
+          void this.initializeWorkspace({
+            parentRoot,
+            workspaceSlug,
+            displayName: displayName || undefined,
+            projects,
+          });
+          return;
+        }
+
         const settingsForm = (ev.target as HTMLElement | null)?.closest<HTMLFormElement>(
           '[data-action="settings-form"]',
         );
