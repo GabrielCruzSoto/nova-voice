@@ -11,6 +11,7 @@ import re
 import uuid
 import weakref
 from collections.abc import AsyncIterator
+from pathlib import Path
 from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -171,13 +172,30 @@ class NovaOrchestrator:
     def _log(self, event_name: str, **fields: str | bool) -> None:
         _log_structured(event_name, extra_secrets=self._extra_secrets(), **fields)
 
+    async def _switch_tier1_context(
+        self,
+        target_path: str,
+        *,
+        workspace_active: bool,
+        allowed_project_paths: tuple[str, ...],
+    ) -> None:
+        sig = inspect.signature(self._tier1_client.switch_workspace)
+        if "workspace_active" in sig.parameters:
+            await self._tier1_client.switch_workspace(  # type: ignore[call-arg]
+                target_path,
+                workspace_active=workspace_active,
+                allowed_project_paths=allowed_project_paths,
+            )
+        else:
+            await self._tier1_client.switch_workspace(target_path)
+
     async def select_workspace(
         self,
         query: str,
         mode: WorkspaceQueryMode = "voice_fuzzy",
         correlation_id: str | None = None,
     ) -> WorkspaceContext:
-        """Resolve, activate, and announce a target project directory."""
+        """Resolve, activate, and announce an isolated workspace directory."""
         corr_id = correlation_id or f"corr-{uuid.uuid4()}"
         async with self._turn_lock:
             context = await self._workspace_resolver.resolve(
@@ -187,7 +205,12 @@ class NovaOrchestrator:
                     mode=mode,
                 )
             )
-            await self._tier1_client.switch_workspace(context.canonical_path)
+            project_paths = tuple(p.canonical_path for p in context.projects)
+            await self._switch_tier1_context(
+                context.canonical_path,
+                workspace_active=True,
+                allowed_project_paths=project_paths,
+            )
             self._log(
                 "workspace_selected",
                 correlation_id=corr_id,
@@ -206,6 +229,30 @@ class NovaOrchestrator:
                 )
             )
             return context
+
+    async def clear_workspace(self, correlation_id: str | None = None) -> None:
+        """Clear active workspace and return Tier 1 to conversational ~ mode with zero tools."""
+        corr_id = correlation_id or f"corr-{uuid.uuid4()}"
+        async with self._turn_lock:
+            clear_fn = getattr(self._workspace_resolver, "clear_active_workspace", None)
+            if callable(clear_fn):
+                res = clear_fn(corr_id)
+                if inspect.isawaitable(res):
+                    await res
+            home_cwd = str(Path.home().resolve())
+            await self._switch_tier1_context(
+                home_cwd,
+                workspace_active=False,
+                allowed_project_paths=(),
+            )
+            self._log("workspace_cleared", correlation_id=corr_id)
+            await self._event_bus.publish(
+                VoiceMilestoneEvent(
+                    correlation_id=corr_id,
+                    summary_text="Modo conversacional activo sin workspace.",
+                    priority="normal",
+                )
+            )
 
     async def handle_user_utterance(
         self,

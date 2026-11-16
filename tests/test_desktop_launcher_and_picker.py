@@ -779,6 +779,39 @@ async def test_nova012_ac5_runtime_tests_never_touch_default_home_config(
     assert not default_resolved.is_relative_to(fake_home)
 
 
+async def test_nova013_ac1_initial_startup_uses_home_cwd_and_excludes_home_from_allowed_roots(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from nova.adapters.desktop_launcher import _default_allowed_roots, _resolve_initial_pi_cwd
+
+    fake_home = tmp_path / "fresh_home"
+    fake_home.mkdir()
+    monkeypatch.setattr(Path, "home", lambda: fake_home)
+    monkeypatch.chdir(fake_home)
+
+    roots = _default_allowed_roots()
+    assert len(roots) >= 1
+    assert str(fake_home.resolve()) not in roots
+
+    initial_cwd = _resolve_initial_pi_cwd(roots, None)
+    assert initial_cwd == str(fake_home.resolve())
+
+    cfg = NovaDesktopConfig(
+        port=0,
+        allowed_roots=roots,
+        initial_workspace=None,
+        open_browser=False,
+        enable_voice=False,
+        ipc_runtime_dir=str(tmp_path / "sock_ac1"),
+        config_path=str(tmp_path / "cfg_ac1" / "config.toml"),
+    )
+    async with NovaDesktopRuntime(cfg) as runtime:
+        assert runtime._pi_client is not None
+        assert runtime._pi_client._config.workspace_path == str(fake_home.resolve())
+        assert runtime._pi_client._config.workspace_active is False
+
+
 
 
 

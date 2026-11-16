@@ -170,13 +170,16 @@ async def _default_browser_spawner(*argv: str) -> BrowserProcessProtocol:
 
 
 def _default_allowed_roots() -> tuple[str, ...]:
+    home_real = Path.home().resolve()
     candidates: list[str] = []
-    proyectos = Path.home() / "Proyectos"
+    proyectos = home_real / "Proyectos"
     if proyectos.is_dir():
         candidates.append(str(proyectos.resolve()))
-    cwd = str(Path.cwd().resolve())
-    if cwd not in candidates:
-        candidates.append(cwd)
+    else:
+        candidates.append(str(proyectos))
+    cwd_real = Path.cwd().resolve()
+    if cwd_real != home_real and str(cwd_real) not in candidates:
+        candidates.append(str(cwd_real))
     return tuple(candidates)
 
 
@@ -460,9 +463,10 @@ def _resolve_initial_pi_cwd(
     allowed_roots: tuple[str, ...],
     active_workspace: WorkspaceContext | None,
 ) -> str:
+    del allowed_roots
     if active_workspace is not None:
         return active_workspace.canonical_path
-    return str(Path(allowed_roots[0]).resolve())
+    return str(Path.home().resolve())
 
 
 class NovaDesktopRuntime:
@@ -726,6 +730,13 @@ class NovaDesktopRuntime:
                     provider=self._config.pi_provider,
                     model=self._config.pi_model,
                     workspace_path=initial_pi_cwd,
+                    workspace_active=initial_ws is not None,
+                    allowed_project_paths=(
+                        tuple(p.canonical_path for p in initial_ws.projects)
+                        if initial_ws is not None
+                        else ()
+                    ),
+                    no_session=True,
                     gatekeeper_ipc_env=ipc_env,
                 )
             )
@@ -1315,7 +1326,10 @@ def config_from_namespace(
         ws_candidate = Path(persisted.general.last_active_workspace)
         if ws_candidate.is_dir():
             resolved_candidate = ws_candidate.resolve()
-            if any(resolved_candidate.is_relative_to(Path(root).resolve()) for root in roots):
+            home_resolved = effective_home.resolve()
+            if resolved_candidate != home_resolved and any(
+                resolved_candidate.is_relative_to(Path(root).resolve()) for root in roots
+            ):
                 initial_ws = str(resolved_candidate)
 
     enable_voice = False if ns.no_voice else bool(persisted.voice.enable_voice)

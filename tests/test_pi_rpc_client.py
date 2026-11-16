@@ -297,3 +297,79 @@ async def test_nova012_ac4_pi_rpc_passes_headless_isolation_flags_and_default_mo
     ext_idx = recorded.index("-e")
     assert recorded[ext_idx + 1].endswith("pi_gatekeeper.ts")
 
+
+async def test_nova013_ac3_ac5_unscoped_mode_injects_no_tools_and_switches_to_isolated_workspace(
+    tmp_path: Path,
+) -> None:
+    dump_file = tmp_path / "spawn_records.jsonl"
+    fake_pi = tmp_path / "fake_pi_unscoped.py"
+    argv = _write_fake_pi_script(
+        fake_pi,
+        f"""
+        import json, os, pathlib, sys
+        rec = {{
+            "cwd": os.getcwd(),
+            "argv": sys.argv[1:],
+            "ws_active": os.environ.get("NOVA_WORKSPACE_ACTIVE"),
+            "allowed_projects": os.environ.get("NOVA_ALLOWED_PROJECT_PATHS"),
+        }}
+        with pathlib.Path({str(dump_file)!r}).open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(rec) + "\\n")
+        while raw := sys.stdin.buffer.readline():
+            req = json.loads(raw.decode("utf-8"))
+            ack = {{
+                "id": req.get("id"),
+                "type": "response",
+                "command": req.get("type", ""),
+                "success": True,
+                "data": {{"disposition": "started"}},
+            }}
+            sys.stdout.buffer.write((json.dumps(ack) + "\\n").encode("utf-8"))
+            if req.get("type") == "prompt":
+                ev = {{
+                    "type": "message_update",
+                    "assistantMessageEvent": {{"type": "text_delta", "delta": "ok"}},
+                }}
+                sys.stdout.buffer.write((json.dumps(ev) + "\\n").encode("utf-8"))
+                settled = json.dumps({{"type": "agent_settled"}}) + "\\n"
+                sys.stdout.buffer.write(settled.encode("utf-8"))
+            sys.stdout.buffer.flush()
+        """,
+    )
+    home_sim = tmp_path / "home_sim"
+    home_sim.mkdir()
+    ws_dir = tmp_path / "ws_alfa"
+    proj_a = ws_dir / "repositories" / "api"
+    proj_a.mkdir(parents=True)
+
+    cfg = PiRpcConfig(
+        executable=argv[0],
+        extra_leading_args=tuple(argv[1:]),
+        workspace_path=str(home_sim),
+        workspace_active=False,
+        gatekeeper_ipc_env={"NOVA_GATEKEEPER_SOCKET": str(tmp_path / "gk.sock")},
+    )
+    async with PiRpcClient(cfg) as client:
+        _ = [c async for c in client.stream_prompt("Hola")]
+        await client.switch_workspace(
+            str(ws_dir),
+            workspace_active=True,
+            allowed_project_paths=(str(proj_a.resolve()),),
+        )
+        _ = [c async for c in client.stream_prompt("Analiza api")]
+
+    import json as _json
+
+    spawns = [_json.loads(line) for line in dump_file.read_text(encoding="utf-8").splitlines()]
+    assert len(spawns) == 2
+    assert spawns[0]["cwd"] == str(home_sim.resolve())
+    assert "--no-tools" in spawns[0]["argv"]
+    assert "--no-session" in spawns[0]["argv"]
+    assert spawns[0]["ws_active"] == "0"
+
+    assert spawns[1]["cwd"] == str(ws_dir.resolve())
+    assert "--no-tools" not in spawns[1]["argv"]
+    assert "--no-session" in spawns[1]["argv"]
+    assert spawns[1]["ws_active"] == "1"
+    assert _json.loads(spawns[1]["allowed_projects"]) == [str(proj_a.resolve())]
+

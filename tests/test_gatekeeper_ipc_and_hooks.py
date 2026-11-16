@@ -850,3 +850,99 @@ print(json.dumps({{
             )
         ]
     assert ttl_exc.value.code == "GATEKEEPER_PLUGIN_MISSING"
+
+
+@pytest.mark.asyncio
+async def test_nova013_ac3_ac5_pi_gatekeeper_blocks_unscoped_home_and_confines_declared_projects(
+    tmp_path: Path,
+) -> None:
+    node_bin = shutil.which("node")
+    assert node_bin is not None
+
+    fake_home = tmp_path / "fake_home"
+    fake_home.mkdir()
+    ws_dir = tmp_path / "ws_cliente_a"
+    proj_dir = ws_dir / "repositories" / "api_pagos"
+    proj_dir.mkdir(parents=True)
+    outside_sub = ws_dir / "notes"
+    outside_sub.mkdir(parents=True)
+
+    probe_mjs = tmp_path / "probe_nova013_ext.mjs"
+    probe_mjs.write_text(
+        f"""
+import extFactory from {json.dumps(PI_GATEKEEPER_EXTENSION_PATH.as_uri())};
+let handler = null;
+extFactory({{ on(ev, fn) {{ if (ev === "tool_call") handler = fn; }} }});
+const toolName = process.env.TEST_TOOL_NAME;
+const input = JSON.parse(process.env.TEST_TOOL_INPUT);
+const cwd = process.env.TEST_CWD;
+const res = await handler({{ toolName, input }}, {{ cwd }});
+console.log(JSON.stringify(res ?? {{ allowed: true }}));
+""",
+        encoding="utf-8",
+    )
+
+    async def _run_ext(
+        tool_name: str,
+        tool_input: dict[str, str],
+        cwd: Path,
+        extra_env: dict[str, str],
+    ) -> dict[str, object]:
+        proc = await asyncio.create_subprocess_exec(
+            node_bin,
+            str(probe_mjs),
+            cwd=str(tmp_path),
+            env={
+                **os.environ,
+                "HOME": str(fake_home),
+                "NOVA_GATEKEEPER_SOCKET": str(tmp_path / "unused.sock"),
+                "NOVA_GATEKEEPER_TOKEN": "tok",
+                "TEST_TOOL_NAME": tool_name,
+                "TEST_TOOL_INPUT": json.dumps(tool_input),
+                "TEST_CWD": str(cwd),
+                **extra_env,
+            },
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+        )
+        out, err = await proc.communicate()
+        assert proc.returncode == 0, err.decode("utf-8", errors="replace")
+        return dict(json.loads(out.decode("utf-8")))
+
+    # 1. NOVA_WORKSPACE_ACTIVE=0 blocks read, ls, write, bash immediately
+    for t_name, t_in in (
+        ("read", {"path": "README.md"}),
+        ("ls", {}),
+        ("write", {"path": "x.txt"}),
+        ("bash", {"command": "pwd"}),
+    ):
+        res_unscoped = await _run_ext(t_name, t_in, ws_dir, {"NOVA_WORKSPACE_ACTIVE": "0"})
+        assert res_unscoped.get("block") is True
+        assert "GATEKEEPER_NO_ACTIVE_WORKSPACE" in str(res_unscoped.get("reason", ""))
+
+    # 2. Even if NOVA_WORKSPACE_ACTIVE is omitted, cwd == HOME is unconditionally blocked
+    res_home = await _run_ext("read", {"path": ".bashrc"}, fake_home, {})
+    assert res_home.get("block") is True
+    assert "GATEKEEPER_NO_ACTIVE_WORKSPACE" in str(res_home.get("reason", ""))
+
+    # 3. With active workspace + NOVA_ALLOWED_PROJECT_PATHS, writes outside declared projects block
+    env_active = {
+        "NOVA_WORKSPACE_ACTIVE": "1",
+        "NOVA_ALLOWED_PROJECT_PATHS": json.dumps([str(proj_dir.resolve())]),
+    }
+    res_ok_write = await _run_ext(
+        "write",
+        {"path": "repositories/api_pagos/app.py"},
+        ws_dir,
+        env_active,
+    )
+    assert res_ok_write.get("allowed") is True
+
+    res_bad_write = await _run_ext(
+        "write",
+        {"path": "notes/leak.txt"},
+        ws_dir,
+        env_active,
+    )
+    assert res_bad_write.get("block") is True
+    assert "GATEKEEPER_OUTSIDE_DECLARED_PROJECT" in str(res_bad_write.get("reason", ""))
