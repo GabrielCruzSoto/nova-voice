@@ -1063,6 +1063,8 @@ class DesktopUiServer:
                     await res
             elif self._workspace_resolver is not None:
                 await self._workspace_resolver.clear_active_workspace(corr_id)
+            if self._settings_service is not None:
+                await self._settings_service.clear_active_workspace()
             await self._write_json(
                 writer,
                 200,
@@ -1196,7 +1198,6 @@ class DesktopUiServer:
             not isinstance(raw_parent, str)
             or not raw_parent.strip()
             or not isinstance(raw_slug, str)
-            or not raw_slug.strip()
             or (raw_display is not None and not isinstance(raw_display, str))
             or not isinstance(raw_projects, list)
             or not all(isinstance(x, str) for x in raw_projects)
@@ -1217,7 +1218,7 @@ class DesktopUiServer:
                 parent_root=raw_parent.strip(),
                 workspace_slug=raw_slug.strip(),
                 display_name=raw_display.strip() if isinstance(raw_display, str) else None,
-                projects=tuple(x.strip() for x in raw_projects if x.strip()),
+                projects=tuple(x.strip() for x in raw_projects),
                 activate=raw_activate,
             )
             ctx = await self._workspace_resolver.initialize_workspace(init_req)

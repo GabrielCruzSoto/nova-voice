@@ -2519,5 +2519,304 @@ test("NOVA-013 AC-1..AC-9: First-run onboarding modal, 4 live diagnostics in onb
   ctrl.dispose();
 });
 
+test("NOVA-013 F1 regression: selected audio/model values in Onboarding and Settings survive live diagnostic renders and persist", async () => {
+  const listeners = new Map();
+  function makeDom() {
+    function createNode(tagName, attrs = {}) {
+      const node = {
+        tagName: tagName.toUpperCase(),
+        attributes: { ...attrs },
+        dataset: {},
+        children: [],
+        parentNode: null,
+        name: attrs.name ?? "",
+        value: attrs.value ?? "",
+        checked: "checked" in attrs,
+        disabled: "disabled" in attrs,
+        _innerHTML: "",
+        getAttribute(k) {
+          return this.attributes[k] ?? null;
+        },
+        closest(sel) {
+          let cur = this;
+          while (cur) {
+            if (matches(cur, sel)) return cur;
+            cur = cur.parentNode;
+          }
+          return null;
+        },
+        querySelector(sel) {
+          return query(this, sel);
+        },
+      };
+      for (const [k, v] of Object.entries(attrs)) {
+        if (k.startsWith("data-")) {
+          const camel = k.slice(5).replace(/-([a-z])/g, (_, c) => c.toUpperCase());
+          node.dataset[camel] = v;
+        }
+      }
+      return node;
+    }
+    function matches(el, sel) {
+      if (sel.startsWith("[") && sel.endsWith("]")) {
+        const inner = sel.slice(1, -1);
+        const eq = inner.indexOf("=");
+        if (eq === -1) return inner in el.attributes;
+        const k = inner.slice(0, eq);
+        const v = inner.slice(eq + 1).replace(/^["']|["']$/g, "");
+        return el.attributes[k] === v;
+      }
+      if (sel.startsWith(".")) {
+        return (el.attributes.class ?? "").split(/\s+/).includes(sel.slice(1));
+      }
+      if (sel.startsWith("#")) {
+        return el.attributes.id === sel.slice(1);
+      }
+      return el.tagName.toLowerCase() === sel.toLowerCase();
+    }
+    function query(node, sel) {
+      for (const c of node.children) {
+        if (matches(c, sel)) return c;
+        const found = query(c, sel);
+        if (found) return found;
+      }
+      return null;
+    }
+    function parse(html) {
+      const rootNode = createNode("div");
+      const stack = [rootNode];
+      const tagRe = /<(\/?[a-zA-Z0-9-]+)([^>]*)>/g;
+      let m;
+      while ((m = tagRe.exec(html)) !== null) {
+        const tag = m[1];
+        const attrStr = m[2];
+        if (tag.startsWith("/")) {
+          const closeName = tag.slice(1).toUpperCase();
+          if (stack.length > 1 && stack[stack.length - 1].tagName === closeName) {
+            const closed = stack.pop();
+            if (closed.tagName === "SELECT") {
+              const selectedOpt = closed.children.find((c) => "selected" in c.attributes);
+              closed.value = selectedOpt
+                ? (selectedOpt.attributes.value ?? "")
+                : (closed.children[0]?.attributes.value ?? "");
+            }
+          }
+        } else {
+          const attrs = {};
+          const attrRe = /([a-zA-Z0-9-]+)(?:=(?:"([^"]*)"|'([^']*)'|([^\s>]+)))?/g;
+          let am;
+          while ((am = attrRe.exec(attrStr)) !== null) {
+            attrs[am[1]] = am[2] ?? am[3] ?? am[4] ?? "";
+          }
+          const el = createNode(tag, attrs);
+          el.parentNode = stack[stack.length - 1];
+          stack[stack.length - 1].children.push(el);
+          const voidTags = ["input", "img", "br", "hr", "meta", "line", "path", "circle", "rect", "polygon"];
+          if (!attrStr.trim().endsWith("/") && !voidTags.includes(tag.toLowerCase())) {
+            stack.push(el);
+          }
+        }
+      }
+      function wire(n) {
+        Object.defineProperty(n, "innerHTML", {
+          get() {
+            return this._innerHTML;
+          },
+          set(val) {
+            this._innerHTML = val;
+            const p = parse(val);
+            for (const c of p.children) c.parentNode = this;
+            this.children = p.children;
+          },
+          configurable: true,
+        });
+        for (const c of n.children) wire(c);
+        return n;
+      }
+      return wire(rootNode);
+    }
+    const root = parse("");
+    root.addEventListener = (type, fn) => {
+      if (!listeners.has(type)) listeners.set(type, []);
+      listeners.get(type).push(fn);
+    };
+    root.dispatch = (type, target) => {
+      for (const fn of listeners.get(type) ?? []) {
+        fn({ target, preventDefault() {} });
+      }
+    };
+    return root;
+  }
+
+  const rootDom = makeDom();
+  const requests = [];
+  const baseSettings = {
+    schema_version: 1,
+    audio: { capture_target: null, playback_target: null },
+    voice: {
+      wakeword_threshold: 0.5,
+      speech_threshold: 0.015,
+      barge_in_threshold: 0.025,
+      sensitivity_preset: "normal",
+      tts_engine: "kokoro",
+      tts_speed: 1.0,
+      kokoro_voice: "ef_dora",
+      whisper_language: "es",
+    },
+    shortcuts: { global_shortcut: "Super+Shift+Space", ptt_mode: "single_turn" },
+    models: { pi_provider: "github-copilot", pi_model: "gpt-4.1", tier2_model: "claude-opus-5-5-high" },
+    general: { remember_workspace: true, last_active_workspace: null, first_run_completed: false },
+  };
+
+  const fakeFetch = async (url, init) => {
+    const method = init?.method ?? "GET";
+    const body = typeof init?.body === "string" ? init.body : "";
+    requests.push({ url, method, body });
+    if (url === "/api/state") {
+      return new Response(
+        JSON.stringify({
+          schema_version: "1.3.0",
+          csrf_token: "csrf-f1",
+          voice_enabled: true,
+          onboarding_required: true,
+          process_cwd: "/home/operador",
+          allowed_roots: ["/home/operador/Proyectos"],
+          call_session: { call_id: "c-f1", state: "standby", turn_count: 0, active_correlation_id: null },
+          active_workspace: null,
+          available_workspaces: [],
+          pending_approvals: [],
+          messages: [],
+        }),
+        { status: 200 },
+      );
+    }
+    if (url === "/api/events") {
+      return new Response(new ReadableStream({ start() {} }), {
+        status: 200,
+        headers: { "Content-Type": "text/event-stream" },
+      });
+    }
+    if (url === "/api/settings" && method === "GET") {
+      return new Response(JSON.stringify({ settings: baseSettings }), { status: 200 });
+    }
+    if (url === "/api/audio/devices") {
+      return new Response(
+        JSON.stringify({
+          available: true,
+          backend: "pipewire",
+          inputs: [{ id: "usb-mic-pro", description: "USB Mic Pro", is_default: false }],
+          outputs: [{ id: "usb-dac-out", description: "USB DAC Out", is_default: false }],
+        }),
+        { status: 200 },
+      );
+    }
+    if (url === "/api/diagnostics/microphone") {
+      const parsed = JSON.parse(body);
+      return new Response(
+        JSON.stringify({
+          ok: true,
+          status: "ok",
+          capture_target: parsed.capture_target,
+          duration_ms: 500,
+          peak_level: 0.4,
+          rms_level: 0.1,
+          speech_detected: true,
+          transcript_preview: "hola",
+          message: "OK mic",
+        }),
+        { status: 200 },
+      );
+    }
+    if (url === "/api/diagnostics/audio-output") {
+      return new Response(
+        JSON.stringify({ ok: true, status: "ok", engine: "kokoro", latency_ms: 40, message: "OK out" }),
+        { status: 200 },
+      );
+    }
+    if (url === "/api/diagnostics/pi") {
+      const parsed = JSON.parse(body);
+      return new Response(
+        JSON.stringify({
+          ok: true,
+          status: "connected",
+          provider: parsed.provider,
+          model: parsed.model,
+          latency_ms: 100,
+          message: "OK pi",
+        }),
+        { status: 200 },
+      );
+    }
+    if (url === "/api/settings" && method === "PUT") {
+      const patch = JSON.parse(body);
+      return new Response(
+        JSON.stringify({
+          applied_hot: ["audio.capture_target", "audio.playback_target"],
+          requires_restart: false,
+          restart_fields: [],
+          settings: {
+            ...baseSettings,
+            audio: {
+              capture_target: patch.audio?.capture_target || null,
+              playback_target: patch.audio?.playback_target || null,
+            },
+            general: { ...baseSettings.general, first_run_completed: true },
+          },
+        }),
+        { status: 200 },
+      );
+    }
+    return new Response("{}", { status: 404 });
+  };
+
+  const ctrl = new DesktopAppController({ rootElement: rootDom, fetchImpl: fakeFetch });
+  await ctrl.start();
+  await new Promise((r) => setTimeout(r, 30));
+
+  const capSelect = rootDom.querySelector('[name="onboarding.capture_target"]');
+  const playSelect = rootDom.querySelector('[name="onboarding.playback_target"]');
+  assert.ok(capSelect && playSelect);
+  capSelect.value = "usb-mic-pro";
+  rootDom.dispatch("change", capSelect);
+  playSelect.value = "usb-dac-out";
+  rootDom.dispatch("change", playSelect);
+
+  await ctrl.runDiagnostic("microphone");
+  await ctrl.runDiagnostic("audio-output");
+
+  const micReq = requests.find((r) => r.url === "/api/diagnostics/microphone");
+  const outReq = requests.find((r) => r.url === "/api/diagnostics/audio-output");
+  assert.equal(JSON.parse(micReq.body).capture_target, "usb-mic-pro");
+  assert.equal(JSON.parse(outReq.body).playback_target, "usb-dac-out");
+
+  // Selected values remain intact in DOM after diagnostic re-renders
+  assert.equal(rootDom.querySelector('[name="onboarding.capture_target"]').value, "usb-mic-pro");
+  assert.equal(rootDom.querySelector('[name="onboarding.playback_target"]').value, "usb-dac-out");
+
+  // Clicking complete-onboarding persists the selected devices
+  const finishBtn = rootDom.querySelector('[data-action="complete-onboarding"]');
+  rootDom.dispatch("click", finishBtn);
+  await new Promise((r) => setTimeout(r, 25));
+
+  const putReq = requests.find((r) => r.url === "/api/settings" && r.method === "PUT");
+  assert.ok(putReq);
+  const putBody = JSON.parse(putReq.body);
+  assert.equal(putBody.audio.capture_target, "usb-mic-pro");
+  assert.equal(putBody.audio.playback_target, "usb-dac-out");
+
+  // Settings drawer: unsaved model edit is used by Pi probe and preserved across render
+  await ctrl.openSettingsDrawer();
+  const piModelInput = rootDom.querySelector('[name="models.pi_model"]');
+  assert.ok(piModelInput);
+  piModelInput.value = "gpt-4.1-mini";
+  await ctrl.runDiagnostic("pi");
+
+  const piReq = requests.find((r) => r.url === "/api/diagnostics/pi");
+  assert.equal(JSON.parse(piReq.body).model, "gpt-4.1-mini");
+  assert.equal(rootDom.querySelector('[name="models.pi_model"]').value, "gpt-4.1-mini");
+
+  ctrl.dispose();
+});
+
 
 

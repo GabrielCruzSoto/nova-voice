@@ -946,3 +946,14 @@ console.log(JSON.stringify(res ?? {{ allowed: true }}));
     )
     assert res_bad_write.get("block") is True
     assert "GATEKEEPER_OUTSIDE_DECLARED_PROJECT" in str(res_bad_write.get("reason", ""))
+
+    # 4. Malformed or unresolvable non-empty NOVA_ALLOWED_PROJECT_PATHS fails closed
+    for broken_raw in ("{malformed-json", json.dumps([str(ws_dir / "missing_repo")])):
+        res_corrupt = await _run_ext(
+            "write",
+            {"path": "notes/leak.txt"},
+            ws_dir,
+            {"NOVA_WORKSPACE_ACTIVE": "1", "NOVA_ALLOWED_PROJECT_PATHS": broken_raw},
+        )
+        assert res_corrupt.get("block") is True
+        assert "GATEKEEPER_OUTSIDE_DECLARED_PROJECT" in str(res_corrupt.get("reason", ""))

@@ -155,6 +155,27 @@ class LiveDiagnosticsService:
         self._extra_secrets_provider = extra_secrets_provider
         self._audio_lock = asyncio.Lock()
 
+    def update_config(
+        self,
+        *,
+        pi_provider: str | None = None,
+        pi_model: str | None = None,
+        tier2_model: str | None = None,
+        tts_engine_label: str | None = None,
+    ) -> None:
+        """Hot-update default model and TTS labels used when probes omit explicit overrides."""
+        updates: dict[str, object] = {}
+        if pi_provider is not None:
+            updates["pi_provider"] = pi_provider
+        if pi_model is not None:
+            updates["pi_model"] = pi_model
+        if tier2_model is not None:
+            updates["tier2_model"] = tier2_model
+        if tts_engine_label is not None:
+            updates["tts_engine_label"] = tts_engine_label
+        if updates:
+            self._config = self._config.model_copy(update=updates)
+
     def _redact(self, text: str) -> str:
         secrets = (
             self._extra_secrets_provider() if self._extra_secrets_provider is not None else ()
@@ -225,7 +246,8 @@ class LiveDiagnosticsService:
                         if len(pcm_buffer) >= target_bytes:
                             break
 
-                await asyncio.wait_for(_collect(), timeout=duration_seconds + 1.5)
+                capture_budget = min(duration_seconds + 0.8, 3.8)
+                await asyncio.wait_for(_collect(), timeout=capture_budget)
             except TimeoutError:
                 pass
             except (VoicePipelineError, OSError) as exc:
@@ -264,11 +286,17 @@ class LiveDiagnosticsService:
 
         speech_detected = peak >= 0.02
         preview = ""
-        if speech_detected and self._stt_port is not None and len(pcm_buffer) >= 2:
+        remaining_stt = 4.0 - (time.monotonic() - started)
+        if (
+            speech_detected
+            and self._stt_port is not None
+            and len(pcm_buffer) >= 2
+            and remaining_stt > 0.15
+        ):
             with contextlib.suppress(Exception):
                 tx = await asyncio.wait_for(
                     self._stt_port.transcribe(bytes(pcm_buffer), sample_rate_hz=16000),
-                    timeout=3.0,
+                    timeout=min(2.0, remaining_stt),
                 )
                 preview = self._redact(tx.text.strip())[:160]
 
@@ -311,7 +339,7 @@ class LiveDiagnosticsService:
             with contextlib.suppress(Exception):
                 synthesized = await asyncio.wait_for(
                     self._tts_port.synthesize("Hola, soy Nova. Prueba de audio exitosa."),
-                    timeout=3.0,
+                    timeout=2.0,
                 )
         if synthesized is None:
             engine_used = "tone_fallback"
@@ -323,7 +351,8 @@ class LiveDiagnosticsService:
         async with self._audio_lock:
             audio_out = self._audio_output_factory(safe_target)
             try:
-                await asyncio.wait_for(audio_out.play_pcm(synthesized), timeout=5.0)
+                play_budget = max(0.5, 5.0 - (time.monotonic() - started))
+                await asyncio.wait_for(audio_out.play_pcm(synthesized), timeout=play_budget)
             except (TimeoutError, VoicePipelineError, OSError) as exc:
                 elapsed_err = round((time.monotonic() - started) * 1000.0, 1)
                 return AudioOutputDiagnosticResult(
@@ -378,12 +407,15 @@ class LiveDiagnosticsService:
         started = time.monotonic()
         with tempfile.TemporaryDirectory(prefix="nova-pi-probe-") as probe_dir:
             try:
-                await self._pi_probe_runner(
-                    resolved_bin,
-                    self._config.pi_extra_args,
-                    eff_provider,
-                    eff_model,
-                    probe_dir,
+                await asyncio.wait_for(
+                    self._pi_probe_runner(
+                        resolved_bin,
+                        self._config.pi_extra_args,
+                        eff_provider,
+                        eff_model,
+                        probe_dir,
+                    ),
+                    timeout=10.0,
                 )
                 elapsed_ms = round((time.monotonic() - started) * 1000.0, 1)
                 return PiConnectionDiagnosticResult(
@@ -439,12 +471,15 @@ class LiveDiagnosticsService:
         started = time.monotonic()
         with tempfile.TemporaryDirectory(prefix="nova-agy-probe-") as probe_dir:
             try:
-                await self._agy_probe_runner(
-                    resolved_bin,
-                    self._config.agy_extra_args,
-                    eff_model,
-                    probe_dir,
-                    self._config.gatekeeper_ipc_env,
+                await asyncio.wait_for(
+                    self._agy_probe_runner(
+                        resolved_bin,
+                        self._config.agy_extra_args,
+                        eff_model,
+                        probe_dir,
+                        self._config.gatekeeper_ipc_env,
+                    ),
+                    timeout=15.0,
                 )
                 elapsed_ms = round((time.monotonic() - started) * 1000.0, 1)
                 return AntigravityDiagnosticResult(
@@ -455,14 +490,19 @@ class LiveDiagnosticsService:
                     latency_ms=elapsed_ms,
                     message="Conexión verificada entre Nova y Antigravity.",
                 )
-            except CodingRunnerError as exc:
+            except (CodingRunnerError, NovaDomainError, TimeoutError, OSError) as exc:
                 elapsed_ms = round((time.monotonic() - started) * 1000.0, 1)
-                raw_err = exc.sanitized_message
+                err_code = exc.code if isinstance(exc, NovaDomainError) else ""
+                raw_err = (
+                    exc.sanitized_message if isinstance(exc, NovaDomainError) else str(exc)
+                )
                 low_err = raw_err.lower()
-                plugin_ok = exc.code != "GATEKEEPER_PLUGIN_MISSING"
-                if exc.code == "GATEKEEPER_PLUGIN_MISSING":
+                plugin_ok = isinstance(exc, CodingRunnerError) and (
+                    err_code != "GATEKEEPER_PLUGIN_MISSING"
+                )
+                if err_code == "GATEKEEPER_PLUGIN_MISSING":
                     status: AntigravityDiagnosticStatus = "plugin_missing"
-                elif "timed out" in low_err:
+                elif "timed out" in low_err or isinstance(exc, TimeoutError):
                     status = "timeout"
                 elif any(hint in low_err for hint in _AUTH_ERROR_HINTS):
                     status = "auth_error"

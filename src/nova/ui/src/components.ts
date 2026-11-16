@@ -935,8 +935,14 @@ export function renderOnboardingModal(model: PresentationalAppModel): string {
   }
   const inputs = model.audioDevices?.inputs ?? [];
   const outputs = model.audioDevices?.outputs ?? [];
-  const capTarget = model.settingsData?.audio.capture_target ?? null;
-  const playTarget = model.settingsData?.audio.playback_target ?? null;
+  const capTarget =
+    model.onboardingDraftAudio !== undefined
+      ? model.onboardingDraftAudio.captureTarget || null
+      : (model.settingsData?.audio.capture_target ?? null);
+  const playTarget =
+    model.onboardingDraftAudio !== undefined
+      ? model.onboardingDraftAudio.playbackTarget || null
+      : (model.settingsData?.audio.playback_target ?? null);
   const savingAttr = model.onboardingSaving ? " disabled" : "";
 
   return `
@@ -951,7 +957,7 @@ export function renderOnboardingModal(model: PresentationalAppModel): string {
           <h2 class="nova-settings-title">Configuración inicial y diagnóstico</h2>
         </div>
         <p class="nova-onboarding-desc">
-          Verificá que tu micrófono, parlantes y conexiones con Pi y Antigravity respondan antes de comenzar. Al finalizar, Nova iniciará en modo conversacional sin workspace activo.
+          Verifica que el micrófono, la salida de audio y las conexiones con Pi y Antigravity respondan antes de comenzar. Al finalizar, Nova iniciará en modo conversacional sin workspace activo.
         </p>
         <div class="nova-settings-section">
           <h3 class="nova-settings-section-title">Dispositivos de audio</h3>

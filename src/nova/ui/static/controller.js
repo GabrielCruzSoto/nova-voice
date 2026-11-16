@@ -5,12 +5,56 @@
  */
 import { escapeHtml, renderAppShell, renderApprovalBanner, renderChatTimeline, renderDock, renderNoticeSlot, renderOnboardingModal, renderSettingsDrawer, renderWorkspaceBar, resolveHumanNotice, } from "./components.js";
 const MAX_CLIENT_MESSAGES = 200;
+const SETTINGS_DRAFT_FIELDS = [
+    "audio.capture_target",
+    "audio.playback_target",
+    "voice.sensitivity_preset",
+    "voice.tts_speed",
+    "voice.tts_engine",
+    "voice.whisper_language",
+    "shortcuts.ptt_mode",
+    "shortcuts.global_shortcut",
+    "models.pi_provider",
+    "models.pi_model",
+    "models.tier2_model",
+    "general.remember_workspace",
+];
+const ONBOARDING_DRAFT_FIELDS = [
+    "onboarding.capture_target",
+    "onboarding.playback_target",
+];
+function snapshotFormFields(container, fieldNames) {
+    const out = new Map();
+    for (const name of fieldNames) {
+        const el = container.querySelector(`[name="${name}"]`);
+        if (el) {
+            out.set(name, {
+                value: el.value,
+                checked: "checked" in el ? Boolean(el.checked) : false,
+            });
+        }
+    }
+    return out;
+}
+function restoreFormFields(container, snapshot) {
+    for (const [name, draft] of snapshot.entries()) {
+        const el = container.querySelector(`[name="${name}"]`);
+        if (!el) {
+            continue;
+        }
+        el.value = draft.value;
+        if ("checked" in el) {
+            el.checked = draft.checked;
+        }
+    }
+}
 export class DesktopAppController {
     #csrfToken = "";
     #abortController = new AbortController();
     #disposed = false;
     #shellMounted = false;
     #pttHolding = false;
+    #lastRenderedSettingsRef = undefined;
     #sleepTimer = null;
     #fetch;
     #root;
@@ -315,10 +359,59 @@ export class DesktopAppController {
             antigravity: null,
         });
     }
+    #readActiveProbeParams() {
+        const s = this.#model.settingsData;
+        const root = this.#root;
+        let captureTarget = s?.audio.capture_target ?? null;
+        let playbackTarget = s?.audio.playback_target ?? null;
+        let piProvider = s?.models.pi_provider ?? null;
+        let piModel = s?.models.pi_model ?? null;
+        let tier2Model = s?.models.tier2_model ?? null;
+        if (this.#model.onboardingOpen) {
+            const capDom = root?.querySelector('[name="onboarding.capture_target"]');
+            const playDom = root?.querySelector('[name="onboarding.playback_target"]');
+            const capVal = capDom !== null && capDom !== undefined
+                ? capDom.value
+                : this.#model.onboardingDraftAudio?.captureTarget;
+            const playVal = playDom !== null && playDom !== undefined
+                ? playDom.value
+                : this.#model.onboardingDraftAudio?.playbackTarget;
+            if (capVal !== undefined) {
+                captureTarget = capVal.trim() || null;
+            }
+            if (playVal !== undefined) {
+                playbackTarget = playVal.trim() || null;
+            }
+        }
+        else if (this.#model.settingsDrawerOpen && root) {
+            const capDom = root.querySelector('[name="audio.capture_target"]');
+            const playDom = root.querySelector('[name="audio.playback_target"]');
+            const provDom = root.querySelector('[name="models.pi_provider"]');
+            const modDom = root.querySelector('[name="models.pi_model"]');
+            const t2Dom = root.querySelector('[name="models.tier2_model"]');
+            if (capDom) {
+                captureTarget = capDom.value.trim() || null;
+            }
+            if (playDom) {
+                playbackTarget = playDom.value.trim() || null;
+            }
+            if (provDom) {
+                piProvider = provDom.value.trim() || piProvider;
+            }
+            if (modDom) {
+                piModel = modDom.value.trim() || piModel;
+            }
+            if (t2Dom) {
+                tier2Model = t2Dom.value.trim() || tier2Model;
+            }
+        }
+        return { captureTarget, playbackTarget, piProvider, piModel, tier2Model };
+    }
     async runDiagnostic(target, options) {
         if (this.#disposed) {
             return;
         }
+        const probeParams = this.#readActiveProbeParams();
         const baseDiag = this.#currentDiagState();
         this.#updateModel({
             diagnostics: {
@@ -326,11 +419,10 @@ export class DesktopAppController {
                 runningTarget: options?.keepRunningAll ? "all" : target,
             },
         });
-        const s = this.#model.settingsData;
         try {
             if (target === "microphone") {
                 const resp = await this.#postJson("/api/diagnostics/microphone", {
-                    capture_target: s?.audio.capture_target ?? null,
+                    capture_target: probeParams.captureTarget,
                     duration_seconds: 2.0,
                 });
                 if (resp.ok) {
@@ -347,7 +439,7 @@ export class DesktopAppController {
             }
             else if (target === "audio-output") {
                 const resp = await this.#postJson("/api/diagnostics/audio-output", {
-                    playback_target: s?.audio.playback_target ?? null,
+                    playback_target: probeParams.playbackTarget,
                 });
                 if (resp.ok) {
                     const payload = (await resp.json());
@@ -363,8 +455,8 @@ export class DesktopAppController {
             }
             else if (target === "pi") {
                 const resp = await this.#postJson("/api/diagnostics/pi", {
-                    provider: s?.models.pi_provider ?? null,
-                    model: s?.models.pi_model ?? null,
+                    provider: probeParams.piProvider,
+                    model: probeParams.piModel,
                 });
                 if (resp.ok) {
                     const payload = (await resp.json());
@@ -380,7 +472,7 @@ export class DesktopAppController {
             }
             else if (target === "antigravity") {
                 const resp = await this.#postJson("/api/diagnostics/antigravity", {
-                    model: s?.models.tier2_model ?? null,
+                    model: probeParams.tier2Model,
                 });
                 if (resp.ok) {
                     const payload = (await resp.json());
@@ -436,14 +528,22 @@ export class DesktopAppController {
         if (this.#disposed) {
             return;
         }
+        const draft = this.#model.onboardingDraftAudio;
+        const effectiveAudio = audioOverride ??
+            (draft !== undefined
+                ? {
+                    captureTarget: draft.captureTarget,
+                    playbackTarget: draft.playbackTarget,
+                }
+                : undefined);
         this.#updateModel({ onboardingSaving: true });
         const patch = {
             general: { first_run_completed: true },
         };
-        if (audioOverride) {
+        if (effectiveAudio) {
             patch["audio"] = {
-                capture_target: audioOverride.captureTarget ?? "",
-                playback_target: audioOverride.playbackTarget ?? "",
+                capture_target: effectiveAudio.captureTarget ?? "",
+                playback_target: effectiveAudio.playbackTarget ?? "",
             };
         }
         const resp = await this.#sendJson("PUT", "/api/settings", patch);
@@ -459,6 +559,7 @@ export class DesktopAppController {
         this.#updateModel({
             onboardingSaving: false,
             onboardingOpen: false,
+            onboardingDraftAudio: undefined,
             settingsData: payload.settings,
             lastMilestone: "Configuración inicial completada.",
         });
@@ -1037,11 +1138,27 @@ export class DesktopAppController {
         }
         const settingsSlot = this.#root.querySelector('[data-slot="settings-drawer"]');
         if (settingsSlot) {
+            const preserveSettingsDraft = Boolean(this.#model.settingsDrawerOpen) &&
+                !this.#model.settingsLoading &&
+                this.#lastRenderedSettingsRef === this.#model.settingsData;
+            const settingsDraft = preserveSettingsDraft
+                ? snapshotFormFields(settingsSlot, SETTINGS_DRAFT_FIELDS)
+                : null;
             settingsSlot.innerHTML = renderSettingsDrawer(this.#model);
+            this.#lastRenderedSettingsRef = this.#model.settingsData;
+            if (settingsDraft && settingsDraft.size > 0) {
+                restoreFormFields(settingsSlot, settingsDraft);
+            }
         }
         const onboardingSlot = this.#root.querySelector('[data-slot="onboarding-container"]');
         if (onboardingSlot) {
+            const onboardingDraft = this.#model.onboardingOpen && this.#model.onboardingDraftAudio === undefined
+                ? snapshotFormFields(onboardingSlot, ONBOARDING_DRAFT_FIELDS)
+                : null;
             onboardingSlot.innerHTML = renderOnboardingModal(this.#model);
+            if (onboardingDraft && onboardingDraft.size > 0) {
+                restoreFormFields(onboardingSlot, onboardingDraft);
+            }
         }
     }
     #bindDomEvents() {
@@ -1098,7 +1215,7 @@ export class DesktopAppController {
                 this.closeSettingsDrawer();
             }
             else if (action === "register-shortcut") {
-                const shortcutInput = root.querySelector('input[name="shortcuts.global_shortcut"]');
+                const shortcutInput = root.querySelector('[name="shortcuts.global_shortcut"]');
                 const shortcut = shortcutInput?.value.trim() || "Super+Shift+Space";
                 void this.registerGlobalShortcut(shortcut);
             }
@@ -1124,8 +1241,8 @@ export class DesktopAppController {
                 void this.runAllDiagnostics();
             }
             else if (action === "complete-onboarding") {
-                const capEl = root.querySelector('select[name="onboarding.capture_target"]');
-                const playEl = root.querySelector('select[name="onboarding.playback_target"]');
+                const capEl = root.querySelector('[name="onboarding.capture_target"]');
+                const playEl = root.querySelector('[name="onboarding.playback_target"]');
                 const audioOverride = capEl || playEl
                     ? {
                         captureTarget: capEl?.value ?? "",
@@ -1156,6 +1273,29 @@ export class DesktopAppController {
             const target = ev.target;
             if (target?.dataset["action"] === "select-workspace-dropdown" && target.value) {
                 void this.selectWorkspace(target.value);
+            }
+            else if (target?.dataset["action"] === "onboarding-audio-select") {
+                const changedName = target.name || target.getAttribute?.("name") || "";
+                const capEl = root.querySelector('[name="onboarding.capture_target"]');
+                const playEl = root.querySelector('[name="onboarding.playback_target"]');
+                const nextCapture = changedName === "onboarding.capture_target"
+                    ? target.value
+                    : (capEl?.value ??
+                        this.#model.onboardingDraftAudio?.captureTarget ??
+                        this.#model.settingsData?.audio.capture_target ??
+                        "");
+                const nextPlayback = changedName === "onboarding.playback_target"
+                    ? target.value
+                    : (playEl?.value ??
+                        this.#model.onboardingDraftAudio?.playbackTarget ??
+                        this.#model.settingsData?.audio.playback_target ??
+                        "");
+                this.#updateModel({
+                    onboardingDraftAudio: {
+                        captureTarget: nextCapture,
+                        playbackTarget: nextPlayback,
+                    },
+                });
             }
         }, { signal: sig });
         root.addEventListener("submit", (ev) => {

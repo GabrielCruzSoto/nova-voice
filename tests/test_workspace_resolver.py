@@ -420,3 +420,58 @@ async def test_nova013_ac4_ac9_initialize_workspace_and_clear_active_workspace(
     await resolver.clear_active_workspace("corr-clear-2")
     assert len(cleared_events) == 1
 
+
+async def test_nova013_secret_keys_in_manifest_raise_invalid_manifest_and_keep_catalog(
+    tmp_path: Path,
+) -> None:
+    fake_home = tmp_path / "home_op"
+    fake_home.mkdir()
+    root = tmp_path / "Proyectos"
+    root.mkdir()
+
+    valid_ws = root / "cliente-sano"
+    (valid_ws / "repositories" / "core").mkdir(parents=True)
+    (valid_ws / "nova-workspace.toml").write_text(
+        'schema_version = "1.0"\n\n'
+        "[workspace]\n"
+        'id = "cliente-sano"\n'
+        'name = "Cliente Sano"\n'
+        'projects = ["repositories/core"]\n',
+        encoding="utf-8",
+    )
+
+    poisoned_toml = root / "cliente-secreto-toml"
+    poisoned_toml.mkdir()
+    (poisoned_toml / "nova-workspace.toml").write_text(
+        'schema_version = "1.0"\n'
+        'openai_api_key = "forbidden"\n\n'
+        "[workspace]\n"
+        'id = "bad"\n'
+        'name = "Bad"\n',
+        encoding="utf-8",
+    )
+
+    poisoned_aff = root / "cliente-secreto-aff"
+    poisoned_aff.mkdir()
+    (poisoned_aff / "aff.yaml").write_text(
+        'schema_version: "1.0"\nauth_token: "forbidden"\nproject:\n  id: "bad-aff"\n',
+        encoding="utf-8",
+    )
+
+    resolver = LocalWorkspaceResolver(allowed_roots=[root], home_dir=fake_home)
+
+    for bad_dir in (poisoned_toml, poisoned_aff):
+        with pytest.raises(WorkspaceResolutionError) as exc_info:
+            await resolver.resolve(
+                ResolveWorkspaceRequest(
+                    correlation_id="corr-sec",
+                    query=str(bad_dir),
+                    mode="exact_path",
+                )
+            )
+        assert exc_info.value.code == "WORKSPACE_INVALID_MANIFEST"
+
+    entries = await resolver.list_workspace_entries()
+    assert [e.name for e in entries] == ["Cliente Sano"]
+
+

@@ -720,7 +720,9 @@ async def test_nova013_onboarding_diagnostics_and_multiproject_workspace_http_ro
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    from nova.adapters.config_store import TomlConfigStore
     from nova.application.live_diagnostics import LiveDiagnosticsConfig, LiveDiagnosticsService
+    from nova.application.settings_service import SettingsService
     from nova.domain.models import (
         AntigravityDiagnosticResult,
         AudioOutputDiagnosticResult,
@@ -811,11 +813,17 @@ async def test_nova013_onboarding_diagnostics_and_multiproject_workspace_http_ro
                 message="Conectado a Antigravity.",
             )
 
+    settings_svc = SettingsService(
+        config_store=TomlConfigStore(config_path=tmp_path / "config.toml"),
+        event_bus=bus,
+    )
+
     async with DesktopUiServer(
         orchestrator=orch,
         state_hub=hub,
         event_bus=bus,
         workspace_resolver=resolver,
+        settings_service=settings_svc,
         diagnostics_service=_StubDiagnostics(),
     ) as srv:
         port = srv.port
@@ -871,13 +879,15 @@ async def test_nova013_onboarding_diagnostics_and_multiproject_workspace_http_ro
         assert init_payload["created"] is True
         assert init_payload["workspace"]["topology"] == "multi-project"
         assert len(init_payload["workspace"]["projects"]) == 2
+        assert settings_svc.current_settings.general.last_active_workspace is not None
 
-        # 3. Clear workspace -> 200 OK and active_workspace returns to None
+        # 3. Clear workspace -> 200 OK and active_workspace + persisted last_active_workspace reset
         st_clr, _, clr_body = await _raw_http_request(
             port, "POST", "/api/workspace/clear", headers=auth_hdrs, body=b"{}"
         )
         assert st_clr == 200
         assert json.loads(clr_body)["cleared"] is True
+        assert settings_svc.current_settings.general.last_active_workspace is None
 
         # 4. All 4 live diagnostic endpoints succeed
         for diag_path in (
@@ -891,5 +901,37 @@ async def test_nova013_onboarding_diagnostics_and_multiproject_workspace_http_ro
             )
             assert st_d == 200
             assert json.loads(d_body)["ok"] is True
+
+        # 5. Secret key in workspace manifest returns 422 WORKSPACE_INVALID_MANIFEST (OP-3)
+        bad_manifest_ws = root / "cliente-con-secreto"
+        bad_manifest_ws.mkdir()
+        (bad_manifest_ws / "nova-workspace.toml").write_text(
+            'schema_version = "1.0"\napi_key = "forbidden"\n[workspace]\nid = "x"\n',
+            encoding="utf-8",
+        )
+        st_sec, _, sec_body = await _raw_http_request(
+            port,
+            "POST",
+            "/api/workspace/select",
+            headers=auth_hdrs,
+            body=json.dumps({"path_or_query": str(bad_manifest_ws)}).encode("utf-8"),
+        )
+        assert st_sec == 422
+        assert json.loads(sec_body)["error_code"] == "WORKSPACE_INVALID_MANIFEST"
+
+        # 6. Blank workspace_slug or blank project slug in /api/workspace/init returns 422 (OP-2)
+        for invalid_init in (
+            {"parent_root": str(root), "workspace_slug": "   ", "projects": ["api"]},
+            {"parent_root": str(root), "workspace_slug": "cliente-dos", "projects": ["api", "  "]},
+        ):
+            st_inv, _, inv_body = await _raw_http_request(
+                port,
+                "POST",
+                "/api/workspace/init",
+                headers=auth_hdrs,
+                body=json.dumps(invalid_init).encode("utf-8"),
+            )
+            assert st_inv == 422
+            assert json.loads(inv_body)["error_code"] == "WORKSPACE_INVALID_MANIFEST"
     hub.close()
 

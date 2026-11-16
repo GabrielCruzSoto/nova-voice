@@ -43,7 +43,7 @@ from nova.application.health_diagnostics import (
     check_system_components,
     resolve_model_path,
 )
-from nova.application.live_diagnostics import LiveDiagnosticsConfig
+from nova.application.live_diagnostics import LiveDiagnosticsConfig, LiveDiagnosticsService
 from nova.application.orchestrator import NovaOrchestrator, OrchestratorSettings
 from nova.application.security_gatekeeper import SecurityGatekeeper
 from nova.application.settings_service import SettingsService
@@ -504,6 +504,7 @@ class NovaDesktopRuntime:
         self._orchestrator: NovaOrchestrator | None = None
         self._voice_coordinator: VoiceRuntimePort | None = None
         self._settings_service: SettingsService | None = None
+        self._diagnostics_service: LiveDiagnosticsService | None = None
         self._state_hub: UiStateHub | None = None
         self._ui_server: DesktopUiServer | None = None
         self._gatekeeper: SecurityGatekeeper | None = None
@@ -581,6 +582,13 @@ class NovaDesktopRuntime:
             )
         if self._orchestrator is not None:
             self._orchestrator.update_models(tier2_model=updated.models.tier2_model)
+        if self._diagnostics_service is not None:
+            self._diagnostics_service.update_config(
+                pi_provider=updated.models.pi_provider,
+                pi_model=updated.models.pi_model,
+                tier2_model=updated.models.tier2_model,
+                tts_engine_label=updated.voice.tts_engine,
+            )
 
         voice_coord = self._voice_coordinator
         if voice_coord is None:
@@ -817,6 +825,7 @@ class NovaDesktopRuntime:
                 tts_port=live_tts,
                 extra_secrets_provider=self._combined_extra_secrets,
             )
+            self._diagnostics_service = diagnostics_service
 
             state_hub = UiStateHub(
                 event_bus=self._event_bus,

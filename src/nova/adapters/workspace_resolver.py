@@ -19,7 +19,11 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from nova.domain.errors import WorkspaceResolutionError, reject_secret_settings_keys
+from nova.domain.errors import (
+    DesktopUiError,
+    WorkspaceResolutionError,
+    reject_secret_settings_keys,
+)
 from nova.domain.events import (
     OrchestratorEventBus,
     WorkspaceChangedEvent,
@@ -639,7 +643,13 @@ class LocalWorkspaceResolver:
                 message=f"Invalid UTF-8 TOML in {NOVA_WORKSPACE_MANIFEST}: {exc}",
             ) from exc
 
-        reject_secret_settings_keys(parsed)
+        try:
+            reject_secret_settings_keys(parsed)
+        except DesktopUiError as exc:
+            raise WorkspaceResolutionError(
+                code="WORKSPACE_INVALID_MANIFEST",
+                message=exc.sanitized_message,
+            ) from exc
         ws_sec = parsed.get("workspace")
         if not isinstance(ws_sec, Mapping):
             raise WorkspaceResolutionError(
@@ -693,7 +703,13 @@ class LocalWorkspaceResolver:
             ) from exc
 
         parsed = _parse_aff_yaml_subset(raw_text)
-        reject_secret_settings_keys(parsed)
+        try:
+            reject_secret_settings_keys(parsed)
+        except DesktopUiError as exc:
+            raise WorkspaceResolutionError(
+                code="WORKSPACE_INVALID_MANIFEST",
+                message=exc.sanitized_message,
+            ) from exc
         proj_sec = parsed.get("project")
         ws_sec = parsed.get("workspace")
         raw_id = (

@@ -286,6 +286,12 @@ export interface PresentationalAppModel {
   readonly appShuttingDown?: boolean | undefined;
   readonly onboardingOpen?: boolean | undefined;
   readonly onboardingSaving?: boolean | undefined;
+  readonly onboardingDraftAudio?:
+    | {
+        readonly captureTarget: string;
+        readonly playbackTarget: string;
+      }
+    | undefined;
   readonly processCwd?: string | undefined;
   readonly allowedRoots?: readonly string[] | undefined;
   readonly initWorkspaceOpen?: boolean | undefined;

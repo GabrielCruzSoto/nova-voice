@@ -12,7 +12,7 @@ from pathlib import Path
 import pytest
 
 from nova.adapters.diagnostics_probes import build_live_diagnostics_service
-from nova.application.live_diagnostics import LiveDiagnosticsConfig
+from nova.application.live_diagnostics import LiveDiagnosticsConfig, LiveDiagnosticsService
 from nova.domain.errors import DesktopUiError
 from nova.domain.models import AudioFrame, SynthesizedAudio, TranscriptionResult
 
@@ -251,3 +251,40 @@ async def test_ac8_pi_and_antigravity_connectivity_probes_classify_and_redact_se
     assert agy_ok.ok is True
     assert agy_ok.status == "connected"
     assert agy_ok.plugin_verified is True
+
+
+async def test_nova013_agy_generic_errors_and_hot_config_update() -> None:
+    async def _failing_agy_runner(
+        _exe: str,
+        _extra: tuple[str, ...],
+        _model: str,
+        _probe_dir: str,
+        _ipc_env: dict[str, str] | None,
+    ) -> None:
+        raise OSError("agy pipe broken with sk-abcdefghijklmnopqrstuvwxyz1234")
+
+    svc = LiveDiagnosticsService(
+        config=LiveDiagnosticsConfig(
+            pi_provider="github-copilot",
+            pi_model="gpt-4.1",
+            tier2_model="claude-opus-5-5-high",
+            tts_engine_label="kokoro",
+        ),
+        which_resolver=lambda name: f"/usr/bin/{name}",
+        agy_probe_runner=_failing_agy_runner,
+    )
+    agy_err = await svc.test_antigravity_connection()
+    assert agy_err.ok is False
+    assert agy_err.status == "error"
+    assert "sk-abcdefghijklmnopqrstuvwxyz1234" not in agy_err.message
+
+    svc.update_config(
+        pi_provider="openai",
+        pi_model="gpt-4.1-mini",
+        tier2_model="gemini-3.1-pro",
+        tts_engine_label="piper",
+    )
+    pi_missing = await svc.test_pi_connection()
+    assert pi_missing.provider == "openai"
+    assert pi_missing.model == "gpt-4.1-mini"
+

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import shutil
 from collections.abc import Callable
+from pathlib import Path
 
 from nova.adapters.antigravity_adapter import (
     ALLOWED_TIER2_MODELS,
@@ -56,8 +57,8 @@ async def default_pi_probe_runner(
             workspace_active=False,
             no_session=True,
             enable_gatekeeper_extension=False,
-            ack_timeout_seconds=5.0,
-            run_timeout_seconds=8.0,
+            ack_timeout_seconds=4.0,
+            run_timeout_seconds=7.5,
         )
     )
     async with client:
@@ -78,10 +79,10 @@ async def default_agy_probe_runner(
             executable=executable,
             extra_leading_args=extra_args,
             allowed_models=allowed,
-            timeout_seconds=12.0,
+            timeout_seconds=10.0,
             gatekeeper_ipc_env=gatekeeper_ipc_env
             or {
-                "NOVA_GATEKEEPER_SOCKET": "/tmp/nova-probe.sock",
+                "NOVA_GATEKEEPER_SOCKET": str(Path(probe_dir) / "nova-probe.sock"),
                 "NOVA_GATEKEEPER_TOKEN": "probe-token",
             },
             require_gatekeeper_plugin=True,

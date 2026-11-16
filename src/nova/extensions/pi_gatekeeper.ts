@@ -156,15 +156,23 @@ function touchesGitMetadata(candidateReal: string, workspaceReal: string): boole
   return segments.some((seg) => seg.toLowerCase() === ".git");
 }
 
-function parseAllowedProjectRoots(): string[] {
+interface AllowedProjectPolicy {
+  readonly enforced: boolean;
+  readonly roots: readonly string[];
+}
+
+function parseAllowedProjectRoots(): AllowedProjectPolicy {
   const raw = process.env.NOVA_ALLOWED_PROJECT_PATHS;
   if (!raw || !raw.trim()) {
-    return [];
+    return { enforced: false, roots: [] };
   }
   try {
     const parsed: unknown = JSON.parse(raw);
     if (!Array.isArray(parsed)) {
-      return [];
+      return { enforced: true, roots: [] };
+    }
+    if (parsed.length === 0) {
+      return { enforced: false, roots: [] };
     }
     const roots: string[] = [];
     for (const item of parsed) {
@@ -172,13 +180,13 @@ function parseAllowedProjectRoots(): string[] {
         try {
           roots.push(fs.realpathSync(item.trim()));
         } catch {
-          // Non-resolvable project path is ignored; confinement remains fail-closed
+          // Non-resolvable project path is ignored; enforced=true keeps confinement fail-closed
         }
       }
     }
-    return roots;
+    return { enforced: true, roots };
   } catch {
-    return [];
+    return { enforced: true, roots: [] };
   }
 }
 
@@ -186,7 +194,7 @@ function isPathConfinedToWorkspace(
   rawPath: string,
   workspaceReal: string,
   forbidGitMetadataWrite = false,
-  allowedProjectRoots: readonly string[] = [],
+  projectPolicy: AllowedProjectPolicy = { enforced: false, roots: [] },
 ): "ok" | "outside_workspace" | "outside_project" {
   const exactNorm = normalizeExactPiPath(rawPath);
   const defensiveNorm = normalizeDefensivePath(rawPath);
@@ -215,8 +223,8 @@ function isPathConfinedToWorkspace(
     }
     if (
       forbidGitMetadataWrite &&
-      allowedProjectRoots.length > 0 &&
-      !allowedProjectRoots.some((projRoot) => isInsideWorkspace(resolved, projRoot))
+      projectPolicy.enforced &&
+      !projectPolicy.roots.some((projRoot) => isInsideWorkspace(resolved, projRoot))
     ) {
       return "outside_project";
     }
@@ -276,7 +284,7 @@ function checkFileToolConfinement(
     };
   }
 
-  const allowedProjectRoots = parseAllowedProjectRoots();
+  const projectPolicy = parseAllowedProjectRoots();
 
   for (const key of PATH_ARGUMENT_KEYS) {
     const val = input[key];
@@ -294,7 +302,7 @@ function checkFileToolConfinement(
       val,
       workspaceReal,
       forbidGitWrite,
-      allowedProjectRoots,
+      projectPolicy,
     );
     if (confinement === "outside_project") {
       return {
