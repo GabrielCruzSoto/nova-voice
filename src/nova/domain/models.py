@@ -30,6 +30,7 @@ def validate_spoken_word_budget(value: str) -> str:
 
 
 WorkspaceQueryMode = Literal["exact_path", "voice_fuzzy", "ui_picker"]
+WorkspaceTopology = Literal["multi-project", "single-repo"]
 CommandSource = Literal["tier1_pi", "tier2_agy"]
 ToolInterceptName = Literal["bash", "run_command"]
 RiskLevel = Literal["low", "medium", "high", "critical"]
@@ -66,6 +67,42 @@ class ResolveWorkspaceRequest(BaseModel):
     mode: str = "voice_fuzzy"
 
 
+class WorkspaceProject(BaseModel):
+    """Validated isolated project declared inside a Workspace (NOVA-013)."""
+
+    model_config = ConfigDict(frozen=True, extra="ignore")
+
+    project_id: str = Field(min_length=1)
+    name: str = Field(min_length=1)
+    relative_path: str = Field(min_length=1)
+    canonical_path: str = Field(min_length=1)
+
+
+class WorkspaceCatalogEntry(BaseModel):
+    """Summary entry for a selectable Workspace inside allowed_roots (NOVA-013)."""
+
+    model_config = ConfigDict(frozen=True, extra="ignore")
+
+    workspace_id: str = Field(min_length=1)
+    name: str = Field(min_length=1)
+    canonical_path: str = Field(min_length=1)
+    topology: WorkspaceTopology = "single-repo"
+    projects: tuple[WorkspaceProject, ...] = ()
+
+
+class InitializeWorkspaceRequest(BaseModel):
+    """Boundary request to initialize a new isolated multi-project Workspace (NOVA-013 OP-2)."""
+
+    model_config = ConfigDict(frozen=True, extra="forbid")
+
+    correlation_id: str = Field(min_length=1)
+    parent_root: str = Field(min_length=1)
+    workspace_slug: str = Field(min_length=1, max_length=120)
+    display_name: str | None = Field(default=None, max_length=120)
+    projects: tuple[str, ...] = ()
+    activate: bool = True
+
+
 class WorkspaceContext(BaseModel):
     """Validated active workspace context."""
 
@@ -76,6 +113,9 @@ class WorkspaceContext(BaseModel):
     canonical_path: str = Field(min_length=1)
     selected_via: WorkspaceQueryMode = "exact_path"
     active_since: str = Field(default_factory=utc_now_iso)
+    topology: WorkspaceTopology = "single-repo"
+    manifest_path: str | None = None
+    projects: tuple[WorkspaceProject, ...] = ()
 
 
 class CodingTaskRequest(BaseModel):
@@ -291,6 +331,7 @@ class GeneralSettingsSection(BaseModel):
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
+    first_run_completed: bool = False
     remember_workspace: bool = True
     last_active_workspace: str | None = None
 
@@ -426,3 +467,70 @@ class ShortcutRegistrationResult:
     shortcut: str
     command: str
     config_file: str | None = None
+
+
+MicDiagnosticStatus = Literal["ok", "silent", "binary_missing", "device_error"]
+AudioOutDiagnosticStatus = Literal["ok", "binary_missing", "tts_unavailable", "device_error"]
+PiDiagnosticStatus = Literal["connected", "binary_missing", "auth_error", "timeout", "error"]
+AntigravityDiagnosticStatus = Literal[
+    "connected",
+    "binary_missing",
+    "plugin_missing",
+    "auth_error",
+    "timeout",
+    "error",
+]
+
+
+class MicDiagnosticResult(BaseModel):
+    """Live microphone readiness test result in RAM (NOVA-013 OP-4)."""
+
+    model_config = ConfigDict(frozen=True, extra="ignore")
+
+    ok: bool
+    status: MicDiagnosticStatus
+    capture_target: str | None = None
+    duration_ms: float = Field(ge=0.0)
+    peak_level: float = Field(ge=0.0, le=1.0)
+    rms_level: float = Field(ge=0.0, le=1.0)
+    speech_detected: bool = False
+    transcript_preview: str = ""
+    message: str = Field(min_length=1)
+
+
+class AudioOutputDiagnosticResult(BaseModel):
+    """Live audio output readiness test result in RAM (NOVA-013 OP-5)."""
+
+    model_config = ConfigDict(frozen=True, extra="ignore")
+
+    ok: bool
+    status: AudioOutDiagnosticStatus
+    engine: str = Field(min_length=1)
+    latency_ms: float = Field(ge=0.0)
+    message: str = Field(min_length=1)
+
+
+class PiConnectionDiagnosticResult(BaseModel):
+    """Live Nova <-> Pi RPC connectivity probe result (NOVA-013 OP-6)."""
+
+    model_config = ConfigDict(frozen=True, extra="ignore")
+
+    ok: bool
+    status: PiDiagnosticStatus
+    provider: str = Field(min_length=1)
+    model: str = Field(min_length=1)
+    latency_ms: float = Field(ge=0.0)
+    message: str = Field(min_length=1)
+
+
+class AntigravityDiagnosticResult(BaseModel):
+    """Live Nova <-> Antigravity CLI connectivity probe result (NOVA-013 OP-7)."""
+
+    model_config = ConfigDict(frozen=True, extra="ignore")
+
+    ok: bool
+    status: AntigravityDiagnosticStatus
+    model: str = Field(min_length=1)
+    plugin_verified: bool = False
+    latency_ms: float = Field(ge=0.0)
+    message: str = Field(min_length=1)

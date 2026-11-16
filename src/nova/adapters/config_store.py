@@ -68,6 +68,7 @@ def serialize_settings_toml(settings: NovaPersistedSettings) -> str:
         f"schema_version = {_toml_value(settings.schema_version)}",
         "",
         "[general]",
+        f"first_run_completed = {_toml_value(settings.general.first_run_completed)}",
         f"remember_workspace = {_toml_value(settings.general.remember_workspace)}",
         f"last_active_workspace = {_toml_value(settings.general.last_active_workspace)}",
         "",

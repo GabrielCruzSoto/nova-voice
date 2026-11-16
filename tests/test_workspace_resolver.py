@@ -14,8 +14,9 @@ from nova.domain.events import (
     OrchestratorEventBus,
     VoiceMilestoneEvent,
     WorkspaceChangedEvent,
+    WorkspaceClearedEvent,
 )
-from nova.domain.models import ResolveWorkspaceRequest
+from nova.domain.models import InitializeWorkspaceRequest, ResolveWorkspaceRequest
 
 
 async def test_ac1_resolve_exact_path_within_allowed_roots_and_emit_event(tmp_path: Path) -> None:
@@ -262,4 +263,160 @@ async def test_ac9_list_available_workspaces_excludes_technical_artifact_directo
         )
     )
     assert ctx.canonical_path == str(explicit_dist.resolve())
+
+
+async def test_nova013_ac2_rejects_home_directory_across_all_modes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    fake_home = tmp_path / "operador_home"
+    fake_home.mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(fake_home))
+
+    resolver = LocalWorkspaceResolver(allowed_roots=[tmp_path, fake_home], home_dir=fake_home)
+
+    for query, mode in (
+        ("~", "exact_path"),
+        (str(fake_home), "exact_path"),
+        ("~", "ui_picker"),
+        (str(fake_home), "ui_picker"),
+        ("operador home", "voice_fuzzy"),
+    ):
+        with pytest.raises(WorkspaceResolutionError) as exc_info:
+            await resolver.resolve(
+                ResolveWorkspaceRequest(
+                    correlation_id="corr-home",
+                    query=query,
+                    mode=mode,
+                )
+            )
+        assert exc_info.value.code == "WORKSPACE_HOME_FORBIDDEN"
+    assert resolver.active_context is None
+
+
+async def test_nova013_ac4_ac5_resolves_aigile_and_toml_workspaces_and_isolates_symlinks(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "Workspaces"
+    alfa = root / "cliente-alfa-workspace"
+    (alfa / "repositories" / "api-pagos").mkdir(parents=True)
+    (alfa / "repositories" / "portal-web").mkdir(parents=True)
+    (alfa / "aff.yaml").write_text(
+        'schema_version: "1.0"\n'
+        "project:\n"
+        '  id: "cliente-alfa"\n'
+        '  name: "Cliente Alfa"\n'
+        '  namespace: "alfa"\n'
+        "workspace:\n"
+        '  topology: "worktrees"\n'
+        'repositories: ["api-pagos", "portal-web"]\n',
+        encoding="utf-8",
+    )
+
+    beta = root / "cliente-beta-workspace"
+    (beta / "repositories" / "backend-core").mkdir(parents=True)
+    (beta / "repositories" / "app-admin").mkdir(parents=True)
+    (beta / "nova-workspace.toml").write_text(
+        'schema_version = "1.0"\n\n'
+        "[workspace]\n"
+        'id = "cliente-beta"\n'
+        'name = "Cliente Beta"\n'
+        'topology = "multi-project"\n'
+        'projects = ["repositories/backend-core", "repositories/app-admin"]\n',
+        encoding="utf-8",
+    )
+
+    resolver = LocalWorkspaceResolver(allowed_roots=[root])
+    entries = await resolver.list_workspace_entries()
+    entry_names = [e.name for e in entries]
+    assert entry_names == ["Cliente Alfa", "Cliente Beta"]
+    assert all("repositories" not in e.name.lower() for e in entries)
+
+    ctx_alfa = await resolver.resolve(
+        ResolveWorkspaceRequest(
+            correlation_id="corr-alfa",
+            query="Cliente Alfa",
+            mode="voice_fuzzy",
+        )
+    )
+    assert ctx_alfa.name == "Cliente Alfa"
+    assert ctx_alfa.topology == "multi-project"
+    assert [p.name for p in ctx_alfa.projects] == ["api-pagos", "portal-web"]
+    assert all(p.canonical_path.startswith(str(alfa.resolve())) for p in ctx_alfa.projects)
+
+    # Cross-client symlink inside beta pointing to alfa must fail-closed
+    cross_link = beta / "repositories" / "fuga-alfa"
+    cross_link.symlink_to(alfa / "repositories" / "api-pagos", target_is_directory=True)
+    (beta / "nova-workspace.toml").write_text(
+        'schema_version = "1.0"\n\n'
+        "[workspace]\n"
+        'id = "cliente-beta"\n'
+        'name = "Cliente Beta"\n'
+        'topology = "multi-project"\n'
+        'projects = ["repositories/backend-core", "repositories/fuga-alfa"]\n',
+        encoding="utf-8",
+    )
+    with pytest.raises(WorkspaceResolutionError) as exc_escape:
+        await resolver.resolve(
+            ResolveWorkspaceRequest(
+                correlation_id="corr-escape",
+                query=str(beta),
+                mode="exact_path",
+            )
+        )
+    assert exc_escape.value.code == "WORKSPACE_OUTSIDE_ALLOWED_ROOTS"
+
+
+async def test_nova013_ac4_ac9_initialize_workspace_and_clear_active_workspace(
+    tmp_path: Path,
+) -> None:
+    fake_home = tmp_path / "home_op"
+    fake_home.mkdir()
+    root = tmp_path / "Proyectos"
+    root.mkdir()
+
+    bus = OrchestratorEventBus()
+    cleared_events: list[WorkspaceClearedEvent] = []
+
+    async def on_ev(ev: object) -> None:
+        if isinstance(ev, WorkspaceClearedEvent):
+            cleared_events.append(ev)
+
+    bus.subscribe(on_ev)
+    resolver = LocalWorkspaceResolver(allowed_roots=[root], event_bus=bus, home_dir=fake_home)
+
+    created = await resolver.initialize_workspace(
+        InitializeWorkspaceRequest(
+            correlation_id="corr-init",
+            parent_root=str(root),
+            workspace_slug="cliente-gamma-workspace",
+            display_name="Cliente Gamma",
+            projects=("api-core", "web-portal"),
+            activate=True,
+        )
+    )
+    assert created.name == "Cliente Gamma"
+    assert created.topology == "multi-project"
+    assert [p.name for p in created.projects] == ["api-core", "web-portal"]
+    assert (root / "cliente-gamma-workspace" / "nova-workspace.toml").is_file()
+    assert resolver.active_context is not None
+
+    with pytest.raises(WorkspaceResolutionError) as dup_exc:
+        await resolver.initialize_workspace(
+            InitializeWorkspaceRequest(
+                correlation_id="corr-dup",
+                parent_root=str(root),
+                workspace_slug="cliente-gamma-workspace",
+                display_name="Cliente Gamma",
+                projects=("api-core",),
+            )
+        )
+    assert dup_exc.value.code == "WORKSPACE_ALREADY_EXISTS"
+
+    await resolver.clear_active_workspace("corr-clear-1")
+    assert resolver.active_context is None
+    assert len(cleared_events) == 1
+    # Idempotent repeat clear does not emit duplicate event
+    await resolver.clear_active_workspace("corr-clear-2")
+    assert len(cleared_events) == 1
 

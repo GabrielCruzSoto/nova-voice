@@ -17,7 +17,9 @@ from nova.domain.models import (
     CommandSource,
     DecisionVerdict,
     InferenceDevice,
+    WorkspaceProject,
     WorkspaceQueryMode,
+    WorkspaceTopology,
     utc_now_iso,
     validate_spoken_word_budget,
 )
@@ -27,7 +29,7 @@ _bus_logger = logging.getLogger("nova.event_bus")
 
 
 class WorkspaceChangedEvent(BaseModel):
-    """Published whenever the active project directory changes."""
+    """Published whenever the active workspace changes."""
 
     model_config = ConfigDict(frozen=True, extra="ignore")
 
@@ -35,6 +37,18 @@ class WorkspaceChangedEvent(BaseModel):
     workspace_name: str = Field(min_length=1)
     canonical_path: str = Field(min_length=1)
     selected_via: WorkspaceQueryMode = "exact_path"
+    topology: WorkspaceTopology = "single-repo"
+    projects: tuple[WorkspaceProject, ...] = ()
+    timestamp: str = Field(default_factory=utc_now_iso)
+
+
+class WorkspaceClearedEvent(BaseModel):
+    """Published when the active workspace is cleared, returning Nova to conversational ~ mode."""
+
+    model_config = ConfigDict(frozen=True, extra="ignore")
+
+    correlation_id: str = Field(min_length=1)
+    process_cwd: str = Field(min_length=1)
     timestamp: str = Field(default_factory=utc_now_iso)
 
 
@@ -176,6 +190,7 @@ class UiPanelToggleRequestedEvent(BaseModel):
 
 OrchestratorEvent = (
     WorkspaceChangedEvent
+    | WorkspaceClearedEvent
     | ChatStreamEvent
     | VoiceMilestoneEvent
     | RunnerFailureEvent
