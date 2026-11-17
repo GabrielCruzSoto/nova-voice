@@ -144,6 +144,7 @@ def check_system_components(
     config: DiagnosticsConfig | Any | None = None,
     *,
     which_resolver: WhichResolver = shutil.which,
+    source_root: Path | None = None,
 ) -> SystemHealthReport:
     """Audit system dependencies and voice models, producing a structured health report."""
     checks: list[ComponentCheckResult] = []
@@ -263,6 +264,7 @@ def check_system_components(
             "oye_nova.onnx",
             explicit_param=ww_explicit,
             models_dir=models_dir,
+            source_root=source_root,
         )
         checks.append(
             ComponentCheckResult(
@@ -285,7 +287,11 @@ def check_system_components(
         )
 
         # OpenWakeWord feature models
-        mel_path = resolve_model_path("melspectrogram.onnx", models_dir=models_dir)
+        mel_path = resolve_model_path(
+            "melspectrogram.onnx",
+            models_dir=models_dir,
+            source_root=source_root,
+        )
         checks.append(
             ComponentCheckResult(
                 name="model_melspectrogram",
@@ -302,7 +308,11 @@ def check_system_components(
             )
         )
 
-        emb_path = resolve_model_path("embedding_model.onnx", models_dir=models_dir)
+        emb_path = resolve_model_path(
+            "embedding_model.onnx",
+            models_dir=models_dir,
+            source_root=source_root,
+        )
         checks.append(
             ComponentCheckResult(
                 name="model_embedding",
@@ -325,6 +335,7 @@ def check_system_components(
             "silero_vad.onnx",
             explicit_param=vad_explicit,
             models_dir=models_dir,
+            source_root=source_root,
         )
         checks.append(
             ComponentCheckResult(
@@ -352,6 +363,7 @@ def check_system_components(
             "es_ES-davefx-medium.onnx",
             explicit_param=tts_explicit,
             models_dir=models_dir,
+            source_root=source_root,
         )
         checks.append(
             ComponentCheckResult(

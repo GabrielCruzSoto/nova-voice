@@ -1359,3 +1359,429 @@ html[data-shell-frameless="true"] .nova-layout[data-ui-mode="panel"] {
 .nova-notice-container[data-error-code="APP_SHUTDOWN"] .notice-message {
   color: #bae6fd;
 }
+
+/* ==========================================================================
+   Segmented Tab Switcher (Chat | Agentes) - GNOME / Libadwaita styling
+   ========================================================================== */
+
+.nova-view-switcher {
+  display: inline-flex;
+  align-items: center;
+  background: rgba(15, 23, 42, 0.72);
+  border: 1px solid var(--border-subtle);
+  border-radius: 9999px;
+  padding: 3px;
+  gap: 2px;
+}
+
+.nova-tab-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  padding: 0.28rem 0.75rem;
+  border-radius: 9999px;
+  border: 1px solid transparent;
+  background: transparent;
+  color: var(--muted-text-primary);
+  font-size: 0.82rem;
+  font-weight: 500;
+  cursor: pointer;
+  transition: all 180ms cubic-bezier(0.16, 1, 0.3, 1);
+  white-space: nowrap;
+}
+
+.nova-tab-btn:hover {
+  color: var(--text-primary);
+  background: rgba(255, 255, 255, 0.05);
+}
+
+.nova-tab-btn--active {
+  background: rgba(30, 41, 59, 0.85);
+  color: var(--text-primary);
+  border-color: rgba(56, 189, 248, 0.35);
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.3);
+  font-weight: 600;
+}
+
+.nova-tab-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 18px;
+  height: 18px;
+  padding: 0 5px;
+  border-radius: 9999px;
+  background: var(--brand-electric-blue);
+  color: #04101e;
+  font-size: 0.72rem;
+  font-weight: 700;
+  line-height: 1;
+}
+
+/* ==========================================================================
+   Agents & Tasks Matrix View
+   ========================================================================== */
+
+.nova-agents-scroll {
+  flex: 1 1 auto;
+  overflow-y: auto;
+  overflow-x: hidden;
+  padding: 0.85rem;
+  display: flex;
+  flex-direction: column;
+}
+
+.nova-agents-matrix-container {
+  display: flex;
+  flex-direction: column;
+  gap: 0.85rem;
+  max-width: var(--conversation-max-width);
+  margin: 0 auto;
+  width: 100%;
+}
+
+/* System Bar & Daemon status */
+.nova-agents-system-bar {
+  display: flex;
+  flex-direction: column;
+  gap: 0.65rem;
+  padding: 0.75rem 0.95rem;
+  background: rgba(15, 23, 42, 0.65);
+  border: 1px solid var(--border-subtle);
+  border-radius: 14px;
+}
+
+.nova-daemon-indicator {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  font-size: 0.84rem;
+  color: var(--text-primary);
+}
+
+.nova-daemon-pulse {
+  width: 9px;
+  height: 9px;
+  border-radius: 50%;
+  background: #34d399;
+  box-shadow: 0 0 8px #34d399;
+  display: inline-block;
+}
+
+.nova-daemon-sub {
+  margin-left: auto;
+  font-size: 0.76rem;
+  color: var(--muted-text-primary);
+  font-family: monospace;
+}
+
+/* Agent Slots Grid */
+.nova-agent-slots-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: 0.65rem;
+}
+
+.nova-agent-slot-card {
+  display: flex;
+  flex-direction: column;
+  gap: 0.35rem;
+  padding: 0.65rem 0.75rem;
+  background: rgba(30, 41, 59, 0.55);
+  border: 1px solid rgba(148, 163, 184, 0.12);
+  border-radius: 10px;
+}
+
+.nova-agent-slot-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+}
+
+.nova-agent-slot-name {
+  font-size: 0.84rem;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.nova-agent-slot-badge {
+  font-size: 0.7rem;
+  padding: 0.15rem 0.45rem;
+  border-radius: 6px;
+  font-weight: 600;
+}
+
+.nova-agent-slot-badge.badge--active {
+  background: rgba(52, 211, 153, 0.2);
+  color: #34d399;
+  border: 1px solid rgba(52, 211, 153, 0.3);
+}
+
+.nova-agent-slot-badge.badge--idle {
+  background: rgba(148, 163, 184, 0.12);
+  color: var(--muted-text-primary);
+}
+
+.nova-agent-slot-meta {
+  display: flex;
+  justify-content: space-between;
+  font-size: 0.75rem;
+  color: var(--muted-text-primary);
+}
+
+.nova-agent-slot-bar-track {
+  height: 4px;
+  background: rgba(255, 255, 255, 0.08);
+  border-radius: 2px;
+  overflow: hidden;
+}
+
+.nova-agent-slot-bar-fill {
+  height: 100%;
+  background: linear-gradient(90deg, var(--brand-sky-glow), var(--brand-nova-violet));
+  border-radius: 2px;
+  transition: width 240ms ease;
+}
+
+/* Filter Bar */
+.nova-agents-filter-bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 0.4rem;
+}
+
+.nova-filter-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.35rem;
+  padding: 0.3rem 0.65rem;
+  border-radius: 9999px;
+  background: rgba(30, 41, 59, 0.5);
+  border: 1px solid var(--border-subtle);
+  color: var(--muted-text-primary);
+  font-size: 0.78rem;
+  cursor: pointer;
+  transition: all 150ms ease;
+}
+
+.nova-filter-pill:hover {
+  background: rgba(30, 41, 59, 0.85);
+  color: var(--text-primary);
+}
+
+.nova-filter-pill--active {
+  background: rgba(56, 189, 248, 0.18);
+  border-color: rgba(56, 189, 248, 0.45);
+  color: var(--brand-sky-glow);
+  font-weight: 600;
+}
+
+.filter-count {
+  font-size: 0.72rem;
+  padding: 0.1rem 0.35rem;
+  border-radius: 9999px;
+  background: rgba(255, 255, 255, 0.1);
+}
+
+/* Tasks Grid & Cards */
+.nova-tasks-grid {
+  display: flex;
+  flex-direction: column;
+  gap: 0.75rem;
+}
+
+.nova-task-card {
+  display: flex;
+  flex-direction: column;
+  gap: 0.55rem;
+  padding: 0.85rem 1rem;
+  background: rgba(18, 25, 43, 0.75);
+  border: 1px solid var(--border-subtle);
+  border-radius: 12px;
+  transition: border-color 180ms ease, box-shadow 180ms ease;
+}
+
+.nova-task-card:hover {
+  border-color: rgba(148, 163, 184, 0.3);
+}
+
+.nova-task-card.status--running {
+  border-left: 3px solid var(--brand-sky-glow);
+}
+
+.nova-task-card.status--gatekeeper {
+  border-left: 3px solid #fbbf24;
+  background: rgba(36, 28, 14, 0.55);
+}
+
+.nova-task-card.status--completed {
+  border-left: 3px solid #34d399;
+}
+
+.nova-task-card.status--failed {
+  border-left: 3px solid var(--accent-danger);
+}
+
+.nova-task-card-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 0.75rem;
+}
+
+.nova-task-title-group {
+  display: flex;
+  align-items: baseline;
+  gap: 0.5rem;
+  flex: 1 1 auto;
+}
+
+.nova-task-id {
+  font-family: monospace;
+  font-size: 0.75rem;
+  color: var(--muted-text-primary);
+  font-weight: 600;
+}
+
+.nova-task-title {
+  margin: 0;
+  font-size: 0.92rem;
+  font-weight: 600;
+  color: var(--text-primary);
+  line-height: 1.35;
+}
+
+.nova-task-status-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.3rem;
+  padding: 0.2rem 0.55rem;
+  border-radius: 9999px;
+  font-size: 0.72rem;
+  font-weight: 600;
+  white-space: nowrap;
+}
+
+.nova-task-status-pill.status--running {
+  background: rgba(56, 189, 248, 0.18);
+  color: #38bdf8;
+  border: 1px solid rgba(56, 189, 248, 0.35);
+}
+
+.nova-task-status-pill.status--gatekeeper {
+  background: rgba(245, 158, 11, 0.2);
+  color: #fbbf24;
+  border: 1px solid rgba(245, 158, 11, 0.35);
+}
+
+.nova-task-status-pill.status--queued {
+  background: rgba(148, 163, 184, 0.15);
+  color: var(--muted-text-primary);
+  border: 1px solid rgba(148, 163, 184, 0.22);
+}
+
+.nova-task-status-pill.status--completed {
+  background: rgba(52, 211, 153, 0.18);
+  color: #34d399;
+  border: 1px solid rgba(52, 211, 153, 0.35);
+}
+
+.nova-task-desc {
+  margin: 0;
+  font-size: 0.82rem;
+  color: var(--muted-text-primary);
+  line-height: 1.4;
+}
+
+.nova-task-badges-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.45rem;
+  align-items: center;
+}
+
+.task-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.25rem;
+  font-size: 0.74rem;
+  padding: 0.15rem 0.45rem;
+  border-radius: 6px;
+  background: rgba(30, 41, 59, 0.6);
+  border: 1px solid rgba(148, 163, 184, 0.12);
+  color: var(--muted-text-primary);
+  font-family: monospace;
+}
+
+.task-badge .badge-icon {
+  font-style: normal;
+}
+
+.nova-task-progress-track {
+  height: 3px;
+  background: rgba(255, 255, 255, 0.08);
+  border-radius: 2px;
+  overflow: hidden;
+}
+
+.nova-task-progress-fill {
+  height: 100%;
+  background: linear-gradient(90deg, var(--brand-electric-blue), var(--brand-nova-violet));
+  border-radius: 2px;
+}
+
+.nova-task-log-row {
+  padding: 0.4rem 0.6rem;
+  background: rgba(9, 14, 24, 0.85);
+  border: 1px solid rgba(148, 163, 184, 0.1);
+  border-radius: 6px;
+  font-family: monospace;
+  font-size: 0.75rem;
+  color: #7dd3fc;
+  overflow-x: auto;
+  white-space: nowrap;
+}
+
+.nova-task-actions {
+  display: flex;
+  gap: 0.4rem;
+  margin-top: 0.25rem;
+}
+
+.btn--compact {
+  padding: 0.25rem 0.65rem;
+  font-size: 0.78rem;
+}
+
+/* Empty State */
+.nova-agents-empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  padding: 3rem 1.5rem;
+  text-align: center;
+  background: rgba(15, 23, 42, 0.4);
+  border: 1px dashed var(--border-subtle);
+  border-radius: 14px;
+}
+
+.nova-empty-icon {
+  font-size: 2.2rem;
+  margin-bottom: 0.5rem;
+}
+
+.nova-empty-title {
+  margin: 0;
+  font-size: 1rem;
+  font-weight: 600;
+  color: var(--text-primary);
+}
+
+.nova-empty-subtitle {
+  margin: 0.35rem 0 0;
+  font-size: 0.82rem;
+  color: var(--muted-text-primary);
+  max-width: 440px;
+}

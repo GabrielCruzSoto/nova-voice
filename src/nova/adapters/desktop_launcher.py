@@ -382,6 +382,9 @@ def build_default_voice_coordinator(
             speech_threshold=config.speech_threshold,
             barge_in_threshold=config.barge_in_threshold,
             ptt_mode=config.ptt_mode,
+            min_speech_rms=0.005,
+            barge_in_grace_seconds=0.60,
+            barge_in_min_frames=10,
         ),
     )
 

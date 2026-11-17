@@ -6,6 +6,8 @@ import { fileURLToPath } from "node:url";
 
 import {
   escapeHtml,
+  getDefaultAgentsOverview,
+  renderAgentsMatrixView,
   renderAppShell,
   renderApprovalBanner,
   renderCallControls,
@@ -1934,6 +1936,9 @@ test("NOVA-008 T5: Settings drawer, XSS escaping, Hold-to-Talk button, and contr
   });
   assert.ok(openHtml.includes("nova-settings-drawer"));
   assert.ok(openHtml.includes('name="shortcuts.global_shortcut"'));
+  assert.ok(openHtml.includes('name="voice.tts_engine"'));
+  assert.ok(openHtml.includes('name="voice.whisper_device"'));
+  assert.ok(openHtml.includes('name="voice.whisper_model"'));
   assert.ok(!openHtml.includes("<script>alert(1)</script>"));
   assert.ok(openHtml.includes("&lt;script&gt;alert(1)&lt;/script&gt;"));
   assert.ok(openHtml.includes("Super+Shift+Space"));
@@ -2282,6 +2287,82 @@ test("NOVA-011: Non-voice quit controls in header, settings drawer, and orb widg
   assert.equal(quitHostCalls, 1, "onQuitHost must notify frameless desktop shell");
   assert.equal(ctrl.model.callSession.state, "closed");
   assert.equal(ctrl.model.noticeBanner?.code, "APP_SHUTDOWN");
+});
+
+test("NOVA-014: View switcher tabs in Header, Agents Matrix rendering, and Controller state", async () => {
+  const baseModel = {
+    status: "success",
+    voiceEnabled: true,
+    uiMode: "panel",
+    activeTab: "chat",
+    callSession: { call_id: "c-1", state: "standby", turn_count: 0, active_correlation_id: null },
+    activeWorkspace: { display_name: "nova-voice", canonical_path: "/home/dev/projects/nova-voice", selected_via: "exact_path" },
+    availableWorkspaces: [],
+    pendingApprovals: [],
+    messages: [],
+    errorBanner: null,
+    pickerFallbackOpen: false,
+    lastMilestone: null,
+  };
+
+  // 1. Default render has view switcher with [ Chat | Agentes ] in header
+  const chatHtml = renderAppShell(baseModel);
+  assert.match(chatHtml, /role="tablist"/);
+  assert.match(chatHtml, /data-action="switch-tab"/);
+  assert.match(chatHtml, /data-tab="chat"/);
+  assert.match(chatHtml, /data-tab="agents"/);
+  assert.match(chatHtml, /data-active-tab="chat"/);
+  assert.match(chatHtml, /data-slot="timeline"/);
+  assert.ok(!chatHtml.includes('data-slot="agents-view"'));
+
+  // 2. Switch to activeTab: "agents" renders Agents Matrix View
+  const agentsHtml = renderAppShell({ ...baseModel, activeTab: "agents" });
+  assert.match(agentsHtml, /data-active-tab="agents"/);
+  assert.match(agentsHtml, /data-slot="agents-view"/);
+  assert.match(agentsHtml, /nova-agents-matrix-container/);
+  assert.match(agentsHtml, /Daemon:.*Conectado/);
+  assert.match(agentsHtml, /Tier 1: Pi Agent/);
+  assert.match(agentsHtml, /Tier 2: Antigravity CLI/);
+  assert.match(agentsHtml, /Refactorizar módulo de autenticación/);
+  assert.match(agentsHtml, /Gatekeeper pendiente/);
+
+  // 3. XSS Escaping in Agent Tasks
+  const maliciousOverview = {
+    daemonStatus: "connected",
+    poolSlots: [],
+    tasks: [
+      {
+        id: "xss",
+        title: "<script>alert('xss-title')</script>",
+        description: "<img src=x onerror=alert('xss-desc')>",
+        workspace: "~/projects/<script>",
+        tier: "tier1_pi",
+        agentName: "Agent <script>",
+        status: "running",
+        lastLog: "<b>malicious log</b>",
+      },
+    ],
+  };
+  const safeAgentsHtml = renderAgentsMatrixView({
+    ...baseModel,
+    activeTab: "agents",
+    agentsOverview: maliciousOverview,
+  });
+  assert.ok(!safeAgentsHtml.includes("<script>alert('xss-title')</script>"));
+  assert.match(safeAgentsHtml, /&lt;script&gt;alert\(&#39;xss-title&#39;\)&lt;\/script&gt;/);
+  assert.ok(!safeAgentsHtml.includes("<img src=x"));
+  assert.match(safeAgentsHtml, /&lt;img src=x/);
+
+  // 4. Controller interaction: switchTab and setAgentsFilter
+  const ctrl = new DesktopAppController();
+  assert.equal(ctrl.model.activeTab, "chat");
+  ctrl.switchTab("agents");
+  assert.equal(ctrl.model.activeTab, "agents");
+  ctrl.setAgentsFilter("running");
+  assert.equal(ctrl.model.agentsFilter, "running");
+  ctrl.switchTab("chat");
+  assert.equal(ctrl.model.activeTab, "chat");
+  ctrl.dispose();
 });
 
 

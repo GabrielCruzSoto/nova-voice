@@ -154,6 +154,35 @@ def generate_earcon_chime(sample_rate_hz: int = 16000) -> SynthesizedAudio:
     )
 
 
+def _frame_ac_rms(pcm_s16le: bytes) -> float:
+    """Compute DC-removed normalized RMS energy in [0.0, 1.0] for mono s16le PCM."""
+    sample_count = len(pcm_s16le) // 2
+    if sample_count == 0:
+        return 0.0
+    ints = struct.unpack(f"<{sample_count}h", pcm_s16le[: sample_count * 2])
+    mean = sum(ints) / sample_count
+    variance = sum((val - mean) ** 2 for val in ints) / sample_count
+    return math.sqrt(variance) / 32768.0
+
+
+def _update_noise_floor(current: float, sample_rms: float) -> float:
+    """Track ambient room noise floor via bounded EMA."""
+    clamped = min(0.08, max(0.0, sample_rms))
+    if current <= 0.0:
+        return clamped
+    return min(0.08, 0.92 * current + 0.08 * clamped)
+
+
+def _update_echo_floor(current: float, sample_rms: float) -> float:
+    """Track loudspeaker echo RMS with fast attack and slow decay during TTS."""
+    clamped = max(0.0, sample_rms)
+    if current <= 0.0:
+        return clamped
+    if clamped > current:
+        return 0.70 * current + 0.30 * clamped
+    return 0.95 * current + 0.05 * clamped
+
+
 class VoiceCoordinatorSettings(BaseModel):
     """Bounded memory, threshold, and timeout configuration for VoiceCallCoordinator."""
 
@@ -169,6 +198,11 @@ class VoiceCoordinatorSettings(BaseModel):
     call_idle_timeout_seconds: float = Field(default=180.0, gt=0.0, le=3600.0)
     allow_barge_in_during_tts: bool = True
     barge_in_grace_seconds: float = Field(default=0.35, ge=0.0, le=2.0)
+    barge_in_min_frames: int | None = Field(default=None, ge=1, le=50)
+    barge_in_echo_multiplier: float = Field(default=1.8, ge=1.0, le=10.0)
+    min_speech_rms: float = Field(default=0.0, ge=0.0, le=0.5)
+    noise_floor_multiplier: float = Field(default=2.0, ge=1.0, le=10.0)
+    speech_resume_frames: int = Field(default=2, ge=1, le=10)
     capture_retry_delay_seconds: float = Field(default=0.25, ge=0.01, le=5.0)
     enable_wake_earcon: bool = True
     ptt_mode: PttMode = "single_turn"
@@ -538,6 +572,9 @@ class VoiceCallCoordinator:
 
         if new_state == "speaking":
             self._speaking_started_at = now
+        elif prev == "speaking" and reason == "tts_playback_completed":
+            self._capture_reset_epoch += 1
+            self._vad.reset()
 
         self._session = self._session.model_copy(
             update={
@@ -641,8 +678,11 @@ class VoiceCallCoordinator:
         in_speech = False
         speech_run = 0
         silence_run = 0
+        speech_resume_run = 0
         barge_in_run = 0
         standby_speech_frames = 0
+        noise_floor_rms = 0.0
+        speaking_echo_rms = 0.0
         onset_started_at = 0.0
         barge_in_started_at = 0.0
         speech_started_at = 0.0
@@ -661,15 +701,24 @@ class VoiceCallCoordinator:
                         in_speech = False
                         speech_run = 0
                         silence_run = 0
+                        speech_resume_run = 0
                         barge_in_run = 0
                         standby_speech_frames = 0
+                        speaking_echo_rms = 0.0
 
                     state = self._session.state
                     if state == "closed":
                         return
 
+                    frame_rms = _frame_ac_rms(frame.pcm_s16le)
+                    speech_rms_floor = max(
+                        self._settings.min_speech_rms,
+                        noise_floor_rms * self._settings.noise_floor_multiplier,
+                    )
+
                     try:
                         if state == "standby":
+                            speaking_echo_rms = 0.0
                             pre_roll.append(frame.pcm_s16le)
                             det = await self._wake_word.detect(frame)
                             if det.detected:
@@ -680,13 +729,17 @@ class VoiceCallCoordinator:
                                 in_speech = False
                                 speech_run = 0
                                 silence_run = 0
+                                speech_resume_run = 0
                                 barge_in_run = 0
                                 standby_speech_frames = 0
                                 continue
 
                             standby_end_silence = min(8, self._settings.end_silence_frames)
                             prob = await self._vad.speech_probability(frame)
-                            if prob >= self._settings.speech_threshold:
+                            if (
+                                prob >= self._settings.speech_threshold
+                                and frame_rms >= speech_rms_floor
+                            ):
                                 if standby_speech_frames == 0:
                                     speech_started_at = self._clock()
                                     seeded = b"".join(pre_roll)
@@ -707,29 +760,41 @@ class VoiceCallCoordinator:
                                         frame.sample_rate_hz,
                                         speech_started_at,
                                     )
-                            elif utterance_buf:
-                                silence_run += 1
-                                if silence_run >= standby_end_silence:
-                                    if standby_speech_frames >= self._settings.min_speech_frames:
-                                        segment = bytes(utterance_buf)
-                                        self._launch_or_queue_standby_spotter(
-                                            segment,
-                                            frame.sample_rate_hz,
-                                            speech_started_at,
-                                        )
-                                    utterance_buf.clear()
-                                    standby_speech_frames = 0
-                                    silence_run = 0
+                            else:
+                                if (
+                                    prob < self._settings.speech_threshold
+                                    and not utterance_buf
+                                ):
+                                    noise_floor_rms = _update_noise_floor(
+                                        noise_floor_rms, frame_rms
+                                    )
+                                if utterance_buf:
+                                    silence_run += 1
+                                    if silence_run >= standby_end_silence:
+                                        min_frames = self._settings.min_speech_frames
+                                        if standby_speech_frames >= min_frames:
+                                            segment = bytes(utterance_buf)
+                                            self._launch_or_queue_standby_spotter(
+                                                segment,
+                                                frame.sample_rate_hz,
+                                                speech_started_at,
+                                            )
+                                        utterance_buf.clear()
+                                        standby_speech_frames = 0
+                                        silence_run = 0
                             continue
 
                         # Active call states: monitor for <100 ms barge-in
                         if state in ("speaking", "thinking", "executing"):
+                            if state != "speaking":
+                                speaking_echo_rms = 0.0
                             if state == "speaking" and not self._settings.allow_barge_in_during_tts:
                                 if (
                                     in_speech
                                     or utterance_buf
                                     or speech_run
                                     or silence_run
+                                    or speech_resume_run
                                     or barge_in_run
                                     or pre_roll
                                 ):
@@ -737,6 +802,7 @@ class VoiceCallCoordinator:
                                     utterance_buf.clear()
                                     speech_run = 0
                                     silence_run = 0
+                                    speech_resume_run = 0
                                     barge_in_run = 0
                                     pre_roll.clear()
                                     self._vad.reset()
@@ -748,6 +814,9 @@ class VoiceCallCoordinator:
                             )
                             if state == "speaking" and in_grace:
                                 if not in_speech:
+                                    speaking_echo_rms = _update_echo_floor(
+                                        speaking_echo_rms, frame_rms
+                                    )
                                     barge_in_run = 0
                                     pre_roll.clear()
                                     continue
@@ -759,9 +828,17 @@ class VoiceCallCoordinator:
                                 remaining = self._settings.max_utterance_bytes - len(utterance_buf)
                                 if remaining > 0:
                                     utterance_buf.extend(frame.pcm_s16le[:remaining])
-                                if prob >= self._settings.speech_threshold:
-                                    silence_run = 0
+                                if (
+                                    prob >= self._settings.speech_threshold
+                                    and frame_rms >= speech_rms_floor
+                                ):
+                                    speech_resume_run += 1
+                                    if speech_resume_run >= self._settings.speech_resume_frames:
+                                        silence_run = 0
+                                    else:
+                                        silence_run += 1
                                 else:
+                                    speech_resume_run = 0
                                     silence_run += 1
                                 if (
                                     silence_run >= self._settings.end_silence_frames
@@ -772,6 +849,7 @@ class VoiceCallCoordinator:
                                     in_speech = False
                                     silence_run = 0
                                     speech_run = 0
+                                    speech_resume_run = 0
                                     self._vad.reset()
                                     self._enqueue_segment(
                                         segment,
@@ -782,21 +860,40 @@ class VoiceCallCoordinator:
 
                             pre_roll.append(frame.pcm_s16le)
                             prob = await self._vad.speech_probability(frame)
-                            if prob >= self._settings.barge_in_threshold:
+                            barge_in_rms_floor = speech_rms_floor
+                            if state == "speaking":
+                                barge_in_rms_floor = max(
+                                    speech_rms_floor,
+                                    speaking_echo_rms * self._settings.barge_in_echo_multiplier,
+                                )
+                            if (
+                                prob >= self._settings.barge_in_threshold
+                                and frame_rms >= barge_in_rms_floor
+                            ):
                                 if barge_in_run == 0:
                                     barge_in_started_at = self._clock()
                                 barge_in_run += 1
                             else:
                                 barge_in_run = 0
+                                if state == "speaking":
+                                    speaking_echo_rms = _update_echo_floor(
+                                        speaking_echo_rms, frame_rms
+                                    )
 
-                            if barge_in_run >= self._settings.min_speech_frames:
+                            required_barge_in_frames = (
+                                self._settings.barge_in_min_frames
+                                or self._settings.min_speech_frames
+                            )
+                            if barge_in_run >= required_barge_in_frames:
                                 barge_in_run = 0
+                                speaking_echo_rms = 0.0
                                 await self._execute_barge_in()
                                 seen_reset_epoch = self._capture_reset_epoch
                                 in_speech = True
                                 speech_started_at = barge_in_started_at
                                 silence_run = 0
                                 speech_run = 0
+                                speech_resume_run = 0
                                 seeded = b"".join(pre_roll)
                                 pre_roll.clear()
                                 utterance_buf = bytearray(
@@ -805,12 +902,14 @@ class VoiceCallCoordinator:
                             continue
 
                         # State == "listening"
+                        speaking_echo_rms = 0.0
                         if not in_speech:
                             if self._ptt_hold_active:
                                 in_speech = True
                                 speech_started_at = self._clock()
                                 speech_run = 0
                                 silence_run = 0
+                                speech_resume_run = 0
                                 seeded = b"".join(pre_roll)
                                 pre_roll.clear()
                                 utterance_buf = bytearray(
@@ -834,18 +933,26 @@ class VoiceCallCoordinator:
 
                             pre_roll.append(frame.pcm_s16le)
                             prob = await self._vad.speech_probability(frame)
-                            if prob >= self._settings.speech_threshold:
+                            if (
+                                prob >= self._settings.speech_threshold
+                                and frame_rms >= speech_rms_floor
+                            ):
                                 if speech_run == 0:
                                     onset_started_at = now
                                 speech_run += 1
                             else:
                                 speech_run = 0
+                                if prob < self._settings.speech_threshold:
+                                    noise_floor_rms = _update_noise_floor(
+                                        noise_floor_rms, frame_rms
+                                    )
 
                             if speech_run >= self._settings.min_speech_frames:
                                 in_speech = True
                                 speech_started_at = onset_started_at
                                 speech_run = 0
                                 silence_run = 0
+                                speech_resume_run = 0
                                 seeded = b"".join(pre_roll)
                                 pre_roll.clear()
                                 utterance_buf = bytearray(
@@ -860,9 +967,17 @@ class VoiceCallCoordinator:
                             if remaining > 0:
                                 utterance_buf.extend(frame.pcm_s16le[:remaining])
 
-                            if prob >= self._settings.speech_threshold:
-                                silence_run = 0
+                            if (
+                                prob >= self._settings.speech_threshold
+                                and frame_rms >= speech_rms_floor
+                            ):
+                                speech_resume_run += 1
+                                if speech_resume_run >= self._settings.speech_resume_frames:
+                                    silence_run = 0
+                                else:
+                                    silence_run += 1
                             else:
+                                speech_resume_run = 0
                                 silence_run += 1
 
                             if (
@@ -881,6 +996,7 @@ class VoiceCallCoordinator:
                                 in_speech = False
                                 silence_run = 0
                                 speech_run = 0
+                                speech_resume_run = 0
                                 self._vad.reset()
                                 self._enqueue_segment(
                                     segment,
