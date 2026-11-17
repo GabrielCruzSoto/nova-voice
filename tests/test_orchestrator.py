@@ -6,6 +6,8 @@ import time
 from collections.abc import AsyncIterator
 from pathlib import Path
 
+import pytest
+
 from nova.adapters.workspace_resolver import LocalWorkspaceResolver
 from nova.application.orchestrator import NovaOrchestrator, OrchestratorSettings
 from nova.domain.errors import CodingRunnerError
@@ -532,4 +534,70 @@ async def test_complex_code_utterance_no_workspace_prompts_to_select_project(
     voice_evs = [e for e in events if isinstance(e, VoiceMilestoneEvent)]
     assert len(voice_evs) == 1
     assert "por favor seleccioná un proyecto" in voice_evs[0].summary_text
+
+
+async def test_nova013_ac9_clear_workspace_returns_tier1_to_conversational_home(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from nova.domain.events import WorkspaceClearedEvent
+
+    fake_home = tmp_path / "home_operador"
+    fake_home.mkdir()
+    monkeypatch.setattr(Path, "home", lambda: fake_home)
+
+    root = tmp_path / "Workspaces"
+    ws = root / "cliente-alfa"
+    (ws / "repositories" / "svc-a").mkdir(parents=True)
+    (ws / "nova-workspace.toml").write_text(
+        'schema_version = "1.0"\n[workspace]\nid = "alfa"\nname = "Alfa"\n'
+        'projects = ["repositories/svc-a"]\n',
+        encoding="utf-8",
+    )
+
+    class _AwareTier1(_FakeTier1Client):
+        def __init__(self) -> None:
+            super().__init__()
+            self.transitions: list[tuple[str, bool, tuple[str, ...]]] = []
+
+        async def switch_workspace(
+            self,
+            new_workspace_path: str,
+            *,
+            workspace_active: bool = True,
+            allowed_project_paths: tuple[str, ...] = (),
+        ) -> None:
+            self.transitions.append((new_workspace_path, workspace_active, allowed_project_paths))
+
+    bus = OrchestratorEventBus()
+    events: list[OrchestratorEvent] = []
+
+    async def collect_ev(ev: OrchestratorEvent) -> None:
+        events.append(ev)
+
+    bus.subscribe(collect_ev)
+    resolver = LocalWorkspaceResolver(allowed_roots=[root], event_bus=bus, home_dir=fake_home)
+    tier1 = _AwareTier1()
+    orch = NovaOrchestrator(
+        workspace_resolver=resolver,
+        tier1_client=tier1,
+        tier2_runner=_FakeTier2Runner(),
+        event_bus=bus,
+    )
+
+    ctx = await orch.select_workspace(str(ws), mode="exact_path")
+    assert ctx.topology == "multi-project"
+    assert tier1.transitions[-1] == (
+        str(ws.resolve()),
+        True,
+        (str((ws / "repositories" / "svc-a").resolve()),),
+    )
+
+    await orch.clear_workspace(correlation_id="corr-clear-orch")
+    assert resolver.active_context is None
+    last_path, last_active, last_projects = tier1.transitions[-1]
+    assert last_path == str(fake_home.resolve())
+    assert last_active is False
+    assert len(last_projects) == 0
+    assert any(isinstance(e, WorkspaceClearedEvent) for e in events)
 

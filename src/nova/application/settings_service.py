@@ -244,3 +244,18 @@ class SettingsService:
             )
             await asyncio.to_thread(self._store.save, updated)
             self._settings = updated
+
+    async def clear_active_workspace(self) -> None:
+        """Clear `last_active_workspace` so explicit return to `~` survives restart."""
+        async with self._lock:
+            if self._settings.general.last_active_workspace is None:
+                return
+            updated = self._settings.model_copy(
+                update={
+                    "general": self._settings.general.model_copy(
+                        update={"last_active_workspace": None}
+                    )
+                }
+            )
+            await asyncio.to_thread(self._store.save, updated)
+            self._settings = updated

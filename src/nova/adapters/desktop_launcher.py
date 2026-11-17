@@ -27,6 +27,7 @@ from nova.adapters.audio_pipewire import PipeWireAudioAdapter, PipeWireAudioSett
 from nova.adapters.config_store import TomlConfigStore, resolve_config_file_path
 from nova.adapters.control_ipc import UnixControlIpcServer
 from nova.adapters.desktop_ui_server import DesktopUiServer, DesktopUiServerSettings
+from nova.adapters.diagnostics_probes import build_live_diagnostics_service
 from nova.adapters.folder_picker_gtk import GtkFolderPickerAdapter
 from nova.adapters.gatekeeper_ipc import GatekeeperIPCConfig, UnixSocketGatekeeperServer
 from nova.adapters.pi_auditor_adapter import PiAuditorAdapter, PiAuditorConfig
@@ -42,6 +43,7 @@ from nova.application.health_diagnostics import (
     check_system_components,
     resolve_model_path,
 )
+from nova.application.live_diagnostics import LiveDiagnosticsConfig, LiveDiagnosticsService
 from nova.application.orchestrator import NovaOrchestrator, OrchestratorSettings
 from nova.application.security_gatekeeper import SecurityGatekeeper
 from nova.application.settings_service import SettingsService
@@ -170,13 +172,16 @@ async def _default_browser_spawner(*argv: str) -> BrowserProcessProtocol:
 
 
 def _default_allowed_roots() -> tuple[str, ...]:
+    home_real = Path.home().resolve()
     candidates: list[str] = []
-    proyectos = Path.home() / "Proyectos"
+    proyectos = home_real / "Proyectos"
     if proyectos.is_dir():
         candidates.append(str(proyectos.resolve()))
-    cwd = str(Path.cwd().resolve())
-    if cwd not in candidates:
-        candidates.append(cwd)
+    else:
+        candidates.append(str(proyectos))
+    cwd_real = Path.cwd().resolve()
+    if cwd_real != home_real and str(cwd_real) not in candidates:
+        candidates.append(str(cwd_real))
     return tuple(candidates)
 
 
@@ -463,9 +468,10 @@ def _resolve_initial_pi_cwd(
     allowed_roots: tuple[str, ...],
     active_workspace: WorkspaceContext | None,
 ) -> str:
+    del allowed_roots
     if active_workspace is not None:
         return active_workspace.canonical_path
-    return str(Path(allowed_roots[0]).resolve())
+    return str(Path.home().resolve())
 
 
 class NovaDesktopRuntime:
@@ -501,6 +507,7 @@ class NovaDesktopRuntime:
         self._orchestrator: NovaOrchestrator | None = None
         self._voice_coordinator: VoiceRuntimePort | None = None
         self._settings_service: SettingsService | None = None
+        self._diagnostics_service: LiveDiagnosticsService | None = None
         self._state_hub: UiStateHub | None = None
         self._ui_server: DesktopUiServer | None = None
         self._gatekeeper: SecurityGatekeeper | None = None
@@ -578,6 +585,13 @@ class NovaDesktopRuntime:
             )
         if self._orchestrator is not None:
             self._orchestrator.update_models(tier2_model=updated.models.tier2_model)
+        if self._diagnostics_service is not None:
+            self._diagnostics_service.update_config(
+                pi_provider=updated.models.pi_provider,
+                pi_model=updated.models.pi_model,
+                tier2_model=updated.models.tier2_model,
+                tts_engine_label=updated.voice.tts_engine,
+            )
 
         voice_coord = self._voice_coordinator
         if voice_coord is None:
@@ -729,6 +743,13 @@ class NovaDesktopRuntime:
                     provider=self._config.pi_provider,
                     model=self._config.pi_model,
                     workspace_path=initial_pi_cwd,
+                    workspace_active=initial_ws is not None,
+                    allowed_project_paths=(
+                        tuple(p.canonical_path for p in initial_ws.projects)
+                        if initial_ws is not None
+                        else ()
+                    ),
+                    no_session=True,
                     gatekeeper_ipc_env=ipc_env,
                 )
             )
@@ -779,21 +800,6 @@ class NovaDesktopRuntime:
 
             self._voice_coordinator = voice_coord
 
-            state_hub = UiStateHub(
-                event_bus=self._event_bus,
-                extra_secrets_provider=self._combined_extra_secrets,
-                available_workspaces_provider=workspace_resolver.list_available_workspaces,
-                call_session_provider=(
-                    (lambda: voice_coord.session) if voice_coord is not None else None
-                ),
-                initial_workspace=initial_ws,
-                initial_call_session=(
-                    voice_coord.session if voice_coord is not None else None
-                ),
-                voice_enabled=self._voice_enabled,
-            )
-            self._state_hub = state_hub
-
             initial_persisted = await asyncio.to_thread(self._config_store.load)
             settings_service = SettingsService(
                 config_store=self._config_store,
@@ -805,6 +811,46 @@ class NovaDesktopRuntime:
             )
             self._settings_service = settings_service
 
+            live_stt = getattr(voice_coord, "_stt", None) if voice_coord is not None else None
+            live_tts = getattr(voice_coord, "_tts", None) if voice_coord is not None else None
+            diagnostics_service = build_live_diagnostics_service(
+                config=LiveDiagnosticsConfig(
+                    pi_executable=self._config.pi_executable,
+                    pi_provider=self._config.pi_provider,
+                    pi_model=self._config.pi_model,
+                    agy_executable=self._config.agy_executable,
+                    tier2_model=self._config.tier2_model,
+                    tts_engine_label=self._config.tts_engine,
+                    gatekeeper_ipc_env=ipc_env,
+                ),
+                which_resolver=self._which_resolver,
+                stt_port=live_stt,
+                tts_port=live_tts,
+                extra_secrets_provider=self._combined_extra_secrets,
+            )
+            self._diagnostics_service = diagnostics_service
+
+            state_hub = UiStateHub(
+                event_bus=self._event_bus,
+                extra_secrets_provider=self._combined_extra_secrets,
+                available_workspaces_provider=workspace_resolver.list_available_workspaces,
+                workspace_entries_provider=workspace_resolver.list_workspace_entries,
+                onboarding_required_provider=lambda: (
+                    not settings_service.current_settings.general.first_run_completed
+                ),
+                process_cwd_provider=lambda: str(Path.home().resolve()),
+                allowed_roots_provider=lambda: self._config.allowed_roots,
+                call_session_provider=(
+                    (lambda: voice_coord.session) if voice_coord is not None else None
+                ),
+                initial_workspace=initial_ws,
+                initial_call_session=(
+                    voice_coord.session if voice_coord is not None else None
+                ),
+                voice_enabled=self._voice_enabled,
+            )
+            self._state_hub = state_hub
+
             ui_server = DesktopUiServer(
                 orchestrator=orchestrator,
                 state_hub=state_hub,
@@ -812,6 +858,8 @@ class NovaDesktopRuntime:
                 voice_coordinator=voice_coord,
                 folder_picker=self._folder_picker,
                 settings_service=settings_service,
+                workspace_resolver=workspace_resolver,
+                diagnostics_service=diagnostics_service,
                 health_report_provider=lambda: self._health_report,
                 shutdown_callback=self.request_shutdown,
                 settings=DesktopUiServerSettings(host="127.0.0.1", port=self._config.port),
@@ -1318,7 +1366,10 @@ def config_from_namespace(
         ws_candidate = Path(persisted.general.last_active_workspace)
         if ws_candidate.is_dir():
             resolved_candidate = ws_candidate.resolve()
-            if any(resolved_candidate.is_relative_to(Path(root).resolve()) for root in roots):
+            home_resolved = effective_home.resolve()
+            if resolved_candidate != home_resolved and any(
+                resolved_candidate.is_relative_to(Path(root).resolve()) for root in roots
+            ):
                 initial_ws = str(resolved_candidate)
 
     enable_voice = False if ns.no_voice else bool(persisted.voice.enable_voice)

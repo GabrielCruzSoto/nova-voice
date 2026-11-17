@@ -1,5 +1,5 @@
 /**
- * Frozen wire contracts mirrored 1:1 from work/NOVA-004/contract.md (nova.desktop.ui.v1 v1.3.0).
+ * Frozen wire contracts mirrored 1:1 from work/NOVA-004..NOVA-013/contract.md.
  */
 
 export type CallSessionState =
@@ -11,11 +11,13 @@ export type CallSessionState =
   | "closed";
 
 export type WorkspaceQueryMode = "exact_path" | "voice_fuzzy" | "ui_picker";
+export type WorkspaceTopology = "multi-project" | "single-repo";
 export type CommandSource = "tier1_pi" | "tier2_agy";
 export type AuditRiskLevel = "medium" | "high" | "critical";
 
 export type UiEventType =
   | "workspace_changed"
+  | "workspace_cleared"
   | "chat_stream"
   | "voice_milestone"
   | "runner_failure"
@@ -47,15 +49,27 @@ export interface UiCallSessionView {
   readonly active_correlation_id: string | null;
 }
 
+export interface UiProjectView {
+  readonly project_id: string;
+  readonly name: string;
+  readonly relative_path: string;
+  readonly canonical_path: string;
+}
+
 export interface UiWorkspaceView {
   readonly display_name: string;
   readonly canonical_path: string;
   readonly selected_via: WorkspaceQueryMode;
+  readonly topology?: WorkspaceTopology | undefined;
+  readonly projects?: readonly UiProjectView[] | undefined;
 }
 
 export interface UiWorkspaceOption {
   readonly display_name: string;
   readonly canonical_path: string;
+  readonly topology?: WorkspaceTopology | undefined;
+  readonly project_count?: number | undefined;
+  readonly projects?: readonly UiProjectView[] | undefined;
 }
 
 export interface UiApprovalItem {
@@ -86,6 +100,9 @@ export interface UiStateSnapshot {
   readonly schema_version: "1.3.0";
   readonly csrf_token: string;
   readonly voice_enabled: boolean;
+  readonly onboarding_required?: boolean | undefined;
+  readonly process_cwd?: string | undefined;
+  readonly allowed_roots?: readonly string[] | undefined;
   readonly call_session: UiCallSessionView;
   readonly active_workspace: UiWorkspaceView | null;
   readonly available_workspaces: readonly UiWorkspaceOption[];
@@ -133,6 +150,7 @@ export interface AudioDeviceCatalog {
 export interface NovaSettingsDocument {
   readonly schema_version: number;
   readonly general: {
+    readonly first_run_completed?: boolean | undefined;
     readonly remember_workspace: boolean;
     readonly last_active_workspace: string | null;
   };
@@ -161,9 +179,9 @@ export interface NovaSettingsDocument {
   readonly shortcuts: {
     readonly global_shortcut: string;
     readonly ptt_mode: PttMode;
-    readonly control_command?: string;
-    readonly desktop_environment?: string;
-    readonly auto_register_supported?: boolean;
+    readonly control_command?: string | undefined;
+    readonly desktop_environment?: string | undefined;
+    readonly auto_register_supported?: boolean | undefined;
   };
 }
 
@@ -174,7 +192,8 @@ export interface SettingsGetResponse {
 }
 
 export interface SettingsPutResponse {
-  readonly saved: boolean;
+  readonly saved?: boolean | undefined;
+  readonly status?: string | undefined;
   readonly requires_restart: boolean;
   readonly restart_fields: readonly string[];
   readonly settings: NovaSettingsDocument;
@@ -185,7 +204,61 @@ export interface ShortcutRegisterResponse {
   readonly desktop_environment: string;
   readonly shortcut: string;
   readonly command: string;
-  readonly manual_command?: string | null;
+  readonly manual_command?: string | null | undefined;
+}
+
+export interface MicDiagnosticResponse {
+  readonly ok: boolean;
+  readonly status: string;
+  readonly duration_ms: number;
+  readonly peak_level: number;
+  readonly rms_level: number;
+  readonly speech_detected: boolean;
+  readonly transcript_preview: string;
+  readonly message: string;
+}
+
+export interface AudioOutputDiagnosticResponse {
+  readonly ok: boolean;
+  readonly status: string;
+  readonly engine: string;
+  readonly latency_ms: number;
+  readonly message: string;
+}
+
+export interface PiDiagnosticResponse {
+  readonly ok: boolean;
+  readonly status: string;
+  readonly provider: string;
+  readonly model: string;
+  readonly latency_ms: number;
+  readonly message: string;
+}
+
+export interface AntigravityDiagnosticResponse {
+  readonly ok: boolean;
+  readonly status: string;
+  readonly model: string;
+  readonly plugin_verified: boolean;
+  readonly latency_ms: number;
+  readonly message: string;
+}
+
+export type DiagnosticTarget = "microphone" | "audio-output" | "pi" | "antigravity";
+
+export interface LiveDiagnosticsState {
+  readonly runningTarget: DiagnosticTarget | "all" | null;
+  readonly microphone: MicDiagnosticResponse | null;
+  readonly audioOutput: AudioOutputDiagnosticResponse | null;
+  readonly pi: PiDiagnosticResponse | null;
+  readonly antigravity: AntigravityDiagnosticResponse | null;
+}
+
+export interface InitializeWorkspaceParams {
+  readonly parentRoot: string;
+  readonly workspaceSlug: string;
+  readonly displayName?: string | undefined;
+  readonly projects: readonly string[];
 }
 
 export type AgentTaskStatus =
@@ -236,21 +309,33 @@ export interface PresentationalAppModel {
   readonly pendingApprovals: readonly UiApprovalItem[];
   readonly messages: readonly UiChatMessage[];
   readonly errorBanner: string | null;
-  readonly noticeBanner?: UiNoticeBanner | null;
+  readonly noticeBanner?: UiNoticeBanner | null | undefined;
   readonly pickerFallbackOpen: boolean;
   readonly lastMilestone: string | null;
   readonly uiMode: "panel" | "orb";
-  readonly activeTab?: "chat" | "agents";
-  readonly agentsFilter?: AgentsFilterKey;
-  readonly agentsOverview?: UiAgentsOverview;
-  readonly isStandby?: boolean;
-  readonly settingsDrawerOpen?: boolean;
-  readonly settingsLoading?: boolean;
-  readonly settingsSaving?: boolean;
-  readonly settingsData?: NovaSettingsDocument | null;
-  readonly audioDevices?: AudioDeviceCatalog | null;
-  readonly settingsNotice?: string | null;
-  readonly settingsError?: string | null;
-  readonly shortcutStatus?: ShortcutRegisterResponse | null;
-  readonly appShuttingDown?: boolean;
+  readonly activeTab?: "chat" | "agents" | undefined;
+  readonly agentsFilter?: AgentsFilterKey | undefined;
+  readonly agentsOverview?: UiAgentsOverview | undefined;
+  readonly isStandby?: boolean | undefined;
+  readonly settingsDrawerOpen?: boolean | undefined;
+  readonly settingsLoading?: boolean | undefined;
+  readonly settingsSaving?: boolean | undefined;
+  readonly settingsData?: NovaSettingsDocument | null | undefined;
+  readonly audioDevices?: AudioDeviceCatalog | null | undefined;
+  readonly settingsNotice?: string | null | undefined;
+  readonly settingsError?: string | null | undefined;
+  readonly shortcutStatus?: ShortcutRegisterResponse | null | undefined;
+  readonly appShuttingDown?: boolean | undefined;
+  readonly onboardingOpen?: boolean | undefined;
+  readonly onboardingSaving?: boolean | undefined;
+  readonly onboardingDraftAudio?:
+    | {
+        readonly captureTarget: string;
+        readonly playbackTarget: string;
+      }
+    | undefined;
+  readonly processCwd?: string | undefined;
+  readonly allowedRoots?: readonly string[] | undefined;
+  readonly initWorkspaceOpen?: boolean | undefined;
+  readonly diagnostics?: LiveDiagnosticsState | null | undefined;
 }

@@ -35,6 +35,8 @@ class PiRpcConfig(BaseModel):
     provider: str = Field(default="nvidia", min_length=1)
     model: str = Field(default=DEFAULT_PI_MODEL, min_length=1)
     workspace_path: str = Field(min_length=1)
+    workspace_active: bool = True
+    allowed_project_paths: tuple[str, ...] = ()
     no_session: bool = False
     ack_timeout_seconds: float = Field(default=5.0, gt=0.0)
     run_timeout_seconds: float = Field(default=180.0, gt=0.0)
@@ -105,16 +107,28 @@ class PiRpcClient:
             "--model",
             self._config.model,
         ]
-        if self._config.no_session:
+        if not self._config.workspace_active:
+            cmd.append("--no-tools")
+        if self._config.no_session or not self._config.workspace_active:
             cmd.append("--no-session")
         if self._config.gatekeeper_ipc_env and self._config.enable_gatekeeper_extension:
             cmd.extend(["-e", str(PI_GATEKEEPER_EXTENSION_PATH)])
 
-        child_env = (
-            {**os.environ, **self._config.gatekeeper_ipc_env}
-            if self._config.gatekeeper_ipc_env
-            else None
-        )
+        extra_env: dict[str, str] = {}
+        if self._config.gatekeeper_ipc_env:
+            extra_env.update(self._config.gatekeeper_ipc_env)
+        if (
+            self._config.gatekeeper_ipc_env
+            or not self._config.workspace_active
+            or self._config.allowed_project_paths
+        ):
+            extra_env["NOVA_WORKSPACE_ACTIVE"] = "1" if self._config.workspace_active else "0"
+            extra_env["NOVA_ALLOWED_PROJECT_PATHS"] = json.dumps(
+                list(self._config.allowed_project_paths),
+                ensure_ascii=False,
+            )
+
+        child_env = {**os.environ, **extra_env} if extra_env else None
 
         try:
             self._process = await asyncio.create_subprocess_exec(
@@ -135,13 +149,31 @@ class PiRpcClient:
         self._reader_task = asyncio.create_task(self._stdout_loop())
         self._stderr_task = asyncio.create_task(self._stderr_loop())
 
-    async def switch_workspace(self, new_workspace_path: str) -> None:
-        """Restart the RPC subprocess cleanly inside a new canonical workspace."""
-        if new_workspace_path == self._config.workspace_path and self.is_running:
+    async def switch_workspace(
+        self,
+        new_workspace_path: str,
+        *,
+        workspace_active: bool = True,
+        allowed_project_paths: tuple[str, ...] = (),
+    ) -> None:
+        """Restart the RPC subprocess cleanly inside a new isolated workspace or ~ mode."""
+        if (
+            new_workspace_path == self._config.workspace_path
+            and workspace_active == self._config.workspace_active
+            and allowed_project_paths == self._config.allowed_project_paths
+            and self.is_running
+        ):
             return
         was_running = self.is_running
         await self.close()
-        self._config = self._config.model_copy(update={"workspace_path": new_workspace_path})
+        self._config = self._config.model_copy(
+            update={
+                "workspace_path": new_workspace_path,
+                "workspace_active": workspace_active,
+                "allowed_project_paths": allowed_project_paths,
+                "no_session": True,
+            }
+        )
         if was_running:
             await self.start()
 
