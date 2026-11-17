@@ -285,6 +285,33 @@ async def test_settings_endpoints_audio_devices_and_ptt(tmp_path: Path) -> None:
         assert stat.S_IMODE(cfg_path.stat().st_mode) == 0o600
         assert len(hot_applied) == 1
 
+        # 4b. Changing whisper_device and whisper_model sets requires_restart=True
+        put_whisper_payload: dict[str, Any] = {
+            "voice": {
+                "whisper_device": "cpu",
+                "whisper_model": "base",
+            },
+        }
+        st_put_w, _, body_put_w = await _http_req(
+            srv.port,
+            "PUT",
+            "/api/settings",
+            headers={
+                "Cookie": cookie,
+                "Origin": srv.base_url,
+                "X-Nova-CSRF": csrf,
+            },
+            body=json.dumps(put_whisper_payload).encode("utf-8"),
+        )
+        assert st_put_w == 200
+        put_w_json = json.loads(body_put_w.decode("utf-8"))
+        assert put_w_json["requires_restart"] is True
+        assert set(put_w_json["restart_fields"]) == {"voice.whisper_device", "voice.whisper_model"}
+        assert put_w_json["settings"]["voice"]["whisper_device"] == "cpu"
+        assert put_w_json["settings"]["voice"]["whisper_model"] == "base"
+        assert store.load().voice.whisper_device == "cpu"
+        assert store.load().voice.whisper_model == "base"
+
         # 5. POST /api/call/ptt
         st_ptt, _, body_ptt = await _http_req(
             srv.port,

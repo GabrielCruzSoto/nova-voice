@@ -6,6 +6,8 @@
 
 import {
   escapeHtml,
+  getDefaultAgentsOverview,
+  renderAgentsMatrixView,
   renderAppShell,
   renderApprovalBanner,
   renderCallControls,
@@ -21,6 +23,7 @@ import {
   resolveHumanNotice,
 } from "./components.js";
 import type {
+  AgentsFilterKey,
   AntigravityDiagnosticResponse,
   AudioDeviceCatalog,
   AudioOutputDiagnosticResponse,
@@ -146,6 +149,9 @@ export class DesktopAppController {
     pickerFallbackOpen: false,
     lastMilestone: null,
     uiMode: "panel",
+    activeTab: "chat",
+    agentsFilter: "all",
+    agentsOverview: getDefaultAgentsOverview(),
     onboardingOpen: false,
     onboardingSaving: false,
     processCwd: "",
@@ -361,6 +367,19 @@ export class DesktopAppController {
     }
   }
 
+  switchTab(tab: "chat" | "agents"): void {
+    if (this.#disposed) {
+      return;
+    }
+    this.#updateModel({ activeTab: tab });
+  }
+
+  setAgentsFilter(filter: AgentsFilterKey): void {
+    if (this.#disposed) {
+      return;
+    }
+    this.#updateModel({ agentsFilter: filter });
+  }
   toggleInitWorkspaceForm(): void {
     if (this.#disposed) {
       return;
@@ -1232,6 +1251,18 @@ export class DesktopAppController {
       this.#shellMounted = this.#model.uiMode !== "orb";
       return;
     }
+    const activeTab = this.#model.activeTab ?? "chat";
+    const currentLayoutEl = this.#root.querySelector<HTMLElement>(".nova-layout");
+    if (currentLayoutEl) {
+      const mountedTab = currentLayoutEl.dataset["activeTab"] ?? "chat";
+      if (mountedTab !== activeTab) {
+        this.#root.innerHTML = fullHtml;
+        return;
+      }
+    }
+    const overview = this.#model.agentsOverview ?? getDefaultAgentsOverview(this.#model.activeWorkspace?.canonical_path);
+    const activeTaskCount = overview.tasks.filter((t) => t.status === "running" || t.status === "gatekeeper_blocked").length;
+
     const headerSlot = this.#root.querySelector<HTMLElement>('[data-slot="header"]');
     if (headerSlot) {
       headerSlot.innerHTML = renderWorkspaceBar(
@@ -1239,24 +1270,33 @@ export class DesktopAppController {
         this.#model.availableWorkspaces,
         this.#model.pickerFallbackOpen,
         this.#model.callSession.state,
+        activeTab,
+        activeTaskCount,
       );
     }
-    const timelineSlot = this.#root.querySelector<HTMLElement>('[data-slot="timeline"]');
-    if (timelineSlot) {
-      timelineSlot.innerHTML = renderChatTimeline(
-        this.#model.status,
-        this.#model.messages,
-        this.#model.errorBanner,
-        this.#model.activeWorkspace,
-        this.#model.availableWorkspaces,
-        Boolean(this.#model.initWorkspaceOpen),
-        this.#model.allowedRoots ?? [],
-      );
-      timelineSlot.scrollTop = timelineSlot.scrollHeight;
-    }
-    const approvalsSlot = this.#root.querySelector<HTMLElement>('[data-slot="approvals"]');
-    if (approvalsSlot) {
-      approvalsSlot.innerHTML = renderApprovalBanner(this.#model.pendingApprovals);
+    if (activeTab === "agents") {
+      const agentsSlot = this.#root.querySelector<HTMLElement>('[data-slot="agents-view"]');
+      if (agentsSlot) {
+        agentsSlot.innerHTML = renderAgentsMatrixView(this.#model);
+      }
+    } else {
+      const timelineSlot = this.#root.querySelector<HTMLElement>('[data-slot="timeline"]');
+      if (timelineSlot) {
+        timelineSlot.innerHTML = renderChatTimeline(
+          this.#model.status,
+          this.#model.messages,
+          this.#model.errorBanner,
+          this.#model.activeWorkspace,
+          this.#model.availableWorkspaces,
+          Boolean(this.#model.initWorkspaceOpen),
+          this.#model.allowedRoots ?? [],
+        );
+        timelineSlot.scrollTop = timelineSlot.scrollHeight;
+      }
+      const approvalsSlot = this.#root.querySelector<HTMLElement>('[data-slot="approvals"]');
+      if (approvalsSlot) {
+        approvalsSlot.innerHTML = renderApprovalBanner(this.#model.pendingApprovals);
+      }
     }
     const milestoneSlot = this.#root.querySelector<HTMLElement>('[data-slot="milestone"]');
     if (milestoneSlot) {
@@ -1310,6 +1350,7 @@ export class DesktopAppController {
     if (layoutEl) {
       layoutEl.dataset["uiMode"] = this.#model.uiMode ?? "panel";
       layoutEl.dataset["callState"] = this.#model.callSession.state;
+      layoutEl.dataset["activeTab"] = this.#model.activeTab ?? "chat";
     }
     const settingsSlot = this.#root.querySelector<HTMLElement>('[data-slot="settings-drawer"]');
     if (settingsSlot) {
@@ -1356,7 +1397,13 @@ export class DesktopAppController {
           return;
         }
         const action = target.dataset["action"];
-        if (action === "toggle-ui-mode") {
+        if (action === "switch-tab") {
+          const tab = (target.dataset["tab"] as "chat" | "agents") || "chat";
+          this.switchTab(tab);
+        } else if (action === "filter-agents") {
+          const filter = (target.dataset["filter"] as AgentsFilterKey) || "all";
+          this.setAgentsFilter(filter);
+        } else if (action === "toggle-ui-mode") {
           void this.toggleUiMode();
         } else if (action === "quit-app") {
           void this.quitApplication();
@@ -1534,6 +1581,8 @@ export class DesktopAppController {
               tts_speed: Number(fd.get("voice.tts_speed") ?? 1.1),
               tts_engine: String(fd.get("voice.tts_engine") ?? "kokoro"),
               whisper_language: String(fd.get("voice.whisper_language") ?? ""),
+              whisper_device: String(fd.get("voice.whisper_device") ?? "cuda"),
+              whisper_model: String(fd.get("voice.whisper_model") ?? "small"),
             },
             models: {
               pi_provider: String(fd.get("models.pi_provider") ?? "").trim(),

@@ -1692,6 +1692,204 @@ async def test_nova012_ac2_two_breath_wake_then_hola_during_spotter_flight() -> 
     await coordinator.shutdown()
 
 
+def _ac_frame(amplitude: int, ts: float = 0.0) -> AudioFrame:
+    """Build a 512-sample alternating square-wave frame with exact AC RMS == amplitude/32768."""
+    import struct
+
+    amp = max(0, min(32767, amplitude))
+    samples = [amp if idx % 2 == 0 else -amp for idx in range(512)]
+    return AudioFrame(
+        pcm_s16le=struct.pack("<512h", *samples),
+        sample_rate_hz=16000,
+        channels=1,
+        monotonic_ts=ts,
+    )
+
+
+async def test_speaker_echo_does_not_self_barge_in_but_louder_user_speech_does() -> None:
+    bus = OrchestratorEventBus()
+    audio_in = _ScriptedAudioInput()
+    audio_out = _ControlledAudioOutput(hold_playback=True)
+    vad = _FakeVad()
+    vad.default_prob = 0.90
+    stt = _FakeStt(transcripts=["para ahora"])
+    orch = _FakeOrchestrator(event_bus=bus)
+
+    coordinator = VoiceCallCoordinator(
+        audio_input=audio_in,
+        audio_output=audio_out,
+        wake_word=_FakeWakeWord(),
+        vad=vad,
+        stt=stt,
+        tts=_FakeTts(),
+        orchestrator=orch,
+        event_bus=bus,
+        settings=VoiceCoordinatorSettings(
+            min_speech_frames=2,
+            barge_in_min_frames=3,
+            end_silence_frames=2,
+            barge_in_grace_seconds=0.10,
+            barge_in_echo_multiplier=1.8,
+            min_speech_rms=0.005,
+        ),
+    )
+    await coordinator.start()
+    await coordinator.start_call()
+
+    await bus.publish(
+        VoiceMilestoneEvent(
+            correlation_id="c-echo",
+            summary_text="Respondiendo por parlantes.",
+            priority="normal",
+        )
+    )
+    await asyncio.wait_for(audio_out.started_ev.wait(), timeout=1.0)
+    assert _state_of(coordinator) == "speaking"
+
+    # Measure speaker echo during grace window (amplitude=1000 -> ac_rms ~ 0.0305)
+    for _ in range(3):
+        audio_in.push_frame(_ac_frame(1000))
+    await asyncio.sleep(0.12)
+
+    # After grace window, continued speaker echo at same level must NOT trigger barge-in
+    for _ in range(4):
+        audio_in.push_frame(_ac_frame(1000))
+    await asyncio.sleep(0.03)
+    assert _state_of(coordinator) == "speaking"
+    assert audio_out.stop_calls == 0
+
+    # Louder user speech (> 1.8x echo) for barge_in_min_frames triggers barge-in
+    for _ in range(3):
+        audio_in.push_frame(_ac_frame(3000))
+    await asyncio.sleep(0.04)
+    assert _state_of(coordinator) == "listening"
+    assert audio_out.stop_calls == 1
+
+    await coordinator.shutdown()
+
+
+async def test_ambient_noise_ignored_and_single_spike_does_not_reset_end_silence() -> None:
+    bus = OrchestratorEventBus()
+    audio_in = _ScriptedAudioInput()
+    audio_out = _ControlledAudioOutput()
+    vad = _FakeVad()
+    stt = _FakeStt(transcripts=["hola anova"])
+    orch = _FakeOrchestrator(event_bus=bus)
+
+    coordinator = VoiceCallCoordinator(
+        audio_input=audio_in,
+        audio_output=audio_out,
+        wake_word=_FakeWakeWord(),
+        vad=vad,
+        stt=stt,
+        tts=_FakeTts(),
+        orchestrator=orch,
+        event_bus=bus,
+        settings=VoiceCoordinatorSettings(
+            pre_roll_frames=2,
+            min_speech_frames=2,
+            end_silence_frames=3,
+            speech_resume_frames=2,
+            min_speech_rms=0.005,
+            noise_floor_multiplier=2.0,
+        ),
+    )
+    await coordinator.start()
+    await coordinator.start_call()
+
+    # 1. Calibrate ambient noise floor (~800 amplitude) with low VAD prob
+    vad.default_prob = 0.05
+    for _ in range(6):
+        audio_in.push_frame(_ac_frame(800))
+    await asyncio.sleep(0.02)
+
+    # 2. Ambient noise spikes in VAD prob (0.85) at same noise amplitude must be ignored
+    vad.probs = [0.85, 0.85, 0.85]
+    for _ in range(3):
+        audio_in.push_frame(_ac_frame(800))
+    await asyncio.sleep(0.03)
+    assert len(stt.captured_buffers) == 0
+
+    # 3. Real speech (amp=5000) starts turn; trailing silence with 1 spike still closes turn
+    vad.probs = [0.90, 0.90, 0.05, 0.90, 0.05]
+    audio_in.push_frame(_ac_frame(5000))
+    audio_in.push_frame(_ac_frame(5000))
+    audio_in.push_frame(_ac_frame(200))  # silence 1
+    audio_in.push_frame(_ac_frame(5000))  # 1-frame spike (< speech_resume_frames=2) -> silence 2
+    audio_in.push_frame(_ac_frame(200))  # silence 3 -> closes turn!
+    await asyncio.sleep(0.05)
+
+    assert len(stt.captured_buffers) == 1
+    assert [u[0] for u in orch.utterances] == ["hola anova"]
+    await coordinator.shutdown()
+
+
+async def test_tts_completion_clears_speaking_preroll_and_accepts_next_user_turn() -> None:
+    bus = OrchestratorEventBus()
+    audio_in = _ScriptedAudioInput()
+    audio_out = _ControlledAudioOutput(hold_playback=True)
+    vad = _FakeVad()
+    vad.default_prob = 0.05
+    stt = _FakeStt(transcripts=["segundo turno"])
+    orch = _FakeOrchestrator(event_bus=bus)
+
+    coordinator = VoiceCallCoordinator(
+        audio_input=audio_in,
+        audio_output=audio_out,
+        wake_word=_FakeWakeWord(),
+        vad=vad,
+        stt=stt,
+        tts=_FakeTts(),
+        orchestrator=orch,
+        event_bus=bus,
+        settings=VoiceCoordinatorSettings(
+            pre_roll_frames=4,
+            min_speech_frames=2,
+            end_silence_frames=2,
+            barge_in_grace_seconds=0.0,
+            barge_in_min_frames=5,
+        ),
+    )
+    await coordinator.start()
+    await coordinator.start_call()
+
+    await bus.publish(
+        VoiceMilestoneEvent(
+            correlation_id="c-1",
+            summary_text="Primera respuesta",
+            priority="normal",
+        )
+    )
+    await asyncio.wait_for(audio_out.started_ev.wait(), timeout=1.0)
+    assert _state_of(coordinator) == "speaking"
+
+    # Push 3 frames during speaking (populates pre_roll, below barge_in_min_frames=5)
+    for idx in range(3):
+        audio_in.push_frame(_ac_frame(400 + idx))
+    await asyncio.sleep(0.02)
+
+    # Complete TTS playback -> speaking -> listening should flush stale speaking pre_roll
+    audio_out.hold_playback = False
+    audio_out._stop_ev.set()
+    await asyncio.sleep(0.04)
+    assert _state_of(coordinator) == "listening"
+
+    # Now user speaks again -> should respond cleanly with only the new speech frames
+    vad.probs = [0.90, 0.90, 0.05, 0.05]
+    audio_in.push_frame(_ac_frame(4000))
+    audio_in.push_frame(_ac_frame(4000))
+    audio_in.push_frame(_ac_frame(100))
+    audio_in.push_frame(_ac_frame(100))
+    await asyncio.sleep(0.05)
+
+    assert [u[0] for u in orch.utterances] == ["segundo turno"]
+    assert len(stt.captured_buffers) == 1
+    # Only the 2 speech + 2 silence frames (4 * 1024 B), not the 3 stale speaking pre_roll frames
+    assert len(stt.captured_buffers[0]) == 4 * 1024
+    await coordinator.shutdown()
+
+
+
 
 
 

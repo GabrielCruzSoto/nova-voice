@@ -132,7 +132,11 @@ def test_missing_onnx_model_reported_with_download_remedy(
         return None
 
     config = NovaDesktopConfig(enable_voice=True)
-    report = check_system_components(config, which_resolver=audio_only_which)
+    report = check_system_components(
+        config,
+        which_resolver=audio_only_which,
+        source_root=tmp_path,
+    )
     assert report.all_ok is False
     missing_models = [c for c in report.components if c.category == "model" and not c.installed]
     assert len(missing_models) >= 4

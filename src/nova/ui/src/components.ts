@@ -5,10 +5,14 @@
  */
 
 import type {
+  AgentsFilterKey,
   AudioDeviceInfo,
   CallSessionState,
   LiveDiagnosticsState,
   PresentationalAppModel,
+  UiAgentPoolSlot,
+  UiAgentTask,
+  UiAgentsOverview,
   UiApprovalItem,
   UiChatMessage,
   UiNoticeBanner,
@@ -296,6 +300,8 @@ export function renderWorkspaceBar(
   options: readonly UiWorkspaceOption[],
   pickerFallbackOpen: boolean,
   callState: CallSessionState = "standby",
+  activeTab: "chat" | "agents" = "chat",
+  activeTaskCount: number = 0,
 ): string {
   const safeState = escapeHtml(callState);
   const stateMeta = CALL_STATE_LABELS[callState] ?? CALL_STATE_LABELS.standby;
@@ -329,6 +335,11 @@ export function renderWorkspaceBar(
     ? `<span class="workspace-fallback-hint" role="status">Selector nativo no disponible; elige un proyecto del catálogo confinado.</span>`
     : "";
 
+  const activeBadgeHtml =
+    activeTaskCount > 0
+      ? `<span class="nova-tab-badge" aria-label="${activeTaskCount} tareas activas">${activeTaskCount}</span>`
+      : "";
+
   return `
     <div class="workspace-bar">
       <div class="workspace-identity">
@@ -336,6 +347,30 @@ export function renderWorkspaceBar(
         <div data-slot="state-indicator" role="status" aria-live="polite" class="nova-state-indicator">
           <span class="nova-state-pill" data-state="${safeState}">${escapeHtml(stateMeta.title)}</span>
         </div>
+      </div>
+      <div class="nova-view-switcher" role="tablist" aria-label="Vistas principales">
+        <button
+          type="button"
+          role="tab"
+          class="nova-tab-btn ${activeTab === "chat" ? "nova-tab-btn--active" : ""}"
+          data-action="switch-tab"
+          data-tab="chat"
+          aria-selected="${activeTab === "chat" ? "true" : "false"}"
+          title="Vista de conversación y chat"
+        >
+          <span class="tab-icon" aria-hidden="true">💬</span> Chat
+        </button>
+        <button
+          type="button"
+          role="tab"
+          class="nova-tab-btn ${activeTab === "agents" ? "nova-tab-btn--active" : ""}"
+          data-action="switch-tab"
+          data-tab="agents"
+          aria-selected="${activeTab === "agents" ? "true" : "false"}"
+          title="Vista de agentes y tareas en ejecución"
+        >
+          <span class="tab-icon" aria-hidden="true">🤖</span> Agentes${activeBadgeHtml ? ` ${activeBadgeHtml}` : ""}
+        </button>
       </div>
       <div class="workspace-view-actions">
         <button
@@ -1021,6 +1056,12 @@ export function renderSettingsDrawer(model: PresentationalAppModel): string {
   const sensitivity = s?.voice.sensitivity_preset ?? "normal";
   const ttsSpeed = s?.voice.tts_speed ?? 1.1;
   const ttsEngine = s?.voice.tts_engine ?? "kokoro";
+  const whisperDevice = s?.voice.whisper_device === "cpu" ? "cpu" : "cuda";
+  const whisperModel = s?.voice.whisper_model ?? "small";
+  const knownModels = ["tiny", "base", "small", "medium"];
+  const customModelOption = !knownModels.includes(whisperModel)
+    ? `<option value="${escapeHtml(whisperModel)}" selected>${escapeHtml(whisperModel)}</option>`
+    : "";
   const whisperLang = s?.voice.whisper_language ?? "";
   const pttMode = s?.shortcuts.ptt_mode ?? "single_turn";
   const pttShortcut = s?.shortcuts.global_shortcut ?? "Super+Shift+Space";
@@ -1087,6 +1128,23 @@ export function renderSettingsDrawer(model: PresentationalAppModel): string {
               </select>
             </label>
             <label class="nova-settings-field">
+              <span>Dispositivo STT (Whisper)</span>
+              <select name="voice.whisper_device">
+                <option value="cuda"${whisperDevice === "cuda" ? " selected" : ""}>GPU (CUDA)</option>
+                <option value="cpu"${whisperDevice === "cpu" ? " selected" : ""}>CPU (Sin tarjeta gráfica)</option>
+              </select>
+            </label>
+            <label class="nova-settings-field">
+              <span>Modelo STT (Whisper)</span>
+              <select name="voice.whisper_model">
+                ${customModelOption}
+                <option value="tiny"${whisperModel === "tiny" ? " selected" : ""}>tiny (mínimo consumo CPU)</option>
+                <option value="base"${whisperModel === "base" ? " selected" : ""}>base (balanceado CPU)</option>
+                <option value="small"${whisperModel === "small" ? " selected" : ""}>small (recomendado GPU / CPU veloz)</option>
+                <option value="medium"${whisperModel === "medium" ? " selected" : ""}>medium (alta precisión)</option>
+              </select>
+            </label>
+            <label class="nova-settings-field">
               <span>Idioma Whisper (vacío = auto)</span>
               <input type="text" name="voice.whisper_language" value="${escapeHtml(whisperLang)}" placeholder="es, en, ..." maxlength="16" />
             </label>
@@ -1147,6 +1205,343 @@ export function renderSettingsDrawer(model: PresentationalAppModel): string {
   `.trim();
 }
 
+export function getDefaultAgentsOverview(activeWorkspacePath?: string | null): UiAgentsOverview {
+  const ws = activeWorkspacePath || "~/projects/nova-voice";
+  return {
+    daemonStatus: "connected",
+    daemonPid: 4812,
+    memoryMb: 174,
+    poolSlots: [
+      {
+        name: "Tier 1: Pi Agent",
+        tier: "tier1_pi",
+        activeSlots: 1,
+        maxSlots: 4,
+        status: "active",
+      },
+      {
+        name: "Tier 2: Antigravity CLI",
+        tier: "tier2_agy",
+        activeSlots: 2,
+        maxSlots: 3,
+        status: "active",
+      },
+    ],
+    tasks: [
+      {
+        id: "901",
+        title: "Refactorizar módulo de autenticación JWT a OAuth2 PKCE",
+        description: "Migrar flujos de refresh token, validadores de firma y middlewares Express sin romper clientes activos.",
+        workspace: "~/projects/ecommerce-api",
+        tier: "tier2_agy",
+        agentName: "Tier 2 • Antigravity CLI",
+        status: "running",
+        progress: 68,
+        duration: "02m 14s",
+        branch: "refactor/oauth2-pkce",
+        lastLog: "> [antigravity] patching src/auth/tokenValidator.ts (14/21 files)...",
+      },
+      {
+        id: "902",
+        title: "Ejecutar migración destructiva de esquema y limpiar tablas legacy",
+        description: "Consolidar sesiones activas en Redis Cluster y eliminar tablas relacionales obsoletas de sesiones v1.",
+        workspace: "~/projects/ecommerce-api",
+        tier: "tier2_agy",
+        agentName: "Tier 2 • Antigravity CLI",
+        status: "gatekeeper_blocked",
+        progress: 54,
+        duration: "04m 09s",
+        branch: "db/cleanup-legacy-sessions",
+        lastLog: "! [gatekeeper] Awaiting user confirmation for: DROP TABLE legacy_sessions;",
+      },
+      {
+        id: "903",
+        title: "Optimizar pipeline de captura de audio y latencia VAD en demonio local",
+        description: "Reducir buffer ring PipeWire a 10ms y vectorizar inferencia Silero VAD con instrucciones AVX2.",
+        workspace: ws,
+        tier: "tier1_pi",
+        agentName: "Tier 1 • Pi Agent",
+        status: "running",
+        progress: 42,
+        duration: "01m 05s",
+        branch: "feat/vad-low-latency",
+        lastLog: "> [pi-agent] running cargo test --package vad_engine...",
+      },
+      {
+        id: "904",
+        title: "Calibrar modelo acústico wake-word «Oye Nova» ante ruido mecánico",
+        description: "Ajustar umbral espectral y filtros pasa-altos para evitar falsos positivos durante sesiones de coding.",
+        workspace: ws,
+        tier: "tier1_pi",
+        agentName: "Tier 1 • Pi Agent",
+        status: "queued",
+        progress: 0,
+        branch: "fix/wakeword-noise-gate",
+        lastLog: "Waiting for free audio benchmark lock in workspace...",
+      },
+      {
+        id: "905",
+        title: "Generar tests unitarios para parser de eventos de telemetría",
+        description: "Cubrir casos borde de payloads corruptos, reconexión offline y compresión gzip en el SDK móvil.",
+        workspace: "~/projects/mobile-app",
+        tier: "tier1_pi",
+        agentName: "Tier 1 • Pi Agent",
+        status: "queued",
+        progress: 0,
+        branch: "chore/telemetry-tests",
+        lastLog: "Waiting for free slot in workspace lock...",
+      },
+      {
+        id: "906",
+        title: "Sincronizar esquemas Parquet e índices particionados diarios",
+        description: "Actualizar definiciones Arrow v16 y compactar particiones huérfanas en catálogo local DuckDB.",
+        workspace: "~/projects/data-pipeline",
+        tier: "tier1_pi",
+        agentName: "Tier 1 • Pi Agent",
+        status: "completed",
+        progress: 100,
+        duration: "18.4s",
+        branch: "main",
+        lastLog: "✓ Completed in 18.4s • 4 files modified, 12 tests passed",
+      },
+    ],
+  };
+}
+
+const TASK_STATUS_META: Readonly<Record<string, { label: string; icon: string; cssClass: string }>> = {
+  running: {
+    label: "En ejecución",
+    icon: "⟳",
+    cssClass: "status--running",
+  },
+  gatekeeper_blocked: {
+    label: "Gatekeeper pendiente",
+    icon: "⚠",
+    cssClass: "status--gatekeeper",
+  },
+  queued: {
+    label: "En cola",
+    icon: "⏳",
+    cssClass: "status--queued",
+  },
+  completed: {
+    label: "Completada",
+    icon: "✓",
+    cssClass: "status--completed",
+  },
+  failed: {
+    label: "Falló",
+    icon: "✕",
+    cssClass: "status--failed",
+  },
+};
+
+export function renderAgentsMatrixView(model: PresentationalAppModel): string {
+  const overview = model.agentsOverview ?? getDefaultAgentsOverview(model.activeWorkspace?.canonical_path);
+  const activeFilter: AgentsFilterKey = model.agentsFilter ?? "all";
+
+  const allTasks = overview.tasks;
+  const runningTasks = allTasks.filter((t) => t.status === "running");
+  const gatekeeperTasks = allTasks.filter((t) => t.status === "gatekeeper_blocked");
+  const queuedTasks = allTasks.filter((t) => t.status === "queued");
+  const completedTasks = allTasks.filter((t) => t.status === "completed");
+
+  const filteredTasks = allTasks.filter((task) => {
+    if (activeFilter === "running") return task.status === "running";
+    if (activeFilter === "gatekeeper") return task.status === "gatekeeper_blocked";
+    if (activeFilter === "queued") return task.status === "queued";
+    if (activeFilter === "completed") return task.status === "completed";
+    return true;
+  });
+
+  const slotsHtml = overview.poolSlots
+    .map((slot) => {
+      const isFull = slot.activeSlots >= slot.maxSlots;
+      const tierLabel = slot.tier === "tier1_pi" ? "Tier 1: Tareas Rápidas" : "Tier 2: Refactor Profundo";
+      const pct = slot.maxSlots > 0 ? Math.round((slot.activeSlots / slot.maxSlots) * 100) : 0;
+      return `
+        <div class="nova-agent-slot-card" data-tier="${escapeHtml(slot.tier)}">
+          <div class="nova-agent-slot-header">
+            <span class="nova-agent-slot-name">${escapeHtml(slot.name)}</span>
+            <span class="nova-agent-slot-badge ${slot.activeSlots > 0 ? "badge--active" : "badge--idle"}">
+              ${slot.activeSlots > 0 ? "Activo" : "En espera"}
+            </span>
+          </div>
+          <div class="nova-agent-slot-meta">
+            <span class="nova-agent-slot-desc">${escapeHtml(tierLabel)}</span>
+            <span class="nova-agent-slot-count ${isFull ? "count--full" : ""}">${slot.activeSlots}/${slot.maxSlots} slots</span>
+          </div>
+          <div class="nova-agent-slot-bar-track">
+            <div class="nova-agent-slot-bar-fill" style="width: ${pct}%"></div>
+          </div>
+        </div>
+      `;
+    })
+    .join("");
+
+  const tasksListHtml =
+    filteredTasks.length === 0
+      ? `
+        <div class="nova-agents-empty" role="status">
+          <div class="nova-empty-icon" aria-hidden="true">🤖</div>
+          <p class="nova-empty-title">No hay tareas en esta categoría</p>
+          <p class="nova-empty-subtitle">Puedes solicitar una tarea por voz o texto usando la barra inferior para que los agentes comiencen a ejecutarla en segundo plano.</p>
+        </div>
+      `
+      : filteredTasks
+          .map((task) => {
+            const meta = TASK_STATUS_META[task.status] ?? TASK_STATUS_META["queued"]!;
+            const isBlocked = task.status === "gatekeeper_blocked";
+            const progress = typeof task.progress === "number" ? task.progress : 0;
+            const branchHtml = task.branch
+              ? `<span class="task-badge task-badge--branch" title="Rama git"><span class="badge-icon">🌿</span> ${escapeHtml(task.branch)}</span>`
+              : "";
+            const durationHtml = task.duration
+              ? `<span class="task-badge task-badge--time"><span class="badge-icon">⏱</span> ${escapeHtml(task.duration)}${task.status === "running" ? ` • ${progress}%` : ""}</span>`
+              : "";
+            const logHtml = task.lastLog
+              ? `
+                <div class="nova-task-log-row" title="Registro de actividad en streaming">
+                  <code>${escapeHtml(task.lastLog)}</code>
+                </div>
+              `
+              : "";
+
+            const actionsHtml = isBlocked
+              ? `
+                <div class="nova-task-actions">
+                  <button type="button" class="btn btn--primary btn--compact" data-action="approve-task" data-task-id="${escapeHtml(task.id)}">Aprobar</button>
+                  <button type="button" class="btn btn--ghost btn--compact" data-action="inspect-task" data-task-id="${escapeHtml(task.id)}">Ver detalles</button>
+                  <button type="button" class="btn btn--reject btn--compact" data-action="cancel-task" data-task-id="${escapeHtml(task.id)}">Rechazar</button>
+                </div>
+              `
+              : `
+                <div class="nova-task-actions">
+                  <button type="button" class="btn btn--ghost btn--compact" data-action="inspect-task" data-task-id="${escapeHtml(task.id)}">Ver detalles</button>
+                  ${
+                    task.status === "running"
+                      ? `<button type="button" class="btn btn--ghost btn--compact" data-action="pause-task" data-task-id="${escapeHtml(task.id)}">Pausar</button>`
+                      : ""
+                  }
+                  ${
+                    task.status === "running" || task.status === "queued"
+                      ? `<button type="button" class="btn btn--reject btn--compact" data-action="cancel-task" data-task-id="${escapeHtml(task.id)}">Cancelar</button>`
+                      : ""
+                  }
+                </div>
+              `;
+
+            return `
+              <article class="nova-task-card ${meta.cssClass}" data-task-id="${escapeHtml(task.id)}" data-task-status="${escapeHtml(task.status)}">
+                <div class="nova-task-card-header">
+                  <div class="nova-task-title-group">
+                    <span class="nova-task-id">#tsk-${escapeHtml(task.id)}</span>
+                    <h3 class="nova-task-title">${escapeHtml(task.title)}</h3>
+                  </div>
+                  <span class="nova-task-status-pill ${meta.cssClass}">
+                    <span class="status-icon" aria-hidden="true">${meta.icon}</span>
+                    <span>${escapeHtml(meta.label)}</span>
+                  </span>
+                </div>
+
+                ${task.description ? `<p class="nova-task-desc">${escapeHtml(task.description)}</p>` : ""}
+
+                <div class="nova-task-badges-row">
+                  <span class="task-badge task-badge--workspace" title="Espacio de trabajo">
+                    <span class="badge-icon">📁</span> ${escapeHtml(task.workspace)}
+                  </span>
+                  <span class="task-badge task-badge--agent" title="Agente asignado">
+                    <span class="badge-icon">🤖</span> ${escapeHtml(task.agentName)}
+                  </span>
+                  ${branchHtml}
+                  ${durationHtml}
+                </div>
+
+                ${
+                  task.status === "running"
+                    ? `
+                      <div class="nova-task-progress-track">
+                        <div class="nova-task-progress-fill" style="width: ${progress}%"></div>
+                      </div>
+                    `
+                    : ""
+                }
+
+                ${logHtml}
+                ${actionsHtml}
+              </article>
+            `;
+          })
+          .join("");
+
+  return `
+    <div class="nova-agents-matrix-container">
+      <section class="nova-agents-system-bar" aria-label="Estado del servicio en segundo plano">
+        <div class="nova-daemon-indicator">
+          <span class="nova-daemon-pulse" aria-hidden="true"></span>
+          <span class="nova-daemon-label">Daemon: <strong>Conectado</strong></span>
+          <span class="nova-daemon-sub">PID ${overview.daemonPid ?? 4812} • ${overview.memoryMb ?? 174} MB en uso</span>
+        </div>
+        <div class="nova-agent-slots-grid">
+          ${slotsHtml}
+        </div>
+      </section>
+
+      <section class="nova-agents-filter-bar" role="toolbar" aria-label="Filtro de tareas">
+        <button
+          type="button"
+          class="nova-filter-pill ${activeFilter === "all" ? "nova-filter-pill--active" : ""}"
+          data-action="filter-agents"
+          data-filter="all"
+          aria-pressed="${activeFilter === "all" ? "true" : "false"}"
+        >
+          Todas <span class="filter-count">${allTasks.length}</span>
+        </button>
+        <button
+          type="button"
+          class="nova-filter-pill ${activeFilter === "running" ? "nova-filter-pill--active" : ""}"
+          data-action="filter-agents"
+          data-filter="running"
+          aria-pressed="${activeFilter === "running" ? "true" : "false"}"
+        >
+          En ejecución <span class="filter-count">${runningTasks.length}</span>
+        </button>
+        <button
+          type="button"
+          class="nova-filter-pill ${activeFilter === "gatekeeper" ? "nova-filter-pill--active" : ""}"
+          data-action="filter-agents"
+          data-filter="gatekeeper"
+          aria-pressed="${activeFilter === "gatekeeper" ? "true" : "false"}"
+        >
+          Gatekeeper <span class="filter-count">${gatekeeperTasks.length}</span>
+        </button>
+        <button
+          type="button"
+          class="nova-filter-pill ${activeFilter === "queued" ? "nova-filter-pill--active" : ""}"
+          data-action="filter-agents"
+          data-filter="queued"
+          aria-pressed="${activeFilter === "queued" ? "true" : "false"}"
+        >
+          En cola <span class="filter-count">${queuedTasks.length}</span>
+        </button>
+        <button
+          type="button"
+          class="nova-filter-pill ${activeFilter === "completed" ? "nova-filter-pill--active" : ""}"
+          data-action="filter-agents"
+          data-filter="completed"
+          aria-pressed="${activeFilter === "completed" ? "true" : "false"}"
+        >
+          Completadas <span class="filter-count">${completedTasks.length}</span>
+        </button>
+      </section>
+
+      <section class="nova-tasks-grid" aria-label="Listado de tareas concurrentes">
+        ${tasksListHtml}
+      </section>
+    </div>
+  `.trim();
+}
+
 export function renderAppShell(model: PresentationalAppModel): string {
   const uiMode = model.uiMode ?? "panel";
   const inCall = isActiveCallState(model.callSession.state);
@@ -1186,32 +1581,42 @@ export function renderAppShell(model: PresentationalAppModel): string {
     `.trim();
   }
 
+  const activeTab = model.activeTab ?? "chat";
+  const overview = model.agentsOverview ?? getDefaultAgentsOverview(model.activeWorkspace?.canonical_path);
+  const activeTaskCount = overview.tasks.filter((t) => t.status === "running" || t.status === "gatekeeper_blocked").length;
+
   const milestoneHtml = model.lastMilestone
     ? `<p class="nova-milestone-toast" aria-live="polite">${escapeHtml(model.lastMilestone)}</p>`
     : "";
 
   return `
-    <div class="nova-layout" data-ui-mode="panel" data-call-state="${escapeHtml(model.callSession.state)}">
+    <div class="nova-layout" data-ui-mode="panel" data-call-state="${escapeHtml(model.callSession.state)}" data-active-tab="${activeTab}">
       <header class="nova-header" data-slot="header">
-        ${renderWorkspaceBar(model.activeWorkspace, model.availableWorkspaces, model.pickerFallbackOpen, model.callSession.state)}
+        ${renderWorkspaceBar(model.activeWorkspace, model.availableWorkspaces, model.pickerFallbackOpen, model.callSession.state, activeTab, activeTaskCount)}
       </header>
 
-      <main class="nova-main" aria-label="Historial de conversación y aprobaciones">
-        <div class="nova-timeline-scroll" data-slot="timeline">
-          ${renderChatTimeline(
-            model.status,
-            model.messages,
-            model.errorBanner,
-            model.activeWorkspace,
-            model.availableWorkspaces,
-            Boolean(model.initWorkspaceOpen),
-            model.allowedRoots ?? [],
-          )}
-        </div>
+      <main class="nova-main" aria-label="${activeTab === "agents" ? "Matriz de agentes y tareas concurrentes" : "Historial de conversación y aprobaciones"}">
+        ${
+          activeTab === "agents"
+            ? `<div class="nova-agents-scroll" data-slot="agents-view">${renderAgentsMatrixView(model)}</div>`
+            : `
+              <div class="nova-timeline-scroll" data-slot="timeline">
+                ${renderChatTimeline(
+                  model.status,
+                  model.messages,
+                  model.errorBanner,
+                  model.activeWorkspace,
+                  model.availableWorkspaces,
+                  Boolean(model.initWorkspaceOpen),
+                  model.allowedRoots ?? [],
+                )}
+              </div>
 
-        <div class="nova-approvals-slot" data-slot="approvals">
-          ${renderApprovalBanner(model.pendingApprovals)}
-        </div>
+              <div class="nova-approvals-slot" data-slot="approvals">
+                ${renderApprovalBanner(model.pendingApprovals)}
+              </div>
+            `
+        }
 
         <div data-slot="milestone" aria-live="polite">${milestoneHtml}</div>
 

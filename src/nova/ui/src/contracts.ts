@@ -261,6 +261,45 @@ export interface InitializeWorkspaceParams {
   readonly projects: readonly string[];
 }
 
+export type AgentTaskStatus =
+  | "running"
+  | "queued"
+  | "completed"
+  | "gatekeeper_blocked"
+  | "failed";
+
+export type AgentsFilterKey = "all" | "running" | "gatekeeper" | "queued" | "completed";
+
+export interface UiAgentTask {
+  readonly id: string;
+  readonly title: string;
+  readonly description?: string;
+  readonly workspace: string;
+  readonly tier: "tier1_pi" | "tier2_agy";
+  readonly agentName: string;
+  readonly status: AgentTaskStatus;
+  readonly progress?: number;
+  readonly duration?: string;
+  readonly lastLog?: string;
+  readonly branch?: string;
+}
+
+export interface UiAgentPoolSlot {
+  readonly name: string;
+  readonly tier: "tier1_pi" | "tier2_agy";
+  readonly activeSlots: number;
+  readonly maxSlots: number;
+  readonly status: "active" | "idle";
+}
+
+export interface UiAgentsOverview {
+  readonly daemonStatus: "connected" | "disconnected";
+  readonly daemonPid?: number;
+  readonly memoryMb?: number;
+  readonly poolSlots: readonly UiAgentPoolSlot[];
+  readonly tasks: readonly UiAgentTask[];
+}
+
 export interface PresentationalAppModel {
   readonly status: ViewStatus;
   readonly voiceEnabled: boolean;
@@ -274,6 +313,9 @@ export interface PresentationalAppModel {
   readonly pickerFallbackOpen: boolean;
   readonly lastMilestone: string | null;
   readonly uiMode: "panel" | "orb";
+  readonly activeTab?: "chat" | "agents" | undefined;
+  readonly agentsFilter?: AgentsFilterKey | undefined;
+  readonly agentsOverview?: UiAgentsOverview | undefined;
   readonly isStandby?: boolean | undefined;
   readonly settingsDrawerOpen?: boolean | undefined;
   readonly settingsLoading?: boolean | undefined;
