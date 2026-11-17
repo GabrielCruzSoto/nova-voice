@@ -1079,6 +1079,28 @@ export function renderSettingsDrawer(model) {
   `.trim();
 }
 export function getDefaultAgentsOverview(activeWorkspacePath) {
+    return {
+        daemonStatus: "connected",
+        poolSlots: [
+            {
+                name: "Tier 1: Pi Agent",
+                tier: "tier1_pi",
+                activeSlots: 0,
+                maxSlots: 4,
+                status: "idle",
+            },
+            {
+                name: "Tier 2: Antigravity CLI",
+                tier: "tier2_agy",
+                activeSlots: 0,
+                maxSlots: 3,
+                status: "idle",
+            },
+        ],
+        tasks: [],
+    };
+}
+export function getMockAgentsOverview(activeWorkspacePath) {
     const ws = activeWorkspacePath || "~/projects/nova-voice";
     return {
         daemonStatus: "connected",

@@ -7,6 +7,7 @@ import { fileURLToPath } from "node:url";
 import {
   escapeHtml,
   getDefaultAgentsOverview,
+  getMockAgentsOverview,
   renderAgentsMatrixView,
   renderAppShell,
   renderApprovalBanner,
@@ -2291,7 +2292,7 @@ test("NOVA-014: View switcher tabs in Header, Agents Matrix rendering, and Contr
   assert.match(chatHtml, /data-slot="timeline"/);
   assert.ok(!chatHtml.includes('data-slot="agents-view"'));
 
-  // 2. Switch to activeTab: "agents" renders Agents Matrix View
+  // 2. Switch to activeTab: "agents" renders Agents Matrix View (empty by default)
   const agentsHtml = renderAppShell({ ...baseModel, activeTab: "agents" });
   assert.match(agentsHtml, /data-active-tab="agents"/);
   assert.match(agentsHtml, /data-slot="agents-view"/);
@@ -2299,8 +2300,16 @@ test("NOVA-014: View switcher tabs in Header, Agents Matrix rendering, and Contr
   assert.match(agentsHtml, /Daemon:.*Conectado/);
   assert.match(agentsHtml, /Tier 1: Pi Agent/);
   assert.match(agentsHtml, /Tier 2: Antigravity CLI/);
-  assert.match(agentsHtml, /Refactorizar módulo de autenticación/);
-  assert.match(agentsHtml, /Gatekeeper pendiente/);
+  assert.match(agentsHtml, /No hay tareas en esta categoría/);
+
+  // 2b. When tasks are present, renders task cards and gatekeeper actions
+  const agentsWithTasksHtml = renderAppShell({
+    ...baseModel,
+    activeTab: "agents",
+    agentsOverview: getMockAgentsOverview(),
+  });
+  assert.match(agentsWithTasksHtml, /Refactorizar módulo de autenticación/);
+  assert.match(agentsWithTasksHtml, /Gatekeeper pendiente/);
 
   // 3. XSS Escaping in Agent Tasks
   const maliciousOverview = {
