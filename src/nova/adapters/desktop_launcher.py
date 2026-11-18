@@ -33,6 +33,7 @@ from nova.adapters.gatekeeper_ipc import GatekeeperIPCConfig, UnixSocketGatekeep
 from nova.adapters.pi_auditor_adapter import PiAuditorAdapter, PiAuditorConfig
 from nova.adapters.pi_rpc_client import PiRpcClient, PiRpcConfig
 from nova.adapters.shortcut_registrar import LinuxShortcutRegistrar
+from nova.adapters.sqlite_history_store import SqliteHistoryStore
 from nova.adapters.stt_faster_whisper import FasterWhisperSettings, FasterWhisperSttAdapter
 from nova.adapters.tts_local_onnx import LocalOnnxTtsAdapter, LocalOnnxTtsSettings
 from nova.adapters.vad_silero import SileroVadAdapter, SileroVadSettings
@@ -71,7 +72,7 @@ from nova.domain.models import (
     TtsEngineChoice,
     WorkspaceContext,
 )
-from nova.domain.ports import FolderPickerPort
+from nova.domain.ports import FolderPickerPort, HistoryStorePort
 
 logger = logging.getLogger("nova.desktop_launcher")
 
@@ -482,6 +483,7 @@ class NovaDesktopRuntime:
         config: NovaDesktopConfig | None = None,
         *,
         folder_picker: FolderPickerPort | None = None,
+        history_store: HistoryStorePort | None = None,
         voice_factory: VoiceRuntimeFactory | None = None,
         browser_spawner: BrowserSpawner = _default_browser_spawner,
         which_resolver: WhichResolver = shutil.which,
@@ -489,6 +491,7 @@ class NovaDesktopRuntime:
     ) -> None:
         self._config = config or NovaDesktopConfig()
         self._folder_picker = folder_picker or GtkFolderPickerAdapter()
+        self._history_store: HistoryStorePort | None = history_store or SqliteHistoryStore()
         self._voice_factory: VoiceRuntimeFactory = voice_factory or build_default_voice_coordinator
         self._browser_spawner = browser_spawner
         self._which_resolver = which_resolver
@@ -749,7 +752,7 @@ class NovaDesktopRuntime:
                         if initial_ws is not None
                         else ()
                     ),
-                    no_session=True,
+                    no_session=not (initial_ws is not None),
                     gatekeeper_ipc_env=ipc_env,
                 )
             )
@@ -768,6 +771,7 @@ class NovaDesktopRuntime:
                 event_bus=self._event_bus,
                 settings=OrchestratorSettings(default_tier2_model=self._config.tier2_model),
                 security_gatekeeper=gatekeeper,
+                history_store=self._history_store,
             )
             self._orchestrator = orchestrator
 
@@ -847,9 +851,29 @@ class NovaDesktopRuntime:
                 initial_call_session=(
                     voice_coord.session if voice_coord is not None else None
                 ),
+                history_store=self._history_store,
                 voice_enabled=self._voice_enabled,
             )
             self._state_hub = state_hub
+            await state_hub.hydrate_history()
+
+            if initial_ws is not None and self._history_store is not None:
+                pointer = await self._history_store.get_session_pointer(initial_ws.canonical_path)
+                if pointer is not None:
+                    if pointer.agy_conversation_id:
+                        orchestrator._tier2_conversations[initial_ws.canonical_path] = (
+                            pointer.agy_conversation_id
+                        )
+                    if pointer.pi_session_id:
+                        await pi_client.switch_workspace(
+                            initial_ws.canonical_path,
+                            workspace_active=True,
+                            allowed_project_paths=tuple(
+                                p.canonical_path for p in initial_ws.projects
+                            ),
+                            session_id=pointer.pi_session_id,
+                            no_session=False,
+                        )
 
             ui_server = DesktopUiServer(
                 orchestrator=orchestrator,
@@ -953,6 +977,11 @@ class NovaDesktopRuntime:
             with contextlib.suppress(Exception):
                 await self._ipc_server.close()
             self._ipc_server = None
+
+        if self._history_store is not None:
+            with contextlib.suppress(Exception):
+                await self._history_store.close()
+            self._history_store = None
 
         self._started = False
 

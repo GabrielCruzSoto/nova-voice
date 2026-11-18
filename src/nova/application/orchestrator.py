@@ -8,11 +8,12 @@ import inspect
 import json
 import logging
 import re
+import time
 import uuid
 import weakref
 from collections.abc import AsyncIterator
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -33,9 +34,11 @@ from nova.domain.models import (
     ResolveWorkspaceRequest,
     WorkspaceContext,
     WorkspaceQueryMode,
+    WorkspaceSessionPointer,
 )
 from nova.domain.ports import (
     CodingRunnerPort,
+    HistoryStorePort,
     SecurityGatekeeperPort,
     Tier1ConversationPort,
     WorkspaceResolverPort,
@@ -142,6 +145,7 @@ class NovaOrchestrator:
         event_bus: OrchestratorEventBus,
         settings: OrchestratorSettings | None = None,
         security_gatekeeper: SecurityGatekeeperPort | None = None,
+        history_store: HistoryStorePort | None = None,
     ) -> None:
         self._workspace_resolver = workspace_resolver
         self._tier1_client = tier1_client
@@ -149,6 +153,7 @@ class NovaOrchestrator:
         self._event_bus = event_bus
         self._settings = settings or OrchestratorSettings()
         self._security_gatekeeper = security_gatekeeper
+        self._history_store = history_store
         self._tier2_conversations: dict[str, str] = {}
         self._turn_lock = asyncio.Lock()
         self._active_turn_task: asyncio.Task[None] | None = None
@@ -178,16 +183,17 @@ class NovaOrchestrator:
         *,
         workspace_active: bool,
         allowed_project_paths: tuple[str, ...],
+        session_id: str | None = None,
     ) -> None:
         sig = inspect.signature(self._tier1_client.switch_workspace)
+        kwargs: dict[str, Any] = {}
         if "workspace_active" in sig.parameters:
-            await self._tier1_client.switch_workspace(  # type: ignore[call-arg]
-                target_path,
-                workspace_active=workspace_active,
-                allowed_project_paths=allowed_project_paths,
-            )
-        else:
-            await self._tier1_client.switch_workspace(target_path)
+            kwargs["workspace_active"] = workspace_active
+        if "allowed_project_paths" in sig.parameters:
+            kwargs["allowed_project_paths"] = allowed_project_paths
+        if "session_id" in sig.parameters:
+            kwargs["session_id"] = session_id
+        await self._tier1_client.switch_workspace(target_path, **kwargs)
 
     async def select_workspace(
         self,
@@ -205,11 +211,25 @@ class NovaOrchestrator:
                     mode=mode,
                 )
             )
+
+            # Query session pointer from history store for continuity (NOVA-015)
+            pi_session_id: str | None = None
+            if self._history_store is not None:
+                pointer = await self._history_store.get_session_pointer(context.canonical_path)
+                if pointer is not None:
+                    if pointer.agy_conversation_id:
+                        self._tier2_conversations[context.canonical_path] = (
+                            pointer.agy_conversation_id
+                        )
+                    if pointer.pi_session_id:
+                        pi_session_id = pointer.pi_session_id
+
             project_paths = tuple(p.canonical_path for p in context.projects)
             await self._switch_tier1_context(
                 context.canonical_path,
                 workspace_active=True,
                 allowed_project_paths=project_paths,
+                session_id=pi_session_id,
             )
             self._log(
                 "workspace_selected",
@@ -446,6 +466,21 @@ class NovaOrchestrator:
                 )
 
         joined = "".join(collected)
+        active_ws = self._workspace_resolver.active_context
+        if self._history_store is not None and active_ws is not None:
+            get_sess_fn = getattr(self._tier1_client, "get_session_id", None)
+            if callable(get_sess_fn):
+                res = get_sess_fn()
+                sess_id = await res if inspect.isawaitable(res) else res
+                if sess_id:
+                    await self._history_store.save_session_pointer(
+                        WorkspaceSessionPointer(
+                            workspace_canonical_path=active_ws.canonical_path,
+                            pi_session_id=sess_id,
+                            updated_at=time.time(),
+                        )
+                    )
+
         await self._event_bus.publish(
             VoiceMilestoneEvent(
                 correlation_id=correlation_id,
@@ -491,6 +526,14 @@ class NovaOrchestrator:
             async for progress in stream:
                 if progress.conversation_id and progress.conversation_id != "unknown":
                     self._tier2_conversations[workspace_path] = progress.conversation_id
+                    if self._history_store is not None:
+                        await self._history_store.save_session_pointer(
+                            WorkspaceSessionPointer(
+                                workspace_canonical_path=workspace_path,
+                                agy_conversation_id=progress.conversation_id,
+                                updated_at=time.time(),
+                            )
+                        )
 
                 if progress.kind == "delta" and progress.text_delta:
                     redacted_delta = self._redact(progress.text_delta)

@@ -9,6 +9,7 @@ import uuid
 from collections import OrderedDict, deque
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
@@ -35,6 +36,7 @@ from nova.domain.models import (
     CallSession,
     CallSessionState,
     CommandSource,
+    PersistedChatMessage,
     WorkspaceCatalogEntry,
     WorkspaceContext,
     WorkspaceProject,
@@ -42,6 +44,7 @@ from nova.domain.models import (
     WorkspaceTopology,
     utc_now_iso,
 )
+from nova.domain.ports import HistoryStorePort
 
 MAX_SINGLE_MESSAGE_CHARS = 65_536
 
@@ -265,11 +268,13 @@ class UiStateHub:
         call_session_provider: Callable[[], CallSession] | None = None,
         initial_workspace: WorkspaceContext | None = None,
         initial_call_session: CallSession | None = None,
+        history_store: HistoryStorePort | None = None,
         voice_enabled: bool = False,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self._event_bus = event_bus
         self._settings = settings or UiHubSettings()
+        self._history_store = history_store
         self._extra_secrets_provider = extra_secrets_provider
         self._available_workspaces_provider = available_workspaces_provider
         self._workspace_entries_provider = workspace_entries_provider
@@ -332,6 +337,67 @@ class UiStateHub:
             self._started = True
             self._event_bus.subscribe(self._on_event)
 
+    async def hydrate_history(self) -> None:
+        """Preload bounded historical chat messages from persistent SQLite store (NOVA-015)."""
+        if self._history_store is None:
+            return
+        ws_path = self._active_workspace.canonical_path if self._active_workspace else None
+        persisted = await self._history_store.get_recent_messages(
+            limit=self._settings.max_messages,
+            workspace_path=ws_path,
+        )
+        for p in persisted:
+            if p.message_id not in self._message_index:
+                role: UiMessageRole = "user" if p.source in ("user", "voice") else "assistant"
+                if p.source == "error":
+                    role = "system"
+                modality: UiMessageModality = "text"
+                if p.source == "voice":
+                    modality = "voice"
+                elif p.source == "tier1_pi":
+                    modality = "tier1_pi"
+                elif p.source == "tier2_runner":
+                    modality = "tier2_runner"
+                elif p.source == "error":
+                    modality = "error"
+                ts = datetime.fromtimestamp(p.created_at, UTC).isoformat()
+                record = _MutableChatRecord(
+                    message_id=p.message_id,
+                    correlation_id=p.correlation_id,
+                    role=role,
+                    modality=modality,
+                    step_type=p.step_type,
+                    content=p.content,
+                    timestamp=ts,
+                    streaming=False,
+                )
+                self._append_record(record)
+
+    def _persist_record_bg(self, record: _MutableChatRecord) -> None:
+        if self._history_store is None:
+            return
+        ws_path = self._active_workspace.canonical_path if self._active_workspace else None
+        source_val = (
+            record.modality
+            if record.role != "user"
+            else ("voice" if record.modality == "voice" else "user")
+        )
+        p_msg = PersistedChatMessage(
+            message_id=record.message_id,
+            correlation_id=record.correlation_id,
+            source=source_val,
+            step_type=record.step_type,
+            content=record.content,
+            created_at=time.time(),
+            workspace_path=ws_path,
+        )
+        try:
+            loop = asyncio.get_running_loop()
+            loop.create_task(self._history_store.append_message(p_msg))
+        except RuntimeError:
+            pass
+
+
     def close(self) -> None:
         """Unsubscribe from OrchestratorEventBus and clear SSE subscribers."""
         if self._started:
@@ -390,7 +456,9 @@ class UiStateHub:
         for key in stale_keys:
             msg_id = self._active_streams.pop(key, None)
             if msg_id is not None and msg_id in self._message_index:
-                self._message_index[msg_id].streaming = False
+                rec = self._message_index[msg_id]
+                rec.streaming = False
+                self._persist_record_bg(rec)
 
     def _fanout(self, item: SseOutboundItem) -> None:
         for sub in list(self._subscribers.values()):
@@ -415,6 +483,7 @@ class UiStateHub:
             streaming=False,
         )
         self._append_record(record)
+        self._persist_record_bg(record)
         self._fanout(SseOutboundItem(kind="resync_snapshot"))
         return record.to_dto()
 
@@ -590,6 +659,7 @@ class UiStateHub:
                 streaming=False,
             )
             self._append_record(rec)
+            self._persist_record_bg(rec)
             self._emit_envelope(
                 seq=seq,
                 event_type="voice_transcription",
@@ -636,6 +706,7 @@ class UiStateHub:
                 streaming=False,
             )
             self._append_record(rec)
+            self._persist_record_bg(rec)
             self._emit_envelope(
                 seq=seq,
                 event_type="runner_failure",

@@ -315,6 +315,7 @@ async def test_nova013_ac3_ac5_unscoped_mode_injects_no_tools_and_switches_to_is
         }}
         with pathlib.Path({str(dump_file)!r}).open("a", encoding="utf-8") as fh:
             fh.write(json.dumps(rec) + "\\n")
+            fh.flush()
         while raw := sys.stdin.buffer.readline():
             req = json.loads(raw.decode("utf-8"))
             ack = {{
@@ -372,4 +373,67 @@ async def test_nova013_ac3_ac5_unscoped_mode_injects_no_tools_and_switches_to_is
     assert "--no-session" in spawns[1]["argv"]
     assert spawns[1]["ws_active"] == "1"
     assert _json.loads(spawns[1]["allowed_projects"]) == [str(proj_a.resolve())]
+
+
+async def test_nova015_switch_workspace_attaches_session_id_when_provided(
+    tmp_path: Path,
+) -> None:
+    dump_file = tmp_path / "spawn_records_sess.jsonl"
+    fake_pi = tmp_path / "fake_pi_sess.py"
+    argv = _write_fake_pi_script(
+        fake_pi,
+        f"""
+        import json, os, pathlib, sys
+        rec = {{"argv": sys.argv[1:]}}
+        with pathlib.Path({str(dump_file)!r}).open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(rec) + "\\n")
+            fh.flush()
+        while raw := sys.stdin.buffer.readline():
+            req = json.loads(raw.decode("utf-8"))
+            ack = {{
+                "id": req.get("id"),
+                "type": "response",
+                "success": True,
+                "data": {{"disposition": "started"}},
+            }}
+            sys.stdout.buffer.write((json.dumps(ack) + "\\n").encode("utf-8"))
+            if req.get("type") == "prompt":
+                ev = {{
+                    "type": "message_update",
+                    "assistantMessageEvent": {{"type": "text_delta", "delta": "ok"}},
+                }}
+                sys.stdout.buffer.write((json.dumps(ev) + "\\n").encode("utf-8"))
+                settled = {{"type": "agent_settled"}}
+                sys.stdout.buffer.write((json.dumps(settled) + "\\n").encode("utf-8"))
+            sys.stdout.buffer.flush()
+        """,
+    )
+    ws_dir = tmp_path / "ws_sess"
+    ws_dir.mkdir()
+
+    cfg = PiRpcConfig(
+        executable=argv[0],
+        extra_leading_args=tuple(argv[1:]),
+        workspace_path=str(ws_dir),
+        workspace_active=False,
+    )
+    async with PiRpcClient(cfg) as client:
+        _ = [c async for c in client.stream_prompt("prompt in unscoped")]
+        await client.switch_workspace(
+            str(ws_dir),
+            workspace_active=True,
+            session_id="session-prev-12345",
+        )
+        _ = [c async for c in client.stream_prompt("test prompt")]
+
+    import json as _json
+
+    spawns = [_json.loads(line) for line in dump_file.read_text(encoding="utf-8").splitlines()]
+    assert len(spawns) == 2
+    # Second spawn has --session-id and NOT --no-session
+    assert "--session-id" in spawns[1]["argv"]
+    idx = spawns[1]["argv"].index("--session-id")
+    assert spawns[1]["argv"][idx + 1] == "session-prev-12345"
+    assert "--no-session" not in spawns[1]["argv"]
+
 
