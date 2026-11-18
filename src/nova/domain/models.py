@@ -534,3 +534,29 @@ class AntigravityDiagnosticResult(BaseModel):
     plugin_verified: bool = False
     latency_ms: float = Field(ge=0.0)
     message: str = Field(min_length=1)
+
+
+class PersistedChatMessage(BaseModel):
+    """Value object representing a persisted chat message record in SQLite (NOVA-015)."""
+
+    model_config = ConfigDict(frozen=True, extra="ignore")
+
+    message_id: str = Field(min_length=1)
+    correlation_id: str = Field(min_length=1)
+    source: str = Field(min_length=1)
+    step_type: str = Field(min_length=1)
+    content: str = ""
+    created_at: float = Field(ge=0.0)
+    workspace_path: str | None = None
+
+
+class WorkspaceSessionPointer(BaseModel):
+    """Active Tier 1 & Tier 2 continuity pointers associated with a workspace (NOVA-015)."""
+
+    model_config = ConfigDict(frozen=True, extra="ignore")
+
+    workspace_canonical_path: str = Field(min_length=1)
+    pi_session_id: str | None = None
+    agy_conversation_id: str | None = None
+    updated_at: float = Field(ge=0.0)
+

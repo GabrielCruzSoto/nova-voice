@@ -37,6 +37,7 @@ class PiRpcConfig(BaseModel):
     workspace_path: str = Field(min_length=1)
     workspace_active: bool = True
     allowed_project_paths: tuple[str, ...] = ()
+    session_id: str | None = None
     no_session: bool = False
     ack_timeout_seconds: float = Field(default=5.0, gt=0.0)
     run_timeout_seconds: float = Field(default=180.0, gt=0.0)
@@ -109,7 +110,9 @@ class PiRpcClient:
         ]
         if not self._config.workspace_active:
             cmd.append("--no-tools")
-        if self._config.no_session or not self._config.workspace_active:
+        if self._config.session_id:
+            cmd.extend(["--session-id", self._config.session_id])
+        elif self._config.no_session or not self._config.workspace_active:
             cmd.append("--no-session")
         if self._config.gatekeeper_ipc_env and self._config.enable_gatekeeper_extension:
             cmd.extend(["-e", str(PI_GATEKEEPER_EXTENSION_PATH)])
@@ -155,12 +158,21 @@ class PiRpcClient:
         *,
         workspace_active: bool = True,
         allowed_project_paths: tuple[str, ...] = (),
+        session_id: str | None = None,
+        no_session: bool | None = None,
     ) -> None:
         """Restart the RPC subprocess cleanly inside a new isolated workspace or ~ mode."""
+        if no_session is None:
+            effective_no_session = False if session_id is not None else True
+        else:
+            effective_no_session = no_session
+
         if (
             new_workspace_path == self._config.workspace_path
             and workspace_active == self._config.workspace_active
             and allowed_project_paths == self._config.allowed_project_paths
+            and session_id == self._config.session_id
+            and effective_no_session == self._config.no_session
             and self.is_running
         ):
             return
@@ -171,7 +183,8 @@ class PiRpcClient:
                 "workspace_path": new_workspace_path,
                 "workspace_active": workspace_active,
                 "allowed_project_paths": allowed_project_paths,
-                "no_session": True,
+                "session_id": session_id,
+                "no_session": effective_no_session,
             }
         )
         if was_running:
@@ -264,6 +277,20 @@ class PiRpcClient:
             return
         await self._send_command({"type": "clear_queue"})
         await self._send_command({"type": "abort"})
+
+    async def get_session_id(self) -> str | None:
+        """Query active session ID from Pi RPC process (NOVA-015)."""
+        if not self.is_running:
+            return None
+        try:
+            resp = await self._send_command({"type": "get_state"})
+            if resp.success and isinstance(resp.data, dict):
+                sess_id = resp.data.get("sessionId")
+                if isinstance(sess_id, str) and sess_id:
+                    return sess_id
+        except PiRpcError:
+            pass
+        return None
 
     async def _open_prompt_stream(
         self,

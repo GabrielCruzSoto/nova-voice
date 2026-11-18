@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
 from nova.application.ui_state_hub import UiHubSettings, UiStateHub
@@ -225,3 +227,65 @@ async def test_ui_state_hub_sse_backpressure_injects_resync_and_enforces_client_
         assert hub.subscriber_count == 0
     finally:
         hub.close()
+
+
+async def test_ui_state_hub_hydrates_and_persists_messages_in_sqlite(tmp_path: Path) -> None:
+    import asyncio
+
+    from nova.adapters.sqlite_history_store import SqliteHistoryStore
+    from nova.domain.models import PersistedChatMessage
+
+    db_path = tmp_path / "hub_history.db"
+    store = SqliteHistoryStore(db_path)
+
+    # Prepopulate SQLite with 2 historical messages
+    await store.append_message(
+        PersistedChatMessage(
+            message_id="hist-1",
+            correlation_id="corr-h1",
+            source="user",
+            step_type="user_prompt",
+            content="Pregunta previa",
+            created_at=100.0,
+            workspace_path="/ws/test",
+        )
+    )
+    await store.append_message(
+        PersistedChatMessage(
+            message_id="hist-2",
+            correlation_id="corr-h1",
+            source="tier1_pi",
+            step_type="agent_response",
+            content="Respuesta previa",
+            created_at=101.0,
+            workspace_path="/ws/test",
+        )
+    )
+
+    bus = OrchestratorEventBus()
+    hub = UiStateHub(
+        event_bus=bus,
+        history_store=store,
+    )
+    hub.start()
+    try:
+        # Hydrate history
+        await hub.hydrate_history()
+
+        snap = await hub.build_snapshot(csrf_token="csrf-t")
+        assert len(snap.messages) == 2
+        assert snap.messages[0].content == "Pregunta previa"
+        assert snap.messages[1].content == "Respuesta previa"
+
+        # Record a new user message and verify it is persisted
+        await hub.record_user_utterance("Nueva pregunta en vivo", correlation_id="corr-live")
+        # Yield to event loop to allow background persist task to complete
+        await asyncio.sleep(0.05)
+
+        stored = await store.get_recent_messages()
+        assert len(stored) == 3
+        assert stored[2].content == "Nueva pregunta en vivo"
+    finally:
+        hub.close()
+        await store.close()
+

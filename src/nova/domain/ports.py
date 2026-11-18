@@ -16,6 +16,7 @@ from nova.domain.models import (
     CommandExecutionDecision,
     CommandInterceptRequest,
     NovaPersistedSettings,
+    PersistedChatMessage,
     ResolveWorkspaceRequest,
     RunnerProgressEvent,
     ShortcutRegistrationResult,
@@ -23,6 +24,7 @@ from nova.domain.models import (
     TranscriptionResult,
     WakeWordDetection,
     WorkspaceContext,
+    WorkspaceSessionPointer,
 )
 
 
@@ -219,3 +221,35 @@ class ShortcutRegistrarPort(Protocol):
     def register_ptt_shortcut(self, shortcut: str) -> ShortcutRegistrationResult:
         """Register or return manual instructions for the global PTT shortcut."""
         ...
+
+
+class HistoryStorePort(Protocol):
+    """Abstract port for persistent SQLite chat history and agent session pointers (NOVA-015)."""
+
+    async def append_message(self, message: PersistedChatMessage) -> None:
+        """Persist a chat message record."""
+        ...
+
+    async def get_recent_messages(
+        self,
+        limit: int = 200,
+        workspace_path: str | None = None,
+    ) -> list[PersistedChatMessage]:
+        """Fetch chronologically ordered recent messages up to `limit`."""
+        ...
+
+    async def save_session_pointer(self, pointer: WorkspaceSessionPointer) -> None:
+        """Upsert active Tier 1 and Tier 2 session continuity identifiers for a workspace."""
+        ...
+
+    async def get_session_pointer(
+        self,
+        workspace_canonical_path: str,
+    ) -> WorkspaceSessionPointer | None:
+        """Retrieve stored session identifiers for a workspace, if any."""
+        ...
+
+    async def close(self) -> None:
+        """Flush and release SQLite database connection."""
+        ...
+

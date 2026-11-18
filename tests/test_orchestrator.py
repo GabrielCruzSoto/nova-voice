@@ -601,3 +601,81 @@ async def test_nova013_ac9_clear_workspace_returns_tier1_to_conversational_home(
     assert len(last_projects) == 0
     assert any(isinstance(e, WorkspaceClearedEvent) for e in events)
 
+
+async def test_orchestrator_session_continuity_with_sqlite_history_store(tmp_path: Path) -> None:
+    from nova.adapters.sqlite_history_store import SqliteHistoryStore
+
+    db_path = tmp_path / "continuity.db"
+    store = SqliteHistoryStore(db_path)
+
+    ws_dir = tmp_path / "project-cont"
+    ws_dir.mkdir(parents=True)
+    (ws_dir / "aff.yaml").write_text(
+        'schema_version: "1.0"\nproject:\n  id: "cont"\n  name: "Cont"\n'
+        'repositories: ["sub-a"]\n',
+        encoding="utf-8",
+    )
+    (ws_dir / "repositories" / "sub-a").mkdir(parents=True)
+
+    bus = OrchestratorEventBus()
+    resolver = LocalWorkspaceResolver(allowed_roots=[tmp_path], event_bus=bus)
+    tier1 = _FakeTier1Client()
+
+    class _ContTier2(_FakeTier2Runner):
+        async def execute(self, request: CodingTaskRequest) -> AsyncIterator[RunnerProgressEvent]:
+            self.requests.append(request)
+            yield RunnerProgressEvent(
+                kind="delta",
+                conversation_id="conv-preserved-777",
+                step_type="agent_response",
+                text_delta="Ejecutando arquitectura...",
+            )
+            yield RunnerProgressEvent(
+                kind="completed",
+                conversation_id="conv-preserved-777",
+                step_type="result",
+                final_response="Completado!",
+            )
+
+    tier2 = _ContTier2()
+    orch1 = NovaOrchestrator(
+        workspace_resolver=resolver,
+        tier1_client=tier1,
+        tier2_runner=tier2,
+        event_bus=bus,
+        history_store=store,
+    )
+
+    # 1. Select workspace and run heavy architecture turn in Orch 1
+    ctx = await orch1.select_workspace(str(ws_dir), mode="exact_path")
+    await orch1.handle_user_utterance("Refactoriza la arquitectura del microservicio")
+
+    # Verify Orch 1 saved session pointer to SQLite
+    pointer = await store.get_session_pointer(ctx.canonical_path)
+    assert pointer is not None
+    assert pointer.agy_conversation_id == "conv-preserved-777"
+
+    # 2. Simulate complete Nova restart by instantiating Orch 2 with clean in-memory state
+    tier2_restart = _ContTier2()
+    orch2 = NovaOrchestrator(
+        workspace_resolver=resolver,
+        tier1_client=tier1,
+        tier2_runner=tier2_restart,
+        event_bus=bus,
+        history_store=store,
+    )
+    # At start, in-memory tier2_conversations is empty
+    assert len(orch2._tier2_conversations) == 0
+
+    # Select workspace in Orch 2 -> loads session pointer from SQLite
+    await orch2.select_workspace(str(ws_dir), mode="exact_path")
+    assert orch2._tier2_conversations.get(ctx.canonical_path) == "conv-preserved-777"
+
+    # Execute heavy turn -> requests has prior conversation_id!
+    await orch2.handle_user_utterance("Continuar con la refactorizacion de arquitectura")
+    assert len(tier2_restart.requests) == 1
+    assert tier2_restart.requests[0].conversation_id == "conv-preserved-777"
+
+    await store.close()
+
+
