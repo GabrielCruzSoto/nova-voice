@@ -390,18 +390,18 @@ async def test_nova015_switch_workspace_attaches_session_id_when_provided(
             fh.flush()
         while raw := sys.stdin.buffer.readline():
             req = json.loads(raw.decode("utf-8"))
-            ack = {
+            ack = {{
                 "id": req.get("id"),
                 "type": "response",
                 "success": True,
                 "data": {{"disposition": "started"}},
-            }
+            }}
             sys.stdout.buffer.write((json.dumps(ack) + "\\n").encode("utf-8"))
             if req.get("type") == "prompt":
-                ev = {
+                ev = {{
                     "type": "message_update",
                     "assistantMessageEvent": {{"type": "text_delta", "delta": "ok"}},
-                }
+                }}
                 sys.stdout.buffer.write((json.dumps(ev) + "\\n").encode("utf-8"))
                 settled = {{"type": "agent_settled"}}
                 sys.stdout.buffer.write((json.dumps(settled) + "\\n").encode("utf-8"))
