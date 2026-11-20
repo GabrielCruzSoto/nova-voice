@@ -141,3 +141,49 @@ def test_missing_onnx_model_reported_with_download_remedy(
     missing_models = [c for c in report.components if c.category == "model" and not c.installed]
     assert len(missing_models) >= 4
     assert any("download-models" in m.remedy for m in missing_models)
+
+
+@pytest.mark.parametrize(
+    ("pkg_mgr_bin", "expected_pm", "expected_audio_cmd"),
+    [
+        ("apt-get", "apt", "sudo apt"),
+        ("dnf", "dnf", "sudo dnf"),
+        ("pacman", "pacman", "sudo pacman"),
+        ("zypper", "zypper", "sudo zypper"),
+    ],
+)
+def test_os_package_manager_remediation_for_missing_audio_and_pi(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    pkg_mgr_bin: str,
+    expected_pm: str,
+    expected_audio_cmd: str,
+) -> None:
+    empty_home = tmp_path / "empty_home"
+    empty_home.mkdir()
+    monkeypatch.setattr(Path, "home", lambda: empty_home)
+    monkeypatch.delenv("XDG_DATA_HOME", raising=False)
+    monkeypatch.delenv("NOVA_MODELS_DIR", raising=False)
+
+    def pm_which(cmd: str) -> str | None:
+        if cmd == pkg_mgr_bin:
+            return f"/usr/bin/{pkg_mgr_bin}"
+        return None
+
+    config = NovaDesktopConfig(
+        pi_executable="non_existent_pi",
+        agy_executable="non_existent_agy",
+        enable_voice=False,
+    )
+    report = check_system_components(config, which_resolver=pm_which)
+    assert report.host_environment is not None
+    assert report.host_environment.package_manager == expected_pm
+
+    audio_comp = next(c for c in report.components if c.name == "audio_capture")
+    assert audio_comp.installed is False
+    assert expected_audio_cmd in audio_comp.remedy
+
+    pi_comp = next(c for c in report.components if c.name == "pi")
+    assert pi_comp.installed is False
+    assert "npm install -g" in pi_comp.remedy
+    assert expected_audio_cmd in pi_comp.remedy

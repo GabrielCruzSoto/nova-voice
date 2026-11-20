@@ -13,5 +13,5 @@ htmlcov/
 node_modules
 node_modules/
 
-# Local voice models (downloaded, not versioned)
-models/
+# Local voice models (downloaded at repo root, not versioned)
+/models/

@@ -173,3 +173,30 @@ def test_local_import_handling(tmp_path: Path) -> None:
     imported_file = dest_dir / "oye_nova.onnx"
     assert imported_file.is_file()
     assert _sha256(imported_file.read_bytes()) == ww_hash
+
+
+def test_bundled_oye_nova_asset_in_manifest_and_downloader(tmp_path: Path) -> None:
+    manifest = load_manifest()
+    models = manifest.get("models", [])
+    ww_entry = next((m for m in models if m["filename"] == "oye_nova.onnx"), None)
+    assert ww_entry is not None
+    assert ww_entry["source_type"] == "bundled"
+    assert ww_entry.get("asset_relpath") == "assets/models/oye_nova.onnx"
+
+    dest_dir = tmp_path / "bundled_dest"
+    progress_events: list[dict[str, Any]] = []
+
+    single_manifest = {"schema_version": "1.0.0", "models": [ww_entry]}
+    rc = download_models(
+        dest_dir,
+        manifest_data=single_manifest,
+        progress_callback=progress_events.append,
+    )
+    assert rc == 0
+    installed = dest_dir / "oye_nova.onnx"
+    assert installed.is_file()
+    assert _sha256(installed.read_bytes()) == ww_entry["sha256"]
+    assert any(
+        ev.get("filename") == "oye_nova.onnx" and ev.get("status") == "completed"
+        for ev in progress_events
+    )

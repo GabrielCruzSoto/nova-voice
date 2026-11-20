@@ -2938,5 +2938,215 @@ test("NOVA-013 F1 regression: selected audio/model values in Onboarding and Sett
   ctrl.dispose();
 });
 
+test("NOVA-016: Onboarding wizard displays OS remedies, provisions voice models, and clears COMPONENTS_MISSING on recheck", async () => {
+  const renders = [];
+  const calls = [];
+  let provisioned = false;
+
+  const fakeFetch = async (input, init) => {
+    const url = typeof input === "string" ? input : input.url;
+    const method = init?.method ?? "GET";
+    calls.push({ url, method });
+
+    if (url === "/api/state") {
+      return new Response(
+        JSON.stringify({
+          schema_version: "1.3.0",
+          csrf_token: "csrf-nova016",
+          voice_enabled: false,
+          onboarding_required: true,
+          call_session: { call_id: "c-16", state: "standby", turn_count: 0, active_correlation_id: null },
+          active_workspace: null,
+          available_workspaces: [],
+          pending_approvals: [],
+          messages: [
+            {
+              message_id: "m-err-1",
+              correlation_id: "corr-startup-health",
+              role: "system",
+              modality: "error",
+              step_type: "COMPONENTS_MISSING",
+              content: "Faltan componentes necesarios: pi, model_tts.",
+              timestamp: "2026-11-19T00:00:00Z",
+              streaming: false,
+            },
+          ],
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      );
+    }
+    if (url === "/api/settings" && method === "GET") {
+      return new Response(
+        JSON.stringify({
+          schema_version: 1,
+          general: { first_run_completed: false, remember_workspace: true, last_active_workspace: null },
+          audio: { capture_target: null, playback_target: null },
+          voice: { enable_voice: true },
+          models: { pi_provider: "github-copilot", pi_model: "gpt-4.1", tier2_model: "claude-opus-5-5-high" },
+          shortcuts: { global_shortcut: "Super+Shift+Space", ptt_mode: "single_turn" },
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      );
+    }
+    if (url === "/api/settings" && method === "PUT") {
+      return new Response(
+        JSON.stringify({
+          ok: true,
+          settings: {
+            schema_version: 1,
+            general: { first_run_completed: true, remember_workspace: true, last_active_workspace: null },
+            audio: { capture_target: "", playback_target: "" },
+            voice: { enable_voice: true },
+            models: { pi_provider: "github-copilot", pi_model: "gpt-4.1", tier2_model: "claude-opus-5-5-high" },
+            shortcuts: { global_shortcut: "Super+Shift+Space", ptt_mode: "single_turn" },
+          },
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      );
+    }
+    if (url === "/api/audio/devices") {
+      return new Response(JSON.stringify({ inputs: [], outputs: [] }), { status: 200 });
+    }
+    if (url === "/api/health") {
+      return new Response(
+        JSON.stringify({
+          all_ok: false,
+          missing_critical_count: 2,
+          missing_optional_count: 0,
+          alert_message: "Faltan componentes necesarios: pi, model_tts.",
+          host_environment: { platform: "linux", distro_id: "ubuntu", package_manager: "apt" },
+          components: [
+            {
+              name: "pi",
+              category: "cli",
+              installed: false,
+              required: true,
+              details: "Ejecutable 'pi' no encontrado",
+              remedy: "Instalá Node.js/npm y Pi CLI con: sudo apt update && sudo apt install -y nodejs npm && npm install -g @mariozechner/pi-coding-agent",
+            },
+            {
+              name: "model_tts",
+              category: "model",
+              installed: false,
+              required: true,
+              details: "Modelo TTS no encontrado",
+              remedy: "Usá el botón 'Instalar modelos de voz'",
+            },
+          ],
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      );
+    }
+    if (url === "/api/models/status") {
+      return new Response(
+        JSON.stringify({
+          status: provisioned ? "completed" : "idle",
+          all_installed: provisioned,
+          total_models: 1,
+          completed_models: provisioned ? 1 : 0,
+          current_model: null,
+          bytes_downloaded: provisioned ? 100 : 0,
+          total_bytes: 100,
+          percent: provisioned ? 100 : 0,
+          error: null,
+          models: [
+            {
+              filename: "es_ES-davefx-medium.onnx",
+              type: "tts_model",
+              description: "Piper TTS",
+              source_type: "https",
+              size_bytes: 100,
+              installed: provisioned,
+              path: provisioned ? "/opt/nova/models/es_ES-davefx-medium.onnx" : null,
+            },
+          ],
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      );
+    }
+    if (url === "/api/models/provision" && method === "POST") {
+      provisioned = true;
+      return new Response(
+        JSON.stringify({
+          status: "completed",
+          all_installed: true,
+          total_models: 1,
+          completed_models: 1,
+          current_model: null,
+          bytes_downloaded: 100,
+          total_bytes: 100,
+          percent: 100,
+          error: null,
+          models: [
+            {
+              filename: "es_ES-davefx-medium.onnx",
+              type: "tts_model",
+              description: "Piper TTS",
+              source_type: "https",
+              size_bytes: 100,
+              installed: true,
+              path: "/opt/nova/models/es_ES-davefx-medium.onnx",
+            },
+          ],
+        }),
+        { status: 202, headers: { "Content-Type": "application/json" } },
+      );
+    }
+    if (url === "/api/health/recheck" && method === "POST") {
+      return new Response(
+        JSON.stringify({
+          voice_enabled: true,
+          health: {
+            all_ok: true,
+            missing_critical_count: 0,
+            missing_optional_count: 0,
+            alert_message: null,
+            host_environment: { platform: "linux", distro_id: "ubuntu", package_manager: "apt" },
+            components: [],
+          },
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      );
+    }
+    if (url === "/api/events") {
+      return new Response(new ReadableStream(), { status: 200 });
+    }
+    return new Response("{}", { status: 404 });
+  };
+
+  const ctrl = new DesktopAppController({
+    fetchImpl: fakeFetch,
+    onRender: (html) => renders.push(html),
+  });
+  await ctrl.start();
+
+  // Onboarding shows missing model action AND OS-specific apt remedy for pi
+  const initialHtml = renders[renders.length - 1];
+  assert.match(initialHtml, /data-action="provision-models"/);
+  assert.match(initialHtml, /data-action="recheck-health"/);
+  assert.match(initialHtml, /sudo apt update/);
+  assert.match(initialHtml, /Finalizar en modo solo texto/);
+
+  // Provisioning voice models triggers /api/models/provision and /api/health/recheck
+  await ctrl.provisionVoiceModels();
+  assert.equal(ctrl.model.voiceEnabled, true);
+  assert.equal(ctrl.model.noticeBanner, null);
+  assert.equal(
+    ctrl.model.messages.some((m) => m.step_type === "COMPONENTS_MISSING"),
+    false,
+  );
+  const readyHtml = renders[renders.length - 1];
+  assert.match(readyHtml, /data-slot="models-ready"/);
+  assert.match(readyHtml, /Finalizar configuración/);
+
+  // Completing onboarding persists settings and rechecks health cleanly
+  await ctrl.completeOnboarding();
+  assert.equal(ctrl.model.onboardingOpen, false);
+  assert.equal(ctrl.model.noticeBanner, null);
+  assert.ok(calls.some((c) => c.url === "/api/health/recheck" && c.method === "POST"));
+
+  ctrl.dispose();
+});
+
 
 

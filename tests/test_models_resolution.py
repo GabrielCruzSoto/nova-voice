@@ -156,6 +156,26 @@ def test_models_resolution_clean_fallback_when_not_found(tmp_path: Path) -> None
     assert resolved is None
 
 
+def test_models_resolution_bundled_asset_fallback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    empty_home = tmp_path / "empty_home"
+    empty_home.mkdir()
+    monkeypatch.setattr(Path, "home", lambda: empty_home)
+    monkeypatch.delenv("XDG_DATA_HOME", raising=False)
+    monkeypatch.delenv("NOVA_MODELS_DIR", raising=False)
+
+    resolved = resolve_model_path(
+        "oye_nova.onnx",
+        explicit_param=None,
+        models_dir=None,
+        source_root=tmp_path,
+    )
+    assert resolved is not None
+    assert resolved.is_file()
+    assert resolved.name == "oye_nova.onnx"
+
+
 def test_config_from_namespace_handles_invalid_models_dir(tmp_path: Path) -> None:
     parser = build_arg_parser()
     invalid_dir = str(tmp_path / "does_not_exist")
