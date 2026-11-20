@@ -182,3 +182,47 @@ def test_nova013_ac6_first_run_completed_defaults_false_and_roundtrips(tmp_path:
     store.save(completed)
     reloaded = store.load()
     assert reloaded.general.first_run_completed is True
+
+
+def test_nova017_ac3_config_v10_migrates_to_multi_tier_v11_roundtrip(tmp_path: Path) -> None:
+    cfg_path = tmp_path / "nova" / "config.toml"
+    cfg_path.parent.mkdir(parents=True, exist_ok=True)
+    cfg_path.write_text(
+        'schema_version = "1.0"\n'
+        "[models]\n"
+        'pi_provider = "openai"\n'
+        'pi_model = "gpt-4o-mini"\n'
+        'tier2_model = "claude-opus-5-5-high"\n',
+        encoding="utf-8",
+    )
+    store = TomlConfigStore(config_path=cfg_path)
+    loaded = store.load()
+    assert loaded.models.tier1_engine == "auto"
+    assert loaded.models.tier1_provider == "openai"
+    assert loaded.models.tier1_model == "gpt-4o-mini"
+    assert loaded.models.tier2_engine == "auto"
+    assert loaded.models.tier2_model == "claude-opus-5-5-high"
+    assert loaded.models.single_engine_mode is False
+
+    updated = loaded.model_copy(
+        update={
+            "models": loaded.models.model_copy(
+                update={
+                    "tier1_engine": "opencode",
+                    "tier1_provider": "anthropic",
+                    "tier1_model": "anthropic/claude-haiku-4-5",
+                    "tier2_engine": "claude",
+                    "tier2_provider": "anthropic",
+                    "tier2_model": "opus",
+                    "single_engine_mode": False,
+                }
+            )
+        }
+    )
+    store.save(updated)
+    reloaded = store.load()
+    assert reloaded.models.tier1_engine == "opencode"
+    assert reloaded.models.tier1_model == "anthropic/claude-haiku-4-5"
+    assert reloaded.models.tier2_engine == "claude"
+    assert reloaded.models.tier2_model == "opus"
+    assert reloaded.models.single_engine_mode is False

@@ -5,9 +5,9 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Literal
+from typing import Any, Literal
 
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 MAX_SPOKEN_WORDS = 25
 DEFAULT_PI_MODEL = "nvidia/nemotron-3.5-lightning-30b-a3b"
@@ -31,8 +31,21 @@ def validate_spoken_word_budget(value: str) -> str:
 
 WorkspaceQueryMode = Literal["exact_path", "voice_fuzzy", "ui_picker"]
 WorkspaceTopology = Literal["multi-project", "single-repo"]
-CommandSource = Literal["tier1_pi", "tier2_agy"]
-ToolInterceptName = Literal["bash", "run_command"]
+AgentEngineId = Literal["pi", "agy", "claude", "opencode"]
+AgentEngineChoice = Literal["auto", "pi", "agy", "claude", "opencode"]
+AgentTier = Literal["tier1", "tier2"]
+AgentAuthMode = Literal["native_cli", "api_token", "unconfigured"]
+CommandSource = Literal[
+    "tier1_pi",
+    "tier2_agy",
+    "tier1_claude",
+    "tier2_claude",
+    "tier1_opencode",
+    "tier2_opencode",
+    "tier1_agy",
+    "tier2_pi",
+]
+ToolInterceptName = Literal["bash", "run_command", "Bash", "shell"]
 RiskLevel = Literal["low", "medium", "high", "critical"]
 AuditRiskLevel = Literal["medium", "high", "critical"]
 Layer1Verdict = Literal["allow", "hard_deny", "escalate"]
@@ -387,20 +400,59 @@ class VoiceSettingsSection(BaseModel):
 
 
 class ModelsSettingsSection(BaseModel):
-    """Tier 1 and Tier 2 model identifiers persisted in config.toml (no API keys)."""
+    """Tier 1 and Tier 2 agent/model identifiers persisted in config.toml (no API keys)."""
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
+    tier1_engine: AgentEngineChoice = "auto"
+    tier1_provider: str = Field(default="nvidia", max_length=64)
+    tier1_model: str = Field(default=DEFAULT_PI_MODEL, min_length=1, max_length=160)
+    tier2_engine: AgentEngineChoice = "auto"
+    tier2_provider: str = Field(default="", max_length=64)
+    tier2_model: str = Field(default="claude-opus-5-5-high", min_length=1, max_length=160)
+    single_engine_mode: bool = False
     pi_provider: str = Field(default="nvidia", min_length=1, max_length=64)
     pi_model: str = Field(default=DEFAULT_PI_MODEL, min_length=1, max_length=160)
-    tier2_model: str = Field(default="claude-opus-5-5-high", min_length=1, max_length=160)
 
-    @field_validator("pi_provider", "pi_model", "tier2_model")
+    @model_validator(mode="before")
+    @classmethod
+    def _migrate_v10_model_fields(cls, data: Any) -> Any:
+        if not isinstance(data, dict):
+            return data
+        merged = dict(data)
+        # Migrate legacy v1.0 keys -> v1.1 tier1_* when tier1_* were omitted
+        if "tier1_provider" not in merged and "pi_provider" in merged:
+            merged["tier1_provider"] = merged["pi_provider"]
+        if "tier1_model" not in merged and "pi_model" in merged:
+            merged["tier1_model"] = merged["pi_model"]
+        # Keep legacy pi_* synchronized when updated via tier1_*
+        if "pi_provider" not in merged and merged.get("tier1_provider"):
+            merged["pi_provider"] = merged["tier1_provider"]
+        if "pi_model" not in merged and merged.get("tier1_model"):
+            merged["pi_model"] = merged["tier1_model"]
+        # Normalize None to empty string for optional provider fields
+        if merged.get("tier1_provider") is None:
+            merged["tier1_provider"] = ""
+        if merged.get("tier2_provider") is None:
+            merged["tier2_provider"] = ""
+        return merged
+
+    @field_validator("pi_provider", "pi_model", "tier1_model", "tier2_model")
     @classmethod
     def _validate_model_tokens(cls, value: str) -> str:
         checked = _validate_safe_setting_token(value)
         if checked is None:
             raise ValueError("Model setting value cannot be empty")
+        return checked
+
+    @field_validator("tier1_provider", "tier2_provider")
+    @classmethod
+    def _validate_optional_provider_tokens(cls, value: str) -> str:
+        if not value or not value.strip():
+            return ""
+        checked = _validate_safe_setting_token(value)
+        if checked is None:
+            return ""
         return checked
 
 
@@ -426,7 +478,7 @@ class NovaPersistedSettings(BaseModel):
 
     model_config = ConfigDict(frozen=True, extra="forbid")
 
-    schema_version: Literal["1.0"] = "1.0"
+    schema_version: Literal["1.0", "1.1"] = "1.1"
     general: GeneralSettingsSection = Field(default_factory=GeneralSettingsSection)
     audio: AudioSettingsSection = Field(default_factory=AudioSettingsSection)
     voice: VoiceSettingsSection = Field(default_factory=VoiceSettingsSection)
@@ -559,4 +611,92 @@ class WorkspaceSessionPointer(BaseModel):
     pi_session_id: str | None = None
     agy_conversation_id: str | None = None
     updated_at: float = Field(ge=0.0)
+
+
+AgentDiagnosticStatus = Literal[
+    "connected",
+    "binary_missing",
+    "plugin_missing",
+    "auth_error",
+    "timeout",
+    "error",
+]
+
+
+class AgentSessionPointer(BaseModel):
+    """Per-engine, per-tier session continuity pointer in SQLite (NOVA-017)."""
+
+    model_config = ConfigDict(frozen=True, extra="ignore")
+
+    workspace_canonical_path: str = Field(min_length=1)
+    tier: AgentTier
+    agent_provider: AgentEngineId
+    session_id: str = Field(min_length=1)
+    updated_at: float = Field(ge=0.0)
+
+
+class AgentDiagnosticResult(BaseModel):
+    """Generic live connectivity probe result for any supported CLI agent (NOVA-017)."""
+
+    model_config = ConfigDict(frozen=True, extra="ignore")
+
+    ok: bool
+    engine: AgentEngineId
+    status: AgentDiagnosticStatus
+    provider: str = ""
+    model: str = ""
+    plugin_verified: bool = False
+    latency_ms: float = Field(ge=0.0)
+    message: str = Field(min_length=1)
+
+
+class AgentCatalogEntry(BaseModel):
+    """Auto-detected CLI agent metadata exposed to UI without raw secrets (NOVA-017)."""
+
+    model_config = ConfigDict(frozen=True, extra="ignore")
+
+    engine: AgentEngineId
+    display_name: str = Field(min_length=1)
+    installed: bool
+    binary_path: str | None = None
+    auth_mode: AgentAuthMode = "unconfigured"
+    configured_env_vars: tuple[str, ...] = ()
+    supports_tier1: bool = True
+    supports_tier2: bool = True
+    default_tier1_model: str = ""
+    default_tier2_model: str = ""
+
+
+class ProviderCredentialStatus(BaseModel):
+    """Write-only status of an optional API token provider (never contains secret values)."""
+
+    model_config = ConfigDict(frozen=True, extra="ignore")
+
+    provider: str = Field(min_length=1)
+    env_var: str = Field(min_length=1)
+    configured: bool = False
+
+
+class ActiveTierSelection(BaseModel):
+    """Currently active engine, provider, and model for a tier."""
+
+    model_config = ConfigDict(frozen=True, extra="ignore")
+
+    engine: AgentEngineId
+    provider: str = ""
+    model: str = ""
+
+
+class AgentCatalogSnapshot(BaseModel):
+    """Full catalog of detected CLI engines and active tier routing (NOVA-017)."""
+
+    model_config = ConfigDict(frozen=True, extra="ignore")
+
+    schema_version: Literal["1.0"] = "1.0"
+    credential_backend: Literal["libsecret", "local_file_0600", "none"] = "none"
+    active_tier1: ActiveTierSelection | None = None
+    active_tier2: ActiveTierSelection | None = None
+    single_engine_mode: bool = False
+    engines: tuple[AgentCatalogEntry, ...] = ()
+    providers: tuple[ProviderCredentialStatus, ...] = ()
 

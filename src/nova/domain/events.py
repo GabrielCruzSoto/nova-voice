@@ -59,7 +59,7 @@ class ChatStreamEvent(BaseModel):
 
     correlation_id: str = Field(min_length=1)
     delta: str
-    source: Literal["tier1_pi", "tier2_runner"]
+    source: Literal["tier1_pi", "tier1_agent", "tier2_runner"]
     step_type: str = "agent_response"
     timestamp: str = Field(default_factory=utc_now_iso)
 

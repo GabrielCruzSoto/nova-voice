@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from collections.abc import AsyncIterator
 from pathlib import Path
-from typing import Protocol
+from typing import Literal, Protocol
 
 from nova.domain.events import CommandApprovalResolvedEvent
 from nova.domain.models import (
@@ -251,5 +251,37 @@ class HistoryStorePort(Protocol):
 
     async def close(self) -> None:
         """Flush and release SQLite database connection."""
+        ...
+
+
+class CredentialStorePort(Protocol):
+    """Abstract port for secure per-user API token storage (libsecret / 0600 local store)."""
+
+    @property
+    def backend_name(self) -> Literal["libsecret", "local_file_0600"]:
+        """Return active storage backend identifier."""
+        ...
+
+    def set_secret(self, provider: str, env_var: str, value: str) -> None:
+        """Store or update an optional provider API token securely."""
+        ...
+
+    def get_secret(self, provider: str, env_var: str) -> str | None:
+        """Retrieve a stored provider API token, or None if not configured."""
+        ...
+
+    def delete_secret(self, provider: str, env_var: str) -> bool:
+        """Delete a stored provider API token; return True if removed."""
+        ...
+
+    def list_configured_env_vars(
+        self,
+        provider: str | None = None,
+    ) -> dict[str, tuple[str, ...]]:
+        """List configured provider env var names (never secret values)."""
+        ...
+
+    def get_all_secret_values(self) -> tuple[str, ...]:
+        """Return all stored secret values for dynamic redaction (`extra_secrets`)."""
         ...
 
