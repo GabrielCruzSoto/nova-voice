@@ -10,6 +10,7 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 MAX_SPOKEN_WORDS = 25
+MAX_SPEECH_CHUNK_CHARS = 600
 DEFAULT_PI_MODEL = "nvidia/nemotron-3.5-lightning-30b-a3b"
 
 
@@ -66,6 +67,7 @@ CallSessionState = Literal[
     "speaking",
     "closed",
 ]
+VoiceConfirmationAction = Literal["confirm", "cancel", "correct"]
 InferenceDevice = Literal["cuda", "cpu"]
 MAX_SYNTHESIZED_PCM_BYTES = 11_520_000
 
@@ -245,6 +247,22 @@ class CallSession(BaseModel):
     active_correlation_id: str | None = None
 
 
+class PendingVoiceTask(BaseModel):
+    """Bounded in-RAM voice instruction awaiting explicit human confirmation (NOVA-018 OP-2)."""
+
+    model_config = ConfigDict(frozen=True, extra="ignore")
+
+    task_id: str = Field(min_length=1)
+    correlation_id: str = Field(min_length=1)
+    utterance: str = Field(min_length=1)
+    understood_summary: str = Field(min_length=1)
+    workspace_canonical_path: str | None = None
+    workspace_name: str | None = None
+    revision: int = Field(default=1, ge=1)
+    created_at_monotonic: float = Field(ge=0.0)
+    expires_at_monotonic: float = Field(gt=0.0)
+
+
 class AudioFrame(BaseModel):
     """Bounded mono 16-bit PCM frame captured in RAM from microphone input (NOVA-003 OP-1)."""
 
@@ -384,6 +402,8 @@ class VoiceSettingsSection(BaseModel):
     wakeword_threshold: float = Field(default=0.60, gt=0.0, le=1.0)
     speech_threshold: float = Field(default=0.50, gt=0.0, le=1.0)
     barge_in_threshold: float = Field(default=0.60, gt=0.0, le=1.0)
+    half_duplex_turn_mode: bool = True
+    require_voice_confirmation: bool = True
 
     @field_validator("whisper_language")
     @classmethod

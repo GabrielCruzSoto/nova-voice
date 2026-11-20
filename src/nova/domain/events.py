@@ -11,6 +11,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from nova.domain.errors import redact_sensitive_text
 from nova.domain.models import (
+    MAX_SPEECH_CHUNK_CHARS,
     MAX_SPOKEN_WORDS,
     AuditRiskLevel,
     CallSessionState,
@@ -78,6 +79,32 @@ class VoiceMilestoneEvent(BaseModel):
     @classmethod
     def _validate_word_budget(cls, value: str) -> str:
         return validate_spoken_word_budget(value)
+
+
+class VoiceSpeechChunkEvent(BaseModel):
+    """Sanitized sentence-level spoken response chunk destined for streaming TTS (NOVA-018 OP-1)."""
+
+    model_config = ConfigDict(frozen=True, extra="ignore")
+
+    correlation_id: str = Field(min_length=1)
+    text: str = Field(min_length=1)
+    chunk_index: int = Field(default=0, ge=0)
+    is_final: bool = True
+    priority: Literal["normal", "interrupt"] = "normal"
+    timestamp: str = Field(default_factory=utc_now_iso)
+
+    @field_validator("text")
+    @classmethod
+    def _validate_speech_text(cls, value: str) -> str:
+        cleaned = " ".join(value.strip().split())
+        if not cleaned:
+            raise ValueError("VOICE_SPEECH_CHUNK_INVALID: spoken chunk text cannot be empty")
+        if len(cleaned) > MAX_SPEECH_CHUNK_CHARS:
+            raise ValueError(
+                f"VOICE_SPEECH_CHUNK_INVALID: spoken chunk exceeds {MAX_SPEECH_CHUNK_CHARS} chars "
+                f"(got {len(cleaned)})"
+            )
+        return cleaned
 
 
 class RunnerFailureEvent(BaseModel):
@@ -193,6 +220,7 @@ OrchestratorEvent = (
     | WorkspaceClearedEvent
     | ChatStreamEvent
     | VoiceMilestoneEvent
+    | VoiceSpeechChunkEvent
     | RunnerFailureEvent
     | CommandBlockedEvent
     | CommandApprovalRequestedEvent

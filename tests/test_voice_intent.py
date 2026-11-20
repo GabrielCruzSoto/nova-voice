@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import pytest
 
-from nova.application.voice_intent import classify_voice_control_intent
+from nova.application.voice_intent import (
+    classify_confirmation_response,
+    classify_voice_control_intent,
+)
 
 
 @pytest.mark.parametrize(
@@ -104,3 +107,76 @@ def test_general_utterance_and_empty_or_bare_wake_word_handling() -> None:
     )
     assert prompt.kind == "user_utterance"
     assert prompt.utterance_text == "ejecuta pytest en modo silencioso."
+
+
+@pytest.mark.parametrize(
+    "phrase",
+    [
+        "sí",
+        "Sí.",
+        "Oye Nova, sí",
+        "confirmar",
+        "¡Confirmado!",
+        "adelante",
+        "dale",
+        "ejecútalo",
+        "correcto",
+        "eso mismo",
+        "Sí, eso es lo que entiendo.",
+        "Oye Nova, sí, ejecútalo",
+    ],
+)
+def test_confirmation_classifier_recognizes_closed_confirm_phrases(phrase: str) -> None:
+    result = classify_confirmation_response(phrase)
+    assert result.action == "confirm"
+
+
+@pytest.mark.parametrize(
+    "phrase",
+    [
+        "no",
+        "No.",
+        "Oye Nova, cancelar",
+        "cancelar",
+        "descartar",
+        "déjalo",
+        "olvídalo",
+        "detener",
+        "no gracias",
+        "mejor no",
+    ],
+)
+def test_confirmation_classifier_recognizes_closed_cancel_phrases(phrase: str) -> None:
+    result = classify_confirmation_response(phrase)
+    assert result.action == "cancel"
+
+
+@pytest.mark.parametrize(
+    ("phrase", "expected_clean"),
+    [
+        (
+            "Oye Nova, no, mejor revisa el archivo orchestrator",
+            "no, mejor revisa el archivo orchestrator",
+        ),
+        (
+            "cambia las pruebas unitarias por documentación",
+            "cambia las pruebas unitarias por documentación",
+        ),
+        (
+            "sí pero solo en el módulo de audio",
+            "sí pero solo en el módulo de audio",
+        ),
+    ],
+)
+def test_confirmation_classifier_treats_other_utterances_as_correction(
+    phrase: str,
+    expected_clean: str,
+) -> None:
+    result = classify_confirmation_response(phrase)
+    assert result.action == "correct"
+    assert result.cleaned_text == expected_clean
+
+
+def test_confirmation_classifier_ignores_empty_or_bare_wake_word() -> None:
+    assert classify_confirmation_response("   ...  ").action == "ignore_empty"
+    assert classify_confirmation_response("Oye Nova!").action == "ignore_empty"
