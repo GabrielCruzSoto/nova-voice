@@ -1078,106 +1078,26 @@ export function renderSettingsDrawer(model) {
     </div>
   `.trim();
 }
-export function getDefaultAgentsOverview(activeWorkspacePath) {
-    const ws = activeWorkspacePath || "~/projects/nova-voice";
+export function getDefaultAgentsOverview(_activeWorkspacePath) {
     return {
         daemonStatus: "connected",
-        daemonPid: 4812,
-        memoryMb: 174,
         poolSlots: [
             {
                 name: "Tier 1: Pi Agent",
                 tier: "tier1_pi",
-                activeSlots: 1,
+                activeSlots: 0,
                 maxSlots: 4,
-                status: "active",
+                status: "idle",
             },
             {
                 name: "Tier 2: Antigravity CLI",
                 tier: "tier2_agy",
-                activeSlots: 2,
+                activeSlots: 0,
                 maxSlots: 3,
-                status: "active",
+                status: "idle",
             },
         ],
-        tasks: [
-            {
-                id: "901",
-                title: "Refactorizar módulo de autenticación JWT a OAuth2 PKCE",
-                description: "Migrar flujos de refresh token, validadores de firma y middlewares Express sin romper clientes activos.",
-                workspace: "~/projects/ecommerce-api",
-                tier: "tier2_agy",
-                agentName: "Tier 2 • Antigravity CLI",
-                status: "running",
-                progress: 68,
-                duration: "02m 14s",
-                branch: "refactor/oauth2-pkce",
-                lastLog: "> [antigravity] patching src/auth/tokenValidator.ts (14/21 files)...",
-            },
-            {
-                id: "902",
-                title: "Ejecutar migración destructiva de esquema y limpiar tablas legacy",
-                description: "Consolidar sesiones activas en Redis Cluster y eliminar tablas relacionales obsoletas de sesiones v1.",
-                workspace: "~/projects/ecommerce-api",
-                tier: "tier2_agy",
-                agentName: "Tier 2 • Antigravity CLI",
-                status: "gatekeeper_blocked",
-                progress: 54,
-                duration: "04m 09s",
-                branch: "db/cleanup-legacy-sessions",
-                lastLog: "! [gatekeeper] Awaiting user confirmation for: DROP TABLE legacy_sessions;",
-            },
-            {
-                id: "903",
-                title: "Optimizar pipeline de captura de audio y latencia VAD en demonio local",
-                description: "Reducir buffer ring PipeWire a 10ms y vectorizar inferencia Silero VAD con instrucciones AVX2.",
-                workspace: ws,
-                tier: "tier1_pi",
-                agentName: "Tier 1 • Pi Agent",
-                status: "running",
-                progress: 42,
-                duration: "01m 05s",
-                branch: "feat/vad-low-latency",
-                lastLog: "> [pi-agent] running cargo test --package vad_engine...",
-            },
-            {
-                id: "904",
-                title: "Calibrar modelo acústico wake-word «Oye Nova» ante ruido mecánico",
-                description: "Ajustar umbral espectral y filtros pasa-altos para evitar falsos positivos durante sesiones de coding.",
-                workspace: ws,
-                tier: "tier1_pi",
-                agentName: "Tier 1 • Pi Agent",
-                status: "queued",
-                progress: 0,
-                branch: "fix/wakeword-noise-gate",
-                lastLog: "Waiting for free audio benchmark lock in workspace...",
-            },
-            {
-                id: "905",
-                title: "Generar tests unitarios para parser de eventos de telemetría",
-                description: "Cubrir casos borde de payloads corruptos, reconexión offline y compresión gzip en el SDK móvil.",
-                workspace: "~/projects/mobile-app",
-                tier: "tier1_pi",
-                agentName: "Tier 1 • Pi Agent",
-                status: "queued",
-                progress: 0,
-                branch: "chore/telemetry-tests",
-                lastLog: "Waiting for free slot in workspace lock...",
-            },
-            {
-                id: "906",
-                title: "Sincronizar esquemas Parquet e índices particionados diarios",
-                description: "Actualizar definiciones Arrow v16 y compactar particiones huérfanas en catálogo local DuckDB.",
-                workspace: "~/projects/data-pipeline",
-                tier: "tier1_pi",
-                agentName: "Tier 1 • Pi Agent",
-                status: "completed",
-                progress: 100,
-                duration: "18.4s",
-                branch: "main",
-                lastLog: "✓ Completed in 18.4s • 4 files modified, 12 tests passed",
-            },
-        ],
+        tasks: [],
     };
 }
 const TASK_STATUS_META = {
@@ -1335,13 +1255,21 @@ export function renderAgentsMatrixView(model) {
             `;
         })
             .join("");
+    const activeCount = runningTasks.length + gatekeeperTasks.length;
+    const daemonSubText = overview.daemonPid != null && overview.memoryMb != null
+        ? `PID ${overview.daemonPid} • ${overview.memoryMb} MB en uso`
+        : overview.daemonPid != null
+            ? `PID ${overview.daemonPid}`
+            : activeCount > 0
+                ? `${activeCount} en curso`
+                : "Sin tareas en ejecución";
     return `
     <div class="nova-agents-matrix-container">
       <section class="nova-agents-system-bar" aria-label="Estado del servicio en segundo plano">
         <div class="nova-daemon-indicator">
           <span class="nova-daemon-pulse" aria-hidden="true"></span>
-          <span class="nova-daemon-label">Daemon: <strong>Conectado</strong></span>
-          <span class="nova-daemon-sub">PID ${overview.daemonPid ?? 4812} • ${overview.memoryMb ?? 174} MB en uso</span>
+          <span class="nova-daemon-label">Daemon: <strong>${overview.daemonStatus === "disconnected" ? "Desconectado" : "Conectado"}</strong></span>
+          <span class="nova-daemon-sub">${escapeHtml(daemonSubText)}</span>
         </div>
         <div class="nova-agent-slots-grid">
           ${slotsHtml}

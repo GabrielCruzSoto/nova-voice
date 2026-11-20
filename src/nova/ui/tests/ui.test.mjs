@@ -2291,16 +2291,49 @@ test("NOVA-014: View switcher tabs in Header, Agents Matrix rendering, and Contr
   assert.match(chatHtml, /data-slot="timeline"/);
   assert.ok(!chatHtml.includes('data-slot="agents-view"'));
 
-  // 2. Switch to activeTab: "agents" renders Agents Matrix View
+  // 2. Switch to activeTab: "agents" renders clean empty Agents Matrix View by default (no mocked tasks)
   const agentsHtml = renderAppShell({ ...baseModel, activeTab: "agents" });
   assert.match(agentsHtml, /data-active-tab="agents"/);
   assert.match(agentsHtml, /data-slot="agents-view"/);
   assert.match(agentsHtml, /nova-agents-matrix-container/);
   assert.match(agentsHtml, /Daemon:.*Conectado/);
+  assert.match(agentsHtml, /Sin tareas en ejecución/);
   assert.match(agentsHtml, /Tier 1: Pi Agent/);
   assert.match(agentsHtml, /Tier 2: Antigravity CLI/);
-  assert.match(agentsHtml, /Refactorizar módulo de autenticación/);
-  assert.match(agentsHtml, /Gatekeeper pendiente/);
+  assert.match(agentsHtml, /0\/4 slots/);
+  assert.match(agentsHtml, /0\/3 slots/);
+  assert.match(agentsHtml, /No hay tareas en esta categoría/);
+  assert.ok(!agentsHtml.includes("Refactorizar módulo de autenticación"));
+  assert.ok(!agentsHtml.includes("4812"));
+
+  // 2b. Populated overview renders task cards and Gatekeeper status
+  const populatedOverview = {
+    daemonStatus: "connected",
+    daemonPid: 9123,
+    memoryMb: 64,
+    poolSlots: [
+      { name: "Tier 1: Pi Agent", tier: "tier1_pi", activeSlots: 0, maxSlots: 4, status: "idle" },
+      { name: "Tier 2: Antigravity CLI", tier: "tier2_agy", activeSlots: 1, maxSlots: 3, status: "active" },
+    ],
+    tasks: [
+      {
+        id: "t1",
+        title: "Revisar migración",
+        workspace: "~/projects/app",
+        tier: "tier2_agy",
+        agentName: "Tier 2 • Antigravity CLI",
+        status: "gatekeeper_blocked",
+        lastLog: "DROP TABLE legacy;",
+      },
+    ],
+  };
+  const populatedAgentsHtml = renderAppShell({
+    ...baseModel,
+    activeTab: "agents",
+    agentsOverview: populatedOverview,
+  });
+  assert.match(populatedAgentsHtml, /Gatekeeper pendiente/);
+  assert.match(populatedAgentsHtml, /PID 9123/);
 
   // 3. XSS Escaping in Agent Tasks
   const maliciousOverview = {
@@ -2329,13 +2362,19 @@ test("NOVA-014: View switcher tabs in Header, Agents Matrix rendering, and Contr
   assert.ok(!safeAgentsHtml.includes("<img src=x"));
   assert.match(safeAgentsHtml, /&lt;img src=x/);
 
-  // 4. Controller interaction: switchTab and setAgentsFilter
+  // 4. Controller interaction: switchTab, setAgentsFilter, and handleAgentTaskAction
   const ctrl = new DesktopAppController();
   assert.equal(ctrl.model.activeTab, "chat");
+  assert.equal(ctrl.model.agentsOverview?.tasks.length, 0);
   ctrl.switchTab("agents");
   assert.equal(ctrl.model.activeTab, "agents");
   ctrl.setAgentsFilter("running");
   assert.equal(ctrl.model.agentsFilter, "running");
+
+  // Verify actions on an empty overview are safe no-ops
+  await ctrl.handleAgentTaskAction("nonexistent", "cancel");
+  assert.equal(ctrl.model.agentsOverview?.tasks.length, 0);
+
   ctrl.switchTab("chat");
   assert.equal(ctrl.model.activeTab, "chat");
   ctrl.dispose();
