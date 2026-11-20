@@ -812,6 +812,46 @@ async def test_nova013_ac1_initial_startup_uses_home_cwd_and_excludes_home_from_
         assert runtime._pi_client._config.workspace_active is False
 
 
+async def test_nova018_ac10_desktop_runtime_wires_half_duplex_confirmation_and_hot_reload(
+    tmp_path: Path,
+) -> None:
+    from nova.adapters.desktop_launcher import build_arg_parser, config_from_namespace
+
+    cfg_file = tmp_path / "cfg_hd" / "config.toml"
+    cfg_file.parent.mkdir(parents=True)
+    # Legacy v1.0 config without half_duplex_turn_mode / require_voice_confirmation
+    cfg_file.write_text(
+        'schema_version = "1.0"\n\n[voice]\nenable_voice = false\ntts_engine = "piper"\n',
+        encoding="utf-8",
+    )
+    ns = build_arg_parser().parse_args(["--no-browser", "--config", str(cfg_file)])
+    desktop_cfg = config_from_namespace(ns, env={})
+    assert desktop_cfg.half_duplex_turn_mode is True
+    assert desktop_cfg.require_voice_confirmation is True
+
+    proj = tmp_path / "demo_hd"
+    proj.mkdir()
+    runtime_cfg = NovaDesktopConfig(
+        port=0,
+        allowed_roots=(str(tmp_path),),
+        initial_workspace=str(proj),
+        open_browser=False,
+        enable_voice=False,
+        ipc_runtime_dir=str(tmp_path / "sock_hd"),
+        config_path=str(cfg_file),
+    )
+    async with NovaDesktopRuntime(runtime_cfg) as runtime:
+        assert runtime._orchestrator is not None
+        assert runtime._orchestrator._settings.require_voice_confirmation is True
+        assert runtime._settings_service is not None
+
+        res = await runtime._settings_service.update_settings(
+            {"voice": {"require_voice_confirmation": False, "half_duplex_turn_mode": False}}
+        )
+        assert res["requires_restart"] is False
+        assert runtime._orchestrator._settings.require_voice_confirmation is False
+
+
 
 
 

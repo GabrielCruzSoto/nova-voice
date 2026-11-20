@@ -16,7 +16,11 @@ from nova.adapters.antigravity_adapter import (
 from nova.adapters.claude_adapter import ClaudeCodeAdapter, ClaudeCodeConfig
 from nova.adapters.credential_store import ALLOWED_PROVIDER_ENV_VARS, SystemCredentialStore
 from nova.adapters.opencode_adapter import OpenCodeAdapter, OpenCodeConfig
-from nova.adapters.pi_rpc_client import PiRpcClient, PiRpcConfig
+from nova.adapters.pi_rpc_client import (
+    NOVA_VOICE_SYSTEM_PROMPT,
+    PiRpcClient,
+    PiRpcConfig,
+)
 from nova.domain.models import (
     DEFAULT_PI_MODEL,
     ActiveTierSelection,
@@ -372,6 +376,7 @@ class AgentAdapterRegistry:
                     tier="tier1",
                     gatekeeper_ipc_env=gatekeeper_ipc_env,
                     provider_env=provider_env or None,
+                    append_system_prompt=NOVA_VOICE_SYSTEM_PROMPT,
                 )
             )
         if engine == "opencode":

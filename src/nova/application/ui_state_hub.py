@@ -27,6 +27,7 @@ from nova.domain.events import (
     SettingsUpdatedEvent,
     UiPanelToggleRequestedEvent,
     VoiceMilestoneEvent,
+    VoiceSpeechChunkEvent,
     VoiceTranscriptionEvent,
     WorkspaceChangedEvent,
     WorkspaceClearedEvent,
@@ -53,6 +54,7 @@ UiEventType = Literal[
     "workspace_cleared",
     "chat_stream",
     "voice_milestone",
+    "voice_speech_chunk",
     "runner_failure",
     "command_blocked",
     "command_approval_requested",
@@ -684,6 +686,24 @@ class UiStateHub:
                 timestamp=event.timestamp,
                 payload={
                     "summary_text": safe_summary,
+                    "priority": event.priority,
+                },
+            )
+            return
+
+        if isinstance(event, VoiceSpeechChunkEvent):
+            if event.is_final:
+                self._close_streams_for_correlation(event.correlation_id)
+            safe_text = self._redact(event.text)
+            self._emit_envelope(
+                seq=seq,
+                event_type="voice_speech_chunk",
+                correlation_id=event.correlation_id,
+                timestamp=event.timestamp,
+                payload={
+                    "text": safe_text,
+                    "chunk_index": event.chunk_index,
+                    "is_final": event.is_final,
                     "priority": event.priority,
                 },
             )

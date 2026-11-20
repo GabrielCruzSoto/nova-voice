@@ -8,7 +8,11 @@ from pathlib import Path
 
 import pytest
 
-from nova.adapters.pi_rpc_client import PiRpcClient, PiRpcConfig
+from nova.adapters.pi_rpc_client import (
+    NOVA_VOICE_SYSTEM_PROMPT,
+    PiRpcClient,
+    PiRpcConfig,
+)
 from nova.domain.errors import PiRpcError
 
 
@@ -435,5 +439,54 @@ async def test_nova015_switch_workspace_attaches_session_id_when_provided(
     idx = spawns[1]["argv"].index("--session-id")
     assert spawns[1]["argv"][idx + 1] == "session-prev-12345"
     assert "--no-session" not in spawns[1]["argv"]
+
+
+async def test_nova018_ac7_pi_rpc_passes_voice_first_append_system_prompt(tmp_path: Path) -> None:
+    dump_file = tmp_path / "argv_prompt.json"
+    fake_pi = tmp_path / "fake_pi_prompt.py"
+    argv = _write_fake_pi_script(
+        fake_pi,
+        f"""
+        import json, sys
+        with open({str(dump_file)!r}, "w", encoding="utf-8") as fh:
+            json.dump(sys.argv[1:], fh, ensure_ascii=False)
+        while raw := sys.stdin.buffer.readline():
+            req = json.loads(raw.decode("utf-8"))
+            resp = {{
+                "id": req.get("id"),
+                "type": "response",
+                "command": req.get("type"),
+                "success": True,
+                "data": {{"disposition": "handled"}},
+            }}
+            sys.stdout.buffer.write((json.dumps(resp) + "\\n").encode("utf-8"))
+            sys.stdout.buffer.flush()
+        """,
+    )
+    cfg = PiRpcConfig(
+        executable=argv[0],
+        extra_leading_args=tuple(argv[1:]),
+        workspace_path=str(tmp_path),
+    )
+    assert cfg.append_system_prompt == NOVA_VOICE_SYSTEM_PROMPT
+    assert "Nova" in NOVA_VOICE_SYSTEM_PROMPT
+
+    async with PiRpcClient(cfg) as client:
+        _ = [c async for c in client.stream_prompt("hola")]
+
+    import json as _json
+
+    captured_argv = _json.loads(dump_file.read_text(encoding="utf-8"))
+    assert "--append-system-prompt" in captured_argv
+    idx = captured_argv.index("--append-system-prompt")
+    assert captured_argv[idx + 1] == NOVA_VOICE_SYSTEM_PROMPT
+
+    # Explicitly disabling append_system_prompt omits the flag
+    cfg_none = cfg.model_copy(update={"append_system_prompt": None})
+    async with PiRpcClient(cfg_none) as client:
+        _ = [c async for c in client.stream_prompt("hola")]
+
+    captured_none = _json.loads(dump_file.read_text(encoding="utf-8"))
+    assert "--append-system-prompt" not in captured_none
 
 
