@@ -127,6 +127,20 @@ def test_deb_contents_listing_includes_base_models_and_no_pycache(
     # Internal library assets (faster-whisper VAD) must remain intact
     assert "faster_whisper/assets/silero_vad_v6.onnx" in listing
 
+    # Every pinned dependency in constraints.txt must be self-contained in /opt/nova/venv
+    constraints_file = _REPO_ROOT / "packaging" / "deb" / "constraints.txt"
+    for raw_line in constraints_file.read_text().splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#"):
+            continue
+        pkg_name = re.split(r"[=<>!~]", line, maxsplit=1)[0].strip()
+        normalized = re.sub(r"[-_.]+", "_", pkg_name).lower()
+        assert re.search(
+            rf"opt/nova/venv/lib/python\d+\.\d+/site-packages/{re.escape(normalized)}-[^/]+\.dist-info/",
+            listing,
+            re.IGNORECASE,
+        ), f"Missing self-contained dependency '{pkg_name}' in packaged venv"
+
     # No __pycache__ or *.pyc
     assert "__pycache__" not in listing
     assert ".pyc" not in listing
