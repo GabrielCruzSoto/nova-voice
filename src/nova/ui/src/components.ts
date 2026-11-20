@@ -1027,6 +1027,100 @@ export function renderOnboardingModal(model: PresentationalAppModel): string {
   `.trim();
 }
 
+function renderMultiTierAgentsControls(model: PresentationalAppModel): string {
+  const s = model.settingsData;
+  const catalog = model.agentCatalog;
+  const t1Engine = s?.models.tier1_engine ?? "auto";
+  const t2Engine = s?.models.tier2_engine ?? "auto";
+  const singleEngine = s?.models.single_engine_mode ?? false;
+  const engines = catalog?.engines ?? [];
+
+  const engineOptions = (selected: string): string => {
+    const baseOpts: Array<{ id: string; label: string }> = [
+      { id: "auto", label: "Automático (detectado)" },
+      { id: "claude", label: "Claude Code (claude)" },
+      { id: "opencode", label: "OpenCode (opencode)" },
+      { id: "agy", label: "Antigravity (agy)" },
+      { id: "pi", label: "Pi CLI (pi)" },
+    ];
+    return baseOpts
+      .map((opt) => {
+        const entry = engines.find((e) => e.engine === opt.id);
+        const suffix = entry ? (entry.installed ? " — instalado" : " — no detectado") : "";
+        return `<option value="${escapeHtml(opt.id)}"${selected === opt.id ? " selected" : ""}>${escapeHtml(opt.label + suffix)}</option>`;
+      })
+      .join("");
+  };
+
+  const detectedBadges = engines.length
+    ? `<div class="nova-agent-catalog-list">${engines
+        .map((e) => {
+          const authLabel =
+            e.auth_mode === "api_token"
+              ? "API token"
+              : e.auth_mode === "native_cli"
+                ? "Sesión nativa CLI"
+                : "Sin configurar";
+          const statusCls = e.installed ? "badge--ok" : "badge--muted";
+          return `
+            <div class="nova-agent-catalog-item">
+              <span class="nova-badge ${statusCls}">${escapeHtml(e.display_name)}</span>
+              <span class="nova-agent-auth-hint">${escapeHtml(e.installed ? authLabel : "No instalado")}</span>
+              ${
+                e.installed
+                  ? `<button type="button" class="btn btn--ghost btn--xs" data-action="probe-agent" data-engine="${escapeHtml(e.engine)}" data-tier="tier1">Probar</button>`
+                  : ""
+              }
+            </div>
+          `;
+        })
+        .join("")}</div>`
+    : "";
+
+  const probeHtml = model.agentProbeResult
+    ? `<div class="nova-settings-hint" data-testid="agent-probe-result">${escapeHtml(
+        `${model.agentProbeResult.engine}: ${model.agentProbeResult.ok ? "OK" : model.agentProbeResult.status} — ${model.agentProbeResult.message}`,
+      )}</div>`
+    : "";
+
+  const providerRows = (catalog?.providers ?? [])
+    .map(
+      (p) => `
+      <div class="nova-credential-row" data-provider="${escapeHtml(p.provider)}" data-env-var="${escapeHtml(p.env_var)}">
+        <span>${escapeHtml(p.provider)} (${escapeHtml(p.env_var)}) — ${p.configured ? "Configurado" : "Sesión nativa / no definido"}</span>
+        <div class="nova-settings-inline">
+          <input type="password" autocomplete="off" placeholder="Opcional: pegar API token" data-cred-input="${escapeHtml(p.env_var)}" />
+          <button type="button" class="btn btn--secondary btn--xs" data-action="save-credential" data-provider="${escapeHtml(p.provider)}" data-env-var="${escapeHtml(p.env_var)}">Guardar</button>
+          ${
+            p.configured
+              ? `<button type="button" class="btn btn--ghost btn--xs" data-action="delete-credential" data-provider="${escapeHtml(p.provider)}" data-env-var="${escapeHtml(p.env_var)}">Quitar</button>`
+              : ""
+          }
+        </div>
+      </div>
+    `,
+    )
+    .join("");
+
+  return `
+    <label class="nova-settings-field">
+      <span>Motor Tier 1 (Rápido / Conversacional)</span>
+      <select name="models.tier1_engine">${engineOptions(t1Engine)}</select>
+    </label>
+    <label class="nova-settings-field">
+      <span>Motor Tier 2 (Especializado / Alto cómputo)</span>
+      <select name="models.tier2_engine">${engineOptions(t2Engine)}</select>
+    </label>
+    <label class="nova-settings-checkbox">
+      <input type="checkbox" name="models.single_engine_mode"${singleEngine ? " checked" : ""} />
+      <span>Modo Single-Engine (usar el motor Tier 1 para ambos tiers)</span>
+    </label>
+    ${detectedBadges}
+    ${probeHtml}
+    ${providerRows ? `<div class="nova-credentials-panel"><strong>Credenciales opcionales por proveedor (almacén seguro)</strong>${providerRows}</div>` : ""}
+  `.trim();
+}
+
 export function renderSettingsDrawer(model: PresentationalAppModel): string {
   if (!model.settingsDrawerOpen) {
     return "";
@@ -1170,7 +1264,8 @@ export function renderSettingsDrawer(model: PresentationalAppModel): string {
           </section>
 
           <section class="nova-settings-section">
-            <h3 class="nova-settings-section-title">Modelos y general</h3>
+            <h3 class="nova-settings-section-title">Motores Multi-Tier, modelos y credenciales</h3>
+            ${renderMultiTierAgentsControls(model)}
             <label class="nova-settings-field">
               <span>Proveedor Tier 1</span>
               <input type="text" name="models.pi_provider" value="${escapeHtml(piProvider)}" maxlength="64" />

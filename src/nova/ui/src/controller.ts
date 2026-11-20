@@ -23,6 +23,9 @@ import {
   resolveHumanNotice,
 } from "./components.js";
 import type {
+  AgentCatalogSnapshot,
+  AgentDiagnosticResponse,
+  AgentEngineId,
   AgentTaskStatus,
   AgentsFilterKey,
   AntigravityDiagnosticResponse,
@@ -70,6 +73,9 @@ const SETTINGS_DRAFT_FIELDS = [
   "voice.whisper_language",
   "shortcuts.ptt_mode",
   "shortcuts.global_shortcut",
+  "models.tier1_engine",
+  "models.tier2_engine",
+  "models.single_engine_mode",
   "models.pi_provider",
   "models.pi_model",
   "models.tier2_model",
@@ -710,6 +716,84 @@ export class DesktopAppController {
     }
   }
 
+  async loadAgentCatalog(): Promise<void> {
+    if (this.#disposed) {
+      return;
+    }
+    try {
+      const resp = await this.#fetch("/api/agents/catalog", {
+        method: "GET",
+        credentials: "same-origin",
+      });
+      if (!resp.ok || this.#disposed) {
+        return;
+      }
+      const catalog = (await resp.json()) as AgentCatalogSnapshot;
+      this.#updateModel({ agentCatalog: catalog });
+    } catch {
+      // Non-blocking catalog fetch
+    }
+  }
+
+  async runAgentDiagnostic(engine: AgentEngineId, tier: "tier1" | "tier2" = "tier1"): Promise<void> {
+    if (this.#disposed) {
+      return;
+    }
+    try {
+      const resp = await this.#postJson("/api/diagnostics/agent", { engine, tier });
+      if (resp.ok && !this.#disposed) {
+        const result = (await resp.json()) as AgentDiagnosticResponse;
+        this.#updateModel({ agentProbeResult: result });
+      }
+    } catch {
+      // Ignore transient network errors
+    }
+  }
+
+  async saveProviderCredential(provider: string, envVar: string, value: string): Promise<void> {
+    if (this.#disposed || !value.trim()) {
+      return;
+    }
+    try {
+      const resp = await this.#fetch("/api/credentials", {
+        method: "PUT",
+        credentials: "same-origin",
+        headers: {
+          "Content-Type": "application/json",
+          "X-Nova-CSRF": this.#csrfToken,
+        },
+        body: JSON.stringify({ provider, env_var: envVar, value: value.trim() }),
+      });
+      if (resp.ok) {
+        await this.loadAgentCatalog();
+      }
+    } catch {
+      // Ignore transient network errors
+    }
+  }
+
+  async deleteProviderCredential(provider: string, envVar: string): Promise<void> {
+    if (this.#disposed) {
+      return;
+    }
+    try {
+      const resp = await this.#fetch("/api/credentials", {
+        method: "DELETE",
+        credentials: "same-origin",
+        headers: {
+          "Content-Type": "application/json",
+          "X-Nova-CSRF": this.#csrfToken,
+        },
+        body: JSON.stringify({ provider, env_var: envVar }),
+      });
+      if (resp.ok) {
+        await this.loadAgentCatalog();
+      }
+    } catch {
+      // Ignore transient network errors
+    }
+  }
+
   async runAllDiagnostics(): Promise<void> {
     if (this.#disposed) {
       return;
@@ -901,6 +985,7 @@ export class DesktopAppController {
     if (this.#disposed) {
       return;
     }
+    void this.loadAgentCatalog();
     this.#updateModel({
       settingsDrawerOpen: true,
       settingsLoading: true,
@@ -1550,6 +1635,27 @@ export class DesktopAppController {
           void this.runDiagnostic("antigravity");
         } else if (action === "diag-run-all") {
           void this.runAllDiagnostics();
+        } else if (action === "probe-agent") {
+          const eng = target.dataset["engine"] as AgentEngineId | undefined;
+          const tier = target.dataset["tier"] === "tier2" ? "tier2" : "tier1";
+          if (eng) {
+            void this.runAgentDiagnostic(eng, tier);
+          }
+        } else if (action === "save-credential") {
+          const prov = target.dataset["provider"] ?? "";
+          const envVar = target.dataset["envVar"] ?? "";
+          const inp = root.querySelector<HTMLInputElement>(`[data-cred-input="${envVar}"]`);
+          if (prov && envVar && inp && inp.value.trim()) {
+            const val = inp.value;
+            inp.value = "";
+            void this.saveProviderCredential(prov, envVar, val);
+          }
+        } else if (action === "delete-credential") {
+          const prov = target.dataset["provider"] ?? "";
+          const envVar = target.dataset["envVar"] ?? "";
+          if (prov && envVar) {
+            void this.deleteProviderCredential(prov, envVar);
+          }
         } else if (action === "complete-onboarding") {
           const capEl = root.querySelector<HTMLSelectElement>(
             '[name="onboarding.capture_target"]',
@@ -1683,6 +1789,11 @@ export class DesktopAppController {
               whisper_model: String(fd.get("voice.whisper_model") ?? "small"),
             },
             models: {
+              tier1_engine: String(fd.get("models.tier1_engine") ?? "auto").trim(),
+              tier2_engine: String(fd.get("models.tier2_engine") ?? "auto").trim(),
+              single_engine_mode: fd.get("models.single_engine_mode") === "on",
+              tier1_provider: String(fd.get("models.pi_provider") ?? "").trim(),
+              tier1_model: String(fd.get("models.pi_model") ?? "").trim(),
               pi_provider: String(fd.get("models.pi_provider") ?? "").trim(),
               pi_model: String(fd.get("models.pi_model") ?? "").trim(),
               tier2_model: String(fd.get("models.tier2_model") ?? "").trim(),

@@ -12,7 +12,18 @@ export type CallSessionState =
 
 export type WorkspaceQueryMode = "exact_path" | "voice_fuzzy" | "ui_picker";
 export type WorkspaceTopology = "multi-project" | "single-repo";
-export type CommandSource = "tier1_pi" | "tier2_agy";
+export type AgentEngineId = "pi" | "agy" | "claude" | "opencode";
+export type AgentEngineChoice = "auto" | AgentEngineId;
+export type AgentAuthMode = "native_cli" | "api_token" | "unconfigured";
+export type CommandSource =
+  | "tier1_pi"
+  | "tier2_agy"
+  | "tier1_claude"
+  | "tier2_claude"
+  | "tier1_opencode"
+  | "tier2_opencode"
+  | "tier1_agy"
+  | "tier2_pi";
 export type AuditRiskLevel = "medium" | "high" | "critical";
 
 export type UiEventType =
@@ -35,6 +46,7 @@ export type UiMessageModality =
   | "text"
   | "voice"
   | "tier1_pi"
+  | "tier1_agent"
   | "tier2_runner"
   | "milestone"
   | "error"
@@ -172,6 +184,12 @@ export interface NovaSettingsDocument {
     readonly kokoro_voice: string;
   };
   readonly models: {
+    readonly tier1_engine?: AgentEngineChoice | undefined;
+    readonly tier1_provider?: string | undefined;
+    readonly tier1_model?: string | undefined;
+    readonly tier2_engine?: AgentEngineChoice | undefined;
+    readonly tier2_provider?: string | undefined;
+    readonly single_engine_mode?: boolean | undefined;
     readonly pi_provider: string;
     readonly pi_model: string;
     readonly tier2_model: string;
@@ -242,6 +260,52 @@ export interface AntigravityDiagnosticResponse {
   readonly plugin_verified: boolean;
   readonly latency_ms: number;
   readonly message: string;
+}
+
+export interface AgentDiagnosticResponse {
+  readonly ok: boolean;
+  readonly engine: AgentEngineId;
+  readonly status: string;
+  readonly provider: string;
+  readonly model: string;
+  readonly plugin_verified: boolean;
+  readonly latency_ms: number;
+  readonly message: string;
+}
+
+export interface AgentCatalogEntry {
+  readonly engine: AgentEngineId;
+  readonly display_name: string;
+  readonly installed: boolean;
+  readonly binary_path: string | null;
+  readonly auth_mode: AgentAuthMode;
+  readonly configured_env_vars: readonly string[];
+  readonly supports_tier1: boolean;
+  readonly supports_tier2: boolean;
+  readonly default_tier1_model: string;
+  readonly default_tier2_model: string;
+}
+
+export interface ProviderCredentialStatus {
+  readonly provider: string;
+  readonly env_var: string;
+  readonly configured: boolean;
+}
+
+export interface ActiveTierSelection {
+  readonly engine: AgentEngineId;
+  readonly provider: string;
+  readonly model: string;
+}
+
+export interface AgentCatalogSnapshot {
+  readonly schema_version: string;
+  readonly credential_backend: "libsecret" | "local_file_0600" | "none";
+  readonly active_tier1: ActiveTierSelection | null;
+  readonly active_tier2: ActiveTierSelection | null;
+  readonly single_engine_mode: boolean;
+  readonly engines: readonly AgentCatalogEntry[];
+  readonly providers: readonly ProviderCredentialStatus[];
 }
 
 export type DiagnosticTarget = "microphone" | "audio-output" | "pi" | "antigravity";
@@ -338,4 +402,6 @@ export interface PresentationalAppModel {
   readonly allowedRoots?: readonly string[] | undefined;
   readonly initWorkspaceOpen?: boolean | undefined;
   readonly diagnostics?: LiveDiagnosticsState | null | undefined;
+  readonly agentCatalog?: AgentCatalogSnapshot | null | undefined;
+  readonly agentProbeResult?: AgentDiagnosticResponse | null | undefined;
 }

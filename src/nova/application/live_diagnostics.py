@@ -25,6 +25,10 @@ from nova.domain.errors import (
 )
 from nova.domain.models import (
     DEFAULT_PI_MODEL,
+    AgentDiagnosticResult,
+    AgentDiagnosticStatus,
+    AgentEngineId,
+    AgentTier,
     AntigravityDiagnosticResult,
     AntigravityDiagnosticStatus,
     AudioOutputDiagnosticResult,
@@ -46,6 +50,14 @@ AudioOutputFactory = Callable[[str | None], AudioOutputPort]
 PiProbeRunner = Callable[[str, tuple[str, ...], str, str, str], Awaitable[None]]
 AgyProbeRunner = Callable[
     [str, tuple[str, ...], str, str, dict[str, str] | None],
+    Awaitable[None],
+]
+ClaudeProbeRunner = Callable[
+    [str, tuple[str, ...], str, str, dict[str, str] | None],
+    Awaitable[None],
+]
+OpenCodeProbeRunner = Callable[
+    [str, tuple[str, ...], str, str, str, dict[str, str] | None],
     Awaitable[None],
 ]
 
@@ -123,6 +135,10 @@ class LiveDiagnosticsConfig(BaseModel):
     pi_model: str = Field(default=DEFAULT_PI_MODEL, min_length=1)
     agy_executable: str = Field(default="agy", min_length=1)
     agy_extra_args: tuple[str, ...] = ()
+    claude_executable: str = Field(default="claude", min_length=1)
+    claude_extra_args: tuple[str, ...] = ()
+    opencode_executable: str = Field(default="opencode", min_length=1)
+    opencode_extra_args: tuple[str, ...] = ()
     tier2_model: str = Field(default="claude-opus-5-5-high", min_length=1)
     tts_engine_label: str = "piper"
     gatekeeper_ipc_env: dict[str, str] | None = None
@@ -140,6 +156,8 @@ class LiveDiagnosticsService:
         audio_output_factory: AudioOutputFactory | None = None,
         pi_probe_runner: PiProbeRunner | None = None,
         agy_probe_runner: AgyProbeRunner | None = None,
+        claude_probe_runner: ClaudeProbeRunner | None = None,
+        opencode_probe_runner: OpenCodeProbeRunner | None = None,
         stt_port: SpeechToTextPort | None = None,
         tts_port: TextToSpeechPort | None = None,
         extra_secrets_provider: Callable[[], tuple[str, ...]] | None = None,
@@ -150,6 +168,8 @@ class LiveDiagnosticsService:
         self._audio_output_factory = audio_output_factory
         self._pi_probe_runner = pi_probe_runner
         self._agy_probe_runner = agy_probe_runner
+        self._claude_probe_runner = claude_probe_runner
+        self._opencode_probe_runner = opencode_probe_runner
         self._stt_port = stt_port
         self._tts_port = tts_port
         self._extra_secrets_provider = extra_secrets_provider
@@ -516,3 +536,169 @@ class LiveDiagnosticsService:
                     latency_ms=elapsed_ms,
                     message=self._redact(f"Fallo al conectar con Antigravity: {raw_err}"),
                 )
+
+    async def test_agent_connection(
+        self,
+        engine: AgentEngineId,
+        *,
+        tier: AgentTier = "tier1",
+        provider: str | None = None,
+        model: str | None = None,
+    ) -> AgentDiagnosticResult:
+        """Generic live readiness probe for any supported CLI agent (NOVA-017)."""
+        _ = tier
+        if engine == "pi":
+            pi_res = await self.test_pi_connection(provider=provider, model=model)
+            return AgentDiagnosticResult(
+                ok=pi_res.ok,
+                engine="pi",
+                status=pi_res.status,
+                provider=pi_res.provider,
+                model=pi_res.model,
+                plugin_verified=pi_res.ok,
+                latency_ms=pi_res.latency_ms,
+                message=pi_res.message,
+            )
+        if engine == "agy":
+            agy_res = await self.test_antigravity_connection(model=model)
+            return AgentDiagnosticResult(
+                ok=agy_res.ok,
+                engine="agy",
+                status=agy_res.status,
+                provider="",
+                model=agy_res.model,
+                plugin_verified=agy_res.plugin_verified,
+                latency_ms=agy_res.latency_ms,
+                message=agy_res.message,
+            )
+
+        eff_provider = _validate_optional_token(provider, field_name="provider") or ""
+        eff_model = _validate_optional_token(model, field_name="model") or ""
+
+        if engine == "claude":
+            resolved = self._resolve_binary(
+                self._config.claude_executable,
+                default_name="claude",
+                fallbacks=(
+                    Path.home() / ".local" / "bin" / "claude",
+                    Path.home() / ".claude" / "local" / "claude",
+                ),
+            )
+            if resolved is None or self._claude_probe_runner is None:
+                return AgentDiagnosticResult(
+                    ok=False,
+                    engine="claude",
+                    status="binary_missing",
+                    provider=eff_provider,
+                    model=eff_model,
+                    plugin_verified=False,
+                    latency_ms=0.0,
+                    message=(
+                        f"Ejecutable '{self._config.claude_executable}' no encontrado."
+                    ),
+                )
+            started = time.monotonic()
+            with tempfile.TemporaryDirectory(prefix="nova-claude-probe-") as probe_dir:
+                try:
+                    await asyncio.wait_for(
+                        self._claude_probe_runner(
+                            resolved,
+                            self._config.claude_extra_args,
+                            eff_model or "haiku",
+                            probe_dir,
+                            self._config.gatekeeper_ipc_env,
+                        ),
+                        timeout=15.0,
+                    )
+                    return AgentDiagnosticResult(
+                        ok=True,
+                        engine="claude",
+                        status="connected",
+                        provider=eff_provider,
+                        model=eff_model or "haiku",
+                        plugin_verified=True,
+                        latency_ms=round((time.monotonic() - started) * 1000.0, 1),
+                        message="Conexión verificada entre Nova y Claude Code.",
+                    )
+                except (CodingRunnerError, NovaDomainError, TimeoutError, OSError) as exc:
+                    return self._classify_agent_probe_error(
+                        "claude", eff_provider, eff_model, started, exc
+                    )
+
+        # OpenCode
+        resolved_oc = self._resolve_binary(
+            self._config.opencode_executable,
+            default_name="opencode",
+            fallbacks=(
+                Path.home() / ".opencode" / "bin" / "opencode",
+                Path.home() / ".local" / "bin" / "opencode",
+            ),
+        )
+        if resolved_oc is None or self._opencode_probe_runner is None:
+            return AgentDiagnosticResult(
+                ok=False,
+                engine="opencode",
+                status="binary_missing",
+                provider=eff_provider,
+                model=eff_model,
+                plugin_verified=False,
+                latency_ms=0.0,
+                message=f"Ejecutable '{self._config.opencode_executable}' no encontrado.",
+            )
+        started_oc = time.monotonic()
+        with tempfile.TemporaryDirectory(prefix="nova-opencode-probe-") as probe_dir:
+            try:
+                await asyncio.wait_for(
+                    self._opencode_probe_runner(
+                        resolved_oc,
+                        self._config.opencode_extra_args,
+                        eff_provider,
+                        eff_model,
+                        probe_dir,
+                        self._config.gatekeeper_ipc_env,
+                    ),
+                    timeout=15.0,
+                )
+                return AgentDiagnosticResult(
+                    ok=True,
+                    engine="opencode",
+                    status="connected",
+                    provider=eff_provider,
+                    model=eff_model,
+                    plugin_verified=True,
+                    latency_ms=round((time.monotonic() - started_oc) * 1000.0, 1),
+                    message="Conexión verificada entre Nova y OpenCode.",
+                )
+            except (CodingRunnerError, NovaDomainError, TimeoutError, OSError) as exc:
+                return self._classify_agent_probe_error(
+                    "opencode", eff_provider, eff_model, started_oc, exc
+                )
+
+    def _classify_agent_probe_error(
+        self,
+        engine: AgentEngineId,
+        provider: str,
+        model: str,
+        started: float,
+        exc: Exception,
+    ) -> AgentDiagnosticResult:
+        elapsed_ms = round((time.monotonic() - started) * 1000.0, 1)
+        raw_err = exc.sanitized_message if isinstance(exc, NovaDomainError) else str(exc)
+        low_err = raw_err.lower()
+        status: AgentDiagnosticStatus
+        if "timed out" in low_err or isinstance(exc, TimeoutError):
+            status = "timeout"
+        elif any(hint in low_err for hint in _AUTH_ERROR_HINTS):
+            status = "auth_error"
+        else:
+            status = "error"
+        return AgentDiagnosticResult(
+            ok=False,
+            engine=engine,
+            status=status,
+            provider=provider,
+            model=model,
+            plugin_verified=False,
+            latency_ms=elapsed_ms,
+            message=self._redact(f"Fallo al conectar con {engine}: {raw_err}"),
+        )
