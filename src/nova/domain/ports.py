@@ -8,6 +8,9 @@ from typing import Literal, Protocol
 
 from nova.domain.events import CommandApprovalResolvedEvent
 from nova.domain.models import (
+    AgentEngineId,
+    AgentSessionPointer,
+    AgentTier,
     AudioDeviceCatalog,
     AudioFrame,
     CodingTaskRequest,
@@ -247,6 +250,19 @@ class HistoryStorePort(Protocol):
         workspace_canonical_path: str,
     ) -> WorkspaceSessionPointer | None:
         """Retrieve stored session identifiers for a workspace, if any."""
+        ...
+
+    async def save_agent_session(self, pointer: AgentSessionPointer) -> None:
+        """Upsert an engine- and tier-specific session pointer for a workspace (NOVA-017)."""
+        ...
+
+    async def get_agent_session(
+        self,
+        workspace_canonical_path: str,
+        tier: AgentTier,
+        agent_provider: AgentEngineId,
+    ) -> AgentSessionPointer | None:
+        """Retrieve stored session pointer by (workspace, tier, agent_provider) (NOVA-017)."""
         ...
 
     async def close(self) -> None:

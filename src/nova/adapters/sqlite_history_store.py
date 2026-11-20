@@ -10,7 +10,13 @@ import threading
 from collections.abc import Mapping
 from pathlib import Path
 
-from nova.domain.models import PersistedChatMessage, WorkspaceSessionPointer
+from nova.domain.models import (
+    AgentEngineId,
+    AgentSessionPointer,
+    AgentTier,
+    PersistedChatMessage,
+    WorkspaceSessionPointer,
+)
 from nova.domain.ports import HistoryStorePort
 
 _SCHEMA_DDL = """
@@ -38,6 +44,34 @@ CREATE TABLE IF NOT EXISTS workspace_sessions (
     agy_conversation_id TEXT,
     updated_at REAL NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS workspace_agent_sessions (
+    workspace_canonical_path TEXT NOT NULL,
+    tier TEXT NOT NULL,
+    agent_provider TEXT NOT NULL,
+    session_id TEXT NOT NULL,
+    updated_at REAL NOT NULL,
+    PRIMARY KEY (workspace_canonical_path, tier, agent_provider)
+);
+
+CREATE INDEX IF NOT EXISTS idx_workspace_agent_sessions_ws
+    ON workspace_agent_sessions(workspace_canonical_path);
+"""
+
+_MIGRATE_LEGACY_SESSIONS_SQL = """
+INSERT OR IGNORE INTO workspace_agent_sessions (
+    workspace_canonical_path, tier, agent_provider, session_id, updated_at
+)
+SELECT workspace_canonical_path, 'tier1', 'pi', pi_session_id, updated_at
+FROM workspace_sessions
+WHERE pi_session_id IS NOT NULL AND TRIM(pi_session_id) != '';
+
+INSERT OR IGNORE INTO workspace_agent_sessions (
+    workspace_canonical_path, tier, agent_provider, session_id, updated_at
+)
+SELECT workspace_canonical_path, 'tier2', 'agy', agy_conversation_id, updated_at
+FROM workspace_sessions
+WHERE agy_conversation_id IS NOT NULL AND TRIM(agy_conversation_id) != '';
 """
 
 
@@ -88,6 +122,7 @@ class SqliteHistoryStore(HistoryStorePort):
                     self._db_path.chmod(0o600)
 
             conn.executescript(_SCHEMA_DDL)
+            conn.executescript(_MIGRATE_LEGACY_SESSIONS_SQL)
             conn.commit()
 
             self._conn = conn
@@ -239,6 +274,72 @@ class SqliteHistoryStore(HistoryStorePort):
                 workspace_canonical_path=row["workspace_canonical_path"],
                 pi_session_id=row["pi_session_id"],
                 agy_conversation_id=row["agy_conversation_id"],
+                updated_at=row["updated_at"],
+            )
+
+    async def save_agent_session(self, pointer: AgentSessionPointer) -> None:
+        """Upsert an engine- and tier-specific session pointer for a workspace (NOVA-017)."""
+        await asyncio.to_thread(self._save_agent_session_sync, pointer)
+
+    def _save_agent_session_sync(self, pointer: AgentSessionPointer) -> None:
+        conn = self._ensure_initialized()
+        with self._lock:
+            conn.execute(
+                """
+                INSERT INTO workspace_agent_sessions (
+                    workspace_canonical_path, tier, agent_provider, session_id, updated_at
+                ) VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(workspace_canonical_path, tier, agent_provider) DO UPDATE SET
+                    session_id = excluded.session_id,
+                    updated_at = excluded.updated_at
+                """,
+                (
+                    pointer.workspace_canonical_path,
+                    pointer.tier,
+                    pointer.agent_provider,
+                    pointer.session_id,
+                    pointer.updated_at,
+                ),
+            )
+            conn.commit()
+
+    async def get_agent_session(
+        self,
+        workspace_canonical_path: str,
+        tier: AgentTier,
+        agent_provider: AgentEngineId,
+    ) -> AgentSessionPointer | None:
+        """Retrieve stored session pointer by (workspace, tier, agent_provider) (NOVA-017)."""
+        return await asyncio.to_thread(
+            self._get_agent_session_sync,
+            workspace_canonical_path,
+            tier,
+            agent_provider,
+        )
+
+    def _get_agent_session_sync(
+        self,
+        workspace_canonical_path: str,
+        tier: AgentTier,
+        agent_provider: AgentEngineId,
+    ) -> AgentSessionPointer | None:
+        conn = self._ensure_initialized()
+        with self._lock:
+            row = conn.execute(
+                """
+                SELECT workspace_canonical_path, tier, agent_provider, session_id, updated_at
+                FROM workspace_agent_sessions
+                WHERE workspace_canonical_path = ? AND tier = ? AND agent_provider = ?
+                """,
+                (workspace_canonical_path, tier, agent_provider),
+            ).fetchone()
+            if row is None:
+                return None
+            return AgentSessionPointer(
+                workspace_canonical_path=row["workspace_canonical_path"],
+                tier=row["tier"],
+                agent_provider=row["agent_provider"],
+                session_id=row["session_id"],
                 updated_at=row["updated_at"],
             )
 
