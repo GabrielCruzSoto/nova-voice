@@ -755,6 +755,7 @@ async def test_nova018_ac2_ac3_ac6_voice_confirmation_then_full_spoken_stream(
         tier1_client=tier1,
         tier2_runner=tier2,
         event_bus=bus,
+        settings=OrchestratorSettings(require_voice_confirmation=True),
         clock=lambda: now[0],
     )
     await orchestrator.select_workspace(str(repo), mode="exact_path", correlation_id="c-ws")
@@ -827,7 +828,10 @@ async def test_nova018_ac4_ac5_cancel_correct_ttl_expiry_and_chat_direct(
         tier1_client=tier1,
         tier2_runner=tier2,
         event_bus=bus,
-        settings=OrchestratorSettings(voice_confirmation_ttl_seconds=60.0),
+        settings=OrchestratorSettings(
+            require_voice_confirmation=True,
+            voice_confirmation_ttl_seconds=60.0,
+        ),
         clock=lambda: now[0],
     )
     await orchestrator.select_workspace(str(repo), mode="exact_path")

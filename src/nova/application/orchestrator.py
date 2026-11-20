@@ -122,7 +122,7 @@ class OrchestratorSettings(BaseModel):
     tier1_engine: AgentEngineId = "pi"
     tier2_engine: AgentEngineId = "agy"
     default_tier2_model: str = Field(default="claude-opus-5-5-high", min_length=1)
-    require_voice_confirmation: bool = True
+    require_voice_confirmation: bool = False
     voice_confirmation_ttl_seconds: float = Field(default=300.0, ge=30.0, le=900.0)
     max_voice_confirmation_revisions: int = Field(default=8, ge=1, le=20)
 

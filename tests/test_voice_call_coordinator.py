@@ -21,6 +21,7 @@ from nova.domain.events import (
     OrchestratorEventBus,
     RunnerFailureEvent,
     VoiceMilestoneEvent,
+    VoiceSpeechChunkEvent,
     VoiceTranscriptionEvent,
 )
 from nova.domain.models import (
@@ -1886,6 +1887,390 @@ async def test_tts_completion_clears_speaking_preroll_and_accepts_next_user_turn
     assert len(stt.captured_buffers) == 1
     # Only the 2 speech + 2 silence frames (4 * 1024 B), not the 3 stale speaking pre_roll frames
     assert len(stt.captured_buffers[0]) == 4 * 1024
+    await coordinator.shutdown()
+
+
+async def test_nova018_ac1_ac6_ac8_half_duplex_streams_speech_and_returns_standby() -> None:
+    bus = OrchestratorEventBus()
+    audio_in = _ScriptedAudioInput()
+    audio_out = _ControlledAudioOutput(hold_playback=False)
+    vad = _FakeVad()
+    tts = _FakeTts()
+    stt = _FakeStt(transcripts=["Oye Nova, explica la arquitectura"])
+
+    turn_started = asyncio.Event()
+    release_turn = asyncio.Event()
+    received_origins: list[str] = []
+
+    class _VoiceAwareOrchestrator(_FakeOrchestrator):
+        async def handle_user_utterance(
+            self,
+            utterance: str,
+            correlation_id: str | None = None,
+            *,
+            origin: str = "chat",
+        ) -> None:
+            received_origins.append(origin)
+            self.utterances.append((utterance, correlation_id))
+            turn_started.set()
+            await release_turn.wait()
+            corr = correlation_id or "c-hd"
+            await bus.publish(
+                VoiceSpeechChunkEvent(
+                    correlation_id=corr,
+                    text="Primera oración larga explicando la arquitectura local de Nova.",
+                    chunk_index=0,
+                    is_final=False,
+                )
+            )
+            await bus.publish(
+                VoiceSpeechChunkEvent(
+                    correlation_id=corr,
+                    text="Segunda oración completando la explicación sin truncar en 20 palabras.",
+                    chunk_index=1,
+                    is_final=True,
+                )
+            )
+
+    orch = _VoiceAwareOrchestrator(event_bus=bus)
+    coordinator = VoiceCallCoordinator(
+        audio_input=audio_in,
+        audio_output=audio_out,
+        wake_word=_FakeWakeWord(),
+        vad=vad,
+        stt=stt,
+        tts=tts,
+        orchestrator=orch,
+        event_bus=bus,
+        settings=VoiceCoordinatorSettings(
+            min_speech_frames=2,
+            end_silence_frames=2,
+            barge_in_grace_seconds=0.0,
+            barge_in_min_frames=2,
+            enable_wake_earcon=False,
+            half_duplex_turn_mode=True,
+        ),
+    )
+    await coordinator.start()
+
+    # AC-8: VoiceSpeechChunkEvent emitted while in standby (typed chat) is discarded silently
+    await bus.publish(
+        VoiceSpeechChunkEvent(
+            correlation_id="c-standby-chat",
+            text="No deberia reproducirse en standby.",
+            chunk_index=0,
+            is_final=True,
+        )
+    )
+    await asyncio.sleep(0.03)
+    assert tts.synthesized_texts == []
+
+    # 1. User wakes Nova with 1-shot standby spotter ("Oye Nova, explica la arquitectura")
+    vad.probs = [0.95, 0.95, 0.05, 0.05]
+    for _ in range(4):
+        audio_in.push_frame(_ac_frame(4000))
+    await asyncio.wait_for(turn_started.wait(), timeout=1.0)
+    assert _state_of(coordinator) == "executing"
+    assert received_origins == ["voice"]
+
+    # 2. Loud microphone audio during executing MUST NOT trigger barge-in in half-duplex mode
+    vad.probs = [0.99, 0.99, 0.99, 0.99]
+    for _ in range(4):
+        audio_in.push_frame(_ac_frame(12000))
+    await asyncio.sleep(0.04)
+    assert orch.barge_in_calls == 0
+    assert _state_of(coordinator) == "executing"
+
+    # 3. Hold playback to verify loud mic audio during speaking also does NOT trigger barge-in
+    audio_out.hold_playback = True
+    release_turn.set()
+    await asyncio.wait_for(audio_out.started_ev.wait(), timeout=1.0)
+    assert _state_of(coordinator) == "speaking"
+
+    vad.probs = [0.99, 0.99, 0.99, 0.99]
+    for _ in range(4):
+        audio_in.push_frame(_ac_frame(12000))
+    await asyncio.sleep(0.04)
+    assert orch.barge_in_calls == 0
+    assert _state_of(coordinator) == "speaking"
+
+    # 4. Release playback -> plays BOTH speech chunks in order and returns automatically to standby
+    audio_out.hold_playback = False
+    audio_out._stop_ev.set()
+    await asyncio.sleep(0.08)
+    assert tts.synthesized_texts == [
+        "Primera oración larga explicando la arquitectura local de Nova.",
+        "Segunda oración completando la explicación sin truncar en 20 palabras.",
+    ]
+    assert _state_of(coordinator) == "standby"
+
+    # 5. Manual barge_in() still works explicitly in half-duplex mode
+    await coordinator.start_call(reason="manual_call_start")
+    audio_out.hold_playback = True
+    audio_out.started_ev.clear()
+    await bus.publish(
+        VoiceSpeechChunkEvent(
+            correlation_id="c-manual-cut",
+            text="Texto largo interrumpible manualmente por boton.",
+            chunk_index=0,
+            is_final=True,
+        )
+    )
+    await asyncio.wait_for(audio_out.started_ev.wait(), timeout=1.0)
+    await coordinator.barge_in()
+    assert orch.barge_in_calls >= 1
+    assert _state_of(coordinator) == "listening"
+    await coordinator.shutdown()
+
+
+async def test_nova018_ac5_half_duplex_preserves_gatekeeper_priority_across_standby() -> None:
+    bus = OrchestratorEventBus()
+    audio_in = _ScriptedAudioInput()
+    audio_out = _ControlledAudioOutput(hold_playback=False)
+    vad = _FakeVad()
+    tts = _FakeTts()
+    stt = _FakeStt(transcripts=["Oye Nova, ejecuta el script", "Oye Nova, aprobar comando"])
+
+    approval_released = asyncio.Event()
+    turn_completed = asyncio.Event()
+    now = [10.0]
+
+    class _GatekeeperOrchestrator(_FakeOrchestrator):
+        async def handle_user_utterance(
+            self,
+            utterance: str,
+            correlation_id: str | None = None,
+            *,
+            origin: str = "chat",
+        ) -> None:
+            del origin
+            self.utterances.append((utterance, correlation_id))
+            await bus.publish(
+                CommandApprovalRequestedEvent(
+                    audit_id="aud-hd-1",
+                    correlation_id=correlation_id or "c-gk",
+                    source="tier1_pi",
+                    sanitized_command="sudo systemctl restart demo",
+                    cwd="/tmp",
+                    risk_level="high",
+                    spoken_summary="Atención, se requiere aprobar este comando.",
+                    technical_explanation="Restart service",
+                    expires_in_seconds=60.0,
+                )
+            )
+            await bus.publish(
+                VoiceMilestoneEvent(
+                    correlation_id=correlation_id or "c-gk",
+                    summary_text="Atención, se requiere aprobar este comando.",
+                    priority="interrupt",
+                )
+            )
+            await approval_released.wait()
+            await bus.publish(
+                VoiceSpeechChunkEvent(
+                    correlation_id=correlation_id or "c-gk",
+                    text="Comando aprobado y completado correctamente.",
+                    chunk_index=0,
+                    is_final=True,
+                )
+            )
+            turn_completed.set()
+
+        async def resolve_command_approval(
+            self,
+            audit_id: str,
+            *,
+            approved: bool,
+            resolved_by: str = "user_voice_or_ui",
+        ) -> CommandApprovalResolvedEvent:
+            ev = await super().resolve_command_approval(
+                audit_id, approved=approved, resolved_by=resolved_by
+            )
+            approval_released.set()
+            return ev
+
+    orch = _GatekeeperOrchestrator(event_bus=bus)
+    coordinator = VoiceCallCoordinator(
+        audio_input=audio_in,
+        audio_output=audio_out,
+        wake_word=_FakeWakeWord(),
+        vad=vad,
+        stt=stt,
+        tts=tts,
+        orchestrator=orch,
+        event_bus=bus,
+        settings=VoiceCoordinatorSettings(
+            min_speech_frames=2,
+            end_silence_frames=2,
+            enable_wake_earcon=False,
+            half_duplex_turn_mode=True,
+        ),
+        clock=lambda: now[0],
+    )
+    await coordinator.start()
+
+    # 1. Initial command enters Gatekeeper hold, speaks warning, and returns to standby
+    vad.probs = [0.95, 0.95, 0.05, 0.05]
+    for _ in range(4):
+        audio_in.push_frame(_ac_frame(4000))
+    await asyncio.sleep(0.08)
+    assert _state_of(coordinator) == "standby"
+    assert orch.barge_in_calls == 0
+
+    # 2. User says "Oye Nova, aprobar comando" -> resolves Gatekeeper (Priority 1)
+    now[0] = 15.0
+    vad.probs = [0.95, 0.95, 0.05, 0.05]
+    for _ in range(4):
+        audio_in.push_frame(_ac_frame(4000))
+    await asyncio.wait_for(turn_completed.wait(), timeout=1.0)
+    await asyncio.sleep(0.08)
+
+    assert orch.approvals == [("aud-hd-1", True, "user_voice")]
+    assert "Comando aprobado y completado correctamente." in tts.synthesized_texts
+    assert _state_of(coordinator) == "standby"
+    await coordinator.shutdown()
+
+
+async def test_nova018_e2e_half_duplex_real_orchestrator_confirmation_and_gatekeeper(
+    tmp_path: object,
+) -> None:
+    from pathlib import Path
+
+    from nova.adapters.workspace_resolver import LocalWorkspaceResolver
+    from nova.application.orchestrator import NovaOrchestrator, OrchestratorSettings
+    from nova.application.security_gatekeeper import GatekeeperSettings, SecurityGatekeeper
+    from nova.domain.models import (
+        CodingTaskRequest,
+        CommandAuditInput,
+        CommandAuditResult,
+        CommandInterceptRequest,
+        RunnerProgressEvent,
+    )
+
+    assert isinstance(tmp_path, Path)
+    root = tmp_path / "Proyectos"
+    repo = root / "nova-e2e-hd"
+    repo.mkdir(parents=True)
+
+    bus = OrchestratorEventBus()
+    resolver = LocalWorkspaceResolver(allowed_roots=[root], event_bus=bus)
+
+    class _AuditorStub:
+        async def audit(self, request: CommandAuditInput) -> CommandAuditResult:
+            return CommandAuditResult(
+                risk_level="high",
+                spoken_summary="Se requiere aprobar el comando privilegiado.",
+                technical_explanation=request.rule_id,
+                audited_by="deterministic_fallback",
+            )
+
+    gatekeeper = SecurityGatekeeper(
+        workspace_resolver=resolver,
+        auditor=_AuditorStub(),
+        event_bus=bus,
+        settings=GatekeeperSettings(approval_timeout_seconds=5.0),
+    )
+    executed = asyncio.Event()
+
+    class _Tier1Stub:
+        async def switch_workspace(self, new_workspace_path: str) -> None:
+            pass
+
+        async def stream_prompt(self, message: str) -> AsyncIterator[str]:
+            dec = await gatekeeper.evaluate_and_authorize(
+                CommandInterceptRequest(
+                    correlation_id="corr-e2e-hd",
+                    source="tier1_pi",
+                    tool_name="bash",
+                    command="sudo echo listo",
+                    cwd=str(repo),
+                )
+            )
+            assert dec.allowed is True
+            executed.set()
+            yield "Primera oración del resultado completo tras aprobar el comando. "
+            yield "Segunda oración confirmando que todo terminó sin interferencias."
+
+        async def barge_in_abort(self) -> None:
+            pass
+
+    class _Tier2Stub:
+        async def execute(self, request: CodingTaskRequest) -> AsyncIterator[RunnerProgressEvent]:
+            yield RunnerProgressEvent(kind="completed", conversation_id="c", final_response="ok")
+
+    now = [100.0]
+    real_orch = NovaOrchestrator(
+        workspace_resolver=resolver,
+        tier1_client=_Tier1Stub(),
+        tier2_runner=_Tier2Stub(),
+        event_bus=bus,
+        settings=OrchestratorSettings(require_voice_confirmation=True),
+        security_gatekeeper=gatekeeper,
+        clock=lambda: now[0],
+    )
+    await real_orch.select_workspace(str(repo), mode="exact_path")
+
+    audio_in = _ScriptedAudioInput()
+    vad = _FakeVad()
+    tts = _FakeTts()
+    stt = _FakeStt(
+        transcripts=[
+            "Oye Nova, ejecuta comando con sudo",
+            "Oye Nova, sí",
+            "Oye Nova, aprobar comando",
+        ]
+    )
+    coordinator = VoiceCallCoordinator(
+        audio_input=audio_in,
+        audio_output=_ControlledAudioOutput(hold_playback=False),
+        wake_word=_FakeWakeWord(),
+        vad=vad,
+        stt=stt,
+        tts=tts,
+        orchestrator=real_orch,
+        event_bus=bus,
+        security_gatekeeper=gatekeeper,
+        settings=VoiceCoordinatorSettings(
+            min_speech_frames=2,
+            end_silence_frames=2,
+            enable_wake_earcon=False,
+            half_duplex_turn_mode=True,
+        ),
+        clock=lambda: now[0],
+    )
+    await coordinator.start()
+
+    # Turn 1: asks for confirmation, does NOT run Tier 1, returns to standby
+    vad.probs = [0.95, 0.95, 0.05, 0.05]
+    for _ in range(4):
+        audio_in.push_frame(_ac_frame(4000))
+    await asyncio.sleep(0.08)
+    assert not executed.is_set()
+    assert real_orch.pending_voice_task is not None
+    assert _state_of(coordinator) == "standby"
+
+    # Turn 2: "Oye Nova, sí" -> confirms -> Gatekeeper holds command -> speaks warning -> standby
+    now[0] = 105.0
+    vad.probs = [0.95, 0.95, 0.05, 0.05]
+    for _ in range(4):
+        audio_in.push_frame(_ac_frame(4000))
+    await asyncio.sleep(0.08)
+    assert real_orch.pending_voice_task is None
+    assert not executed.is_set()
+    assert _state_of(coordinator) == "standby"
+
+    # Turn 3: "Oye Nova, aprobar comando" -> approves Gatekeeper -> speaks full answer -> standby
+    now[0] = 107.0
+    vad.probs = [0.95, 0.95, 0.05, 0.05]
+    for _ in range(4):
+        audio_in.push_frame(_ac_frame(4000))
+    await asyncio.wait_for(executed.wait(), timeout=1.0)
+    await asyncio.sleep(0.1)
+
+    spoken_all = " ".join(tts.synthesized_texts)
+    assert "Primera oración del resultado completo" in spoken_all
+    assert "todo terminó sin interferencias" in spoken_all
+    assert _state_of(coordinator) == "standby"
     await coordinator.shutdown()
 
 
