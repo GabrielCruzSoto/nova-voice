@@ -575,7 +575,7 @@ async def test_runtime_runs_preflight_health_check_and_publishes_warning(
         failures = [e for e in events if isinstance(e, RunnerFailureEvent)]
         assert len(failures) == 1
         assert failures[0].error_code == "COMPONENTS_MISSING"
-        assert "pi" in failures[0].sanitized_message
+        assert "agent_runtime" in failures[0].sanitized_message
 
 
 async def test_run_desktop_daemon_exits_cleanly_via_http_shutdown_and_control_quit(
