@@ -160,8 +160,26 @@ class SettingsService:
                     if "barge_in_threshold" not in raw_voice:
                         voice_patch["barge_in_threshold"] = bi_t
 
+            models_patch = _merge_section(
+                prev_dump["models"],
+                raw_patch.get("models"),
+                section_name="models",
+            )
+            raw_models = raw_patch.get("models")
+            if isinstance(raw_models, Mapping):
+                if "tier1_provider" in raw_models and "pi_provider" not in raw_models:
+                    if models_patch.get("tier1_provider"):
+                        models_patch["pi_provider"] = models_patch["tier1_provider"]
+                if "tier1_model" in raw_models and "pi_model" not in raw_models:
+                    if models_patch.get("tier1_model"):
+                        models_patch["pi_model"] = models_patch["tier1_model"]
+                if "pi_provider" in raw_models and "tier1_provider" not in raw_models:
+                    models_patch["tier1_provider"] = models_patch["pi_provider"]
+                if "pi_model" in raw_models and "tier1_model" not in raw_models:
+                    models_patch["tier1_model"] = models_patch["pi_model"]
+
             merged_dump: dict[str, Any] = {
-                "schema_version": "1.0",
+                "schema_version": "1.1",
                 "general": _merge_section(
                     prev_dump["general"],
                     raw_patch.get("general"),
@@ -173,11 +191,7 @@ class SettingsService:
                     section_name="audio",
                 ),
                 "voice": voice_patch,
-                "models": _merge_section(
-                    prev_dump["models"],
-                    raw_patch.get("models"),
-                    section_name="models",
-                ),
+                "models": models_patch,
                 "shortcuts": _merge_section(
                     prev_dump["shortcuts"],
                     raw_patch.get("shortcuts"),

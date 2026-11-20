@@ -314,62 +314,100 @@ def check_system_components(
         os_release_path=os_release_path,
     )
 
-    # 1. Tier 1 Pi CLI
+    # 1. Multi-engine CLI agent detection (NOVA-017: claude, opencode, agy, pi)
     pi_name = config.pi_executable if config is not None else "pi"
-    pi_ok, pi_path = _resolve_cli_binary(
-        pi_name,
-        which_resolver,
-        fallback_paths=(
-            Path.home() / ".local" / "bin" / "pi",
-            Path.home() / ".pi" / "agent" / "bin" / "pi",
-        ),
-    )
-    checks.append(
-        ComponentCheckResult(
-            name="pi",
-            category="cli",
-            installed=pi_ok,
-            path=pi_path,
-            required=True,
-            details=(
-                f"Pi CLI encontrado en {pi_path}"
-                if pi_ok
-                else f"Ejecutable '{pi_name}' no encontrado en el PATH"
-            ),
-            remedy=(
-                ""
-                if pi_ok
-                else build_component_remedy("pi", host_env, which_resolver=which_resolver)
-            ),
-        )
+    agy_name = config.agy_executable if config is not None else "agy"
+    claude_name = getattr(config, "claude_executable", "claude") if config is not None else "claude"
+    opencode_name = (
+        getattr(config, "opencode_executable", "opencode") if config is not None else "opencode"
     )
 
-    # 2. Tier 2 Antigravity CLI (agy)
-    agy_name = config.agy_executable if config is not None else "agy"
-    agy_ok, agy_path = _resolve_cli_binary(
-        agy_name,
-        which_resolver,
-        fallback_paths=(Path.home() / ".local" / "bin" / "agy",),
+    cli_specs: tuple[tuple[str, str, str, tuple[Path, ...]], ...] = (
+        (
+            "claude",
+            "Claude Code",
+            claude_name,
+            (
+                Path.home() / ".local" / "bin" / "claude",
+                Path.home() / ".claude" / "local" / "claude",
+            ),
+        ),
+        (
+            "opencode",
+            "OpenCode",
+            opencode_name,
+            (
+                Path.home() / ".opencode" / "bin" / "opencode",
+                Path.home() / ".local" / "bin" / "opencode",
+            ),
+        ),
+        (
+            "agy",
+            "Antigravity",
+            agy_name,
+            (Path.home() / ".local" / "bin" / "agy",),
+        ),
+        (
+            "pi",
+            "Pi CLI",
+            pi_name,
+            (
+                Path.home() / ".local" / "bin" / "pi",
+                Path.home() / ".pi" / "agent" / "bin" / "pi",
+            ),
+        ),
     )
-    checks.append(
-        ComponentCheckResult(
-            name="agy",
-            category="cli",
-            installed=agy_ok,
-            path=agy_path,
-            required=False,
-            details=(
-                f"Antigravity CLI encontrado en {agy_path}"
-                if agy_ok
-                else f"Ejecutable '{agy_name}' no encontrado"
-            ),
-            remedy=(
-                ""
-                if agy_ok
-                else build_component_remedy("agy", host_env, which_resolver=which_resolver)
-            ),
+    detected_engines: list[tuple[str, str]] = []
+    for engine_id, label, exe_name, fallbacks in cli_specs:
+        ok, resolved_path = _resolve_cli_binary(
+            exe_name,
+            which_resolver,
+            fallback_paths=fallbacks,
         )
-    )
+        if ok and resolved_path is not None:
+            detected_engines.append((engine_id, resolved_path))
+            checks.append(
+                ComponentCheckResult(
+                    name=engine_id,
+                    category="cli",
+                    installed=True,
+                    path=resolved_path,
+                    required=False,
+                    details=f"{label} encontrado en {resolved_path}",
+                    remedy="",
+                )
+            )
+
+    if detected_engines:
+        summary_engines = ", ".join(name for name, _ in detected_engines)
+        checks.append(
+            ComponentCheckResult(
+                name="agent_runtime",
+                category="cli",
+                installed=True,
+                path=detected_engines[0][1],
+                required=True,
+                details=f"Motores CLI compatibles detectados: {summary_engines}",
+                remedy="",
+            )
+        )
+    else:
+        os_cli_remedy = build_component_remedy("pi", host_env, which_resolver=which_resolver)
+        checks.append(
+            ComponentCheckResult(
+                name="agent_runtime",
+                category="cli",
+                installed=False,
+                path=None,
+                required=True,
+                details="No se encontró ningún agente CLI compatible (claude, opencode, agy o pi)",
+                remedy=(
+                    "Instalá al menos un agente CLI compatible: Claude Code (claude), "
+                    "OpenCode (opencode), Antigravity (agy) o Pi CLI (pi). "
+                    f"{os_cli_remedy}"
+                ),
+            )
+        )
 
     # 3. Audio tools (PipeWire / PulseAudio)
     pw_rec_ok = bool(which_resolver("pw-record") or which_resolver("parecord"))

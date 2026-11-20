@@ -41,12 +41,15 @@ from nova.domain.events import (
     RunnerFailureEvent,
 )
 from nova.domain.models import (
+    AgentCatalogSnapshot,
+    AgentEngineId,
+    AgentTier,
     CallSession,
     InitializeWorkspaceRequest,
     WorkspaceContext,
     WorkspaceQueryMode,
 )
-from nova.domain.ports import FolderPickerPort
+from nova.domain.ports import CredentialStorePort, FolderPickerPort
 
 MAX_HTTP_BODY_BYTES = 65_536
 MAX_HEADER_LINE_BYTES = 8_192
@@ -170,6 +173,8 @@ class DesktopUiServer:
         workspace_resolver: LocalWorkspaceResolver | None = None,
         diagnostics_service: LiveDiagnosticsService | None = None,
         health_report_provider: Callable[[], Any] | None = None,
+        agent_catalog_provider: Callable[[], AgentCatalogSnapshot] | None = None,
+        credential_store: CredentialStorePort | None = None,
         health_recheck_callback: Callable[[], Awaitable[tuple[Any, bool]]] | None = None,
         models_provisioning_service: VoiceModelsProvisioningService | None = None,
         shutdown_callback: Callable[[str], None] | None = None,
@@ -187,6 +192,8 @@ class DesktopUiServer:
         self._workspace_resolver = workspace_resolver
         self._diagnostics_service = diagnostics_service
         self._health_report_provider = health_report_provider
+        self._agent_catalog_provider = agent_catalog_provider
+        self._credential_store = credential_store
         self._health_recheck_callback = health_recheck_callback
         self._models_provisioning_service = models_provisioning_service
         self._shutdown_callback = shutdown_callback
@@ -649,6 +656,29 @@ class DesktopUiServer:
             await self._write_json(writer, 200, data, corr_id)
             return
 
+        if method == "GET" and path == "/api/agents/catalog":
+            sess = self._validate_session_cookie(headers.get("cookie"))
+            if sess is None:
+                await self._write_error(
+                    writer,
+                    403,
+                    "UI_FORBIDDEN_ORIGIN_OR_CSRF",
+                    "Missing or invalid UI session cookie.",
+                    corr_id,
+                )
+                return
+            if self._agent_catalog_provider is None:
+                await self._write_json(
+                    writer,
+                    200,
+                    AgentCatalogSnapshot().model_dump(),
+                    corr_id,
+                )
+                return
+            snapshot = self._agent_catalog_provider()
+            await self._write_json(writer, 200, snapshot.model_dump(), corr_id)
+            return
+
         if method == "GET" and path == "/api/models/status":
             sess = self._validate_session_cookie(headers.get("cookie"))
             if sess is None:
@@ -697,7 +727,7 @@ class DesktopUiServer:
             await self._handle_sse_stream(reader, writer, sess, corr_id)
             return
 
-        if method in ("POST", "PUT") and path.startswith("/api/"):
+        if method in ("POST", "PUT", "DELETE") and path.startswith("/api/"):
             sess = self._validate_session_cookie(headers.get("cookie"))
             provided_csrf = headers.get(CSRF_HEADER_NAME, "")
             if (
@@ -715,6 +745,8 @@ class DesktopUiServer:
                 return
             if method == "PUT":
                 await self._dispatch_put_api(writer, path, body_bytes, corr_id)
+            elif method == "DELETE":
+                await self._dispatch_delete_api(writer, path, body_bytes, corr_id)
             else:
                 await self._dispatch_post_api(writer, path, body_bytes, corr_id)
             return
@@ -923,11 +955,123 @@ class DesktopUiServer:
             await self._write_json(writer, 200, result, corr_id)
             return
 
+        if path == "/api/credentials":
+            if self._credential_store is None:
+                await self._write_error(
+                    writer,
+                    503,
+                    "CREDENTIAL_STORE_UNAVAILABLE",
+                    "Credential store is not enabled in this session.",
+                    corr_id,
+                )
+                return
+            provider = payload.get("provider")
+            env_var = payload.get("env_var")
+            value = payload.get("value")
+            if (
+                not isinstance(provider, str)
+                or not isinstance(env_var, str)
+                or not isinstance(value, str)
+            ):
+                await self._write_error(
+                    writer,
+                    400,
+                    "INVALID_CREDENTIAL_REQUEST",
+                    "Fields 'provider', 'env_var', and 'value' must be strings.",
+                    corr_id,
+                )
+                return
+            try:
+                await asyncio.to_thread(
+                    self._credential_store.set_secret, provider, env_var, value
+                )
+            except DesktopUiError as exc:
+                status_code = 503 if exc.code == "CREDENTIAL_PERSIST_FAILED" else 400
+                await self._write_error(
+                    writer, status_code, exc.code, exc.sanitized_message, corr_id
+                )
+                return
+            await self._write_json(
+                writer,
+                200,
+                {
+                    "ok": True,
+                    "provider": provider.strip().lower(),
+                    "env_var": env_var.strip(),
+                    "configured": True,
+                    "backend": self._credential_store.backend_name,
+                },
+                corr_id,
+            )
+            return
+
         await self._write_error(
             writer,
             404,
             "UI_ROUTE_NOT_FOUND",
             f"Unknown PUT route: {path}",
+            corr_id,
+        )
+
+    async def _dispatch_delete_api(
+        self,
+        writer: asyncio.StreamWriter,
+        path: str,
+        body_bytes: bytes,
+        corr_id: str,
+    ) -> None:
+        try:
+            payload = self._parse_json_object(body_bytes)
+        except DesktopUiError as exc:
+            await self._write_error(writer, 400, exc.code, exc.sanitized_message, corr_id)
+            return
+
+        if path == "/api/credentials":
+            if self._credential_store is None:
+                await self._write_error(
+                    writer,
+                    503,
+                    "CREDENTIAL_STORE_UNAVAILABLE",
+                    "Credential store is not enabled in this session.",
+                    corr_id,
+                )
+                return
+            provider = payload.get("provider")
+            env_var = payload.get("env_var")
+            if not isinstance(provider, str) or not isinstance(env_var, str):
+                await self._write_error(
+                    writer,
+                    400,
+                    "INVALID_CREDENTIAL_REQUEST",
+                    "Fields 'provider' and 'env_var' must be strings.",
+                    corr_id,
+                )
+                return
+            try:
+                await asyncio.to_thread(
+                    self._credential_store.delete_secret, provider, env_var
+                )
+            except DesktopUiError as exc:
+                await self._write_error(writer, 400, exc.code, exc.sanitized_message, corr_id)
+                return
+            await self._write_json(
+                writer,
+                200,
+                {
+                    "ok": True,
+                    "provider": provider.strip().lower(),
+                    "env_var": env_var.strip(),
+                    "configured": False,
+                },
+                corr_id,
+            )
+            return
+
+        await self._write_error(
+            writer,
+            404,
+            "UI_ROUTE_NOT_FOUND",
+            f"Unknown DELETE route: {path}",
             corr_id,
         )
 
@@ -1458,6 +1602,36 @@ class DesktopUiServer:
                     model=agy_mod
                 )
                 await self._write_json(writer, 200, res_agy.model_dump(), corr_id)
+                return
+
+            if path == "/api/diagnostics/agent":
+                raw_engine = payload.get("engine")
+                raw_tier = payload.get("tier", "tier1")
+                raw_prov = payload.get("provider")
+                raw_mod = payload.get("model")
+                if (
+                    raw_engine not in ("pi", "agy", "claude", "opencode")
+                    or raw_tier not in ("tier1", "tier2")
+                    or (raw_prov is not None and not isinstance(raw_prov, str))
+                    or (raw_mod is not None and not isinstance(raw_mod, str))
+                ):
+                    await self._write_error(
+                        writer,
+                        400,
+                        "DIAGNOSTIC_INVALID_PARAMS",
+                        "Invalid agent diagnostic parameters.",
+                        corr_id,
+                    )
+                    return
+                eng: AgentEngineId = raw_engine
+                tier_val: AgentTier = raw_tier
+                res_agent = await self._diagnostics_service.test_agent_connection(
+                    eng,
+                    tier=tier_val,
+                    provider=raw_prov,
+                    model=raw_mod,
+                )
+                await self._write_json(writer, 200, res_agent.model_dump(), corr_id)
                 return
         except DesktopUiError as exc:
             await self._write_error(writer, 422, exc.code, exc.sanitized_message, corr_id)

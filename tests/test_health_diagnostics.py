@@ -107,11 +107,32 @@ def test_missing_pi_and_audio_tools_generates_alert_message(
     assert report.all_ok is False
     assert report.missing_critical_count >= 2
     assert report.alert_message is not None
-    assert "pi" in report.alert_message
+    assert "agent_runtime" in report.alert_message
 
     remedies = [c.remedy for c in report.components if not c.installed]
-    assert any("Pi CLI" in r for r in remedies)
+    assert any("Pi CLI" in r and "Claude Code" in r for r in remedies)
     assert any("pipewire" in r for r in remedies)
+
+
+def test_nova017_ac1_claude_or_opencode_only_passes_preflight(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    empty_home = tmp_path / "empty_home"
+    empty_home.mkdir()
+    monkeypatch.setattr(Path, "home", lambda: empty_home)
+
+    def claude_only_which(cmd: str) -> str | None:
+        if cmd in ("claude", "pw-record", "pw-play"):
+            return f"/usr/bin/{cmd}"
+        return None
+
+    config = NovaDesktopConfig(enable_voice=False)
+    report = check_system_components(config, which_resolver=claude_only_which)
+    assert report.all_ok is True
+    assert report.missing_critical_count == 0
+    assert any(c.name == "claude" and c.installed for c in report.components)
+    assert any(c.name == "agent_runtime" and c.installed for c in report.components)
 
 
 def test_missing_onnx_model_reported_with_download_remedy(
@@ -183,7 +204,7 @@ def test_os_package_manager_remediation_for_missing_audio_and_pi(
     assert audio_comp.installed is False
     assert expected_audio_cmd in audio_comp.remedy
 
-    pi_comp = next(c for c in report.components if c.name == "pi")
-    assert pi_comp.installed is False
-    assert "npm install -g" in pi_comp.remedy
-    assert expected_audio_cmd in pi_comp.remedy
+    agent_comp = next(c for c in report.components if c.name == "agent_runtime")
+    assert agent_comp.installed is False
+    assert "npm install -g" in agent_comp.remedy
+    assert expected_audio_cmd in agent_comp.remedy

@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+import sqlite3
 from pathlib import Path
 
 import pytest
 
 from nova.adapters.sqlite_history_store import SqliteHistoryStore, resolve_default_history_db_path
-from nova.domain.models import PersistedChatMessage, WorkspaceSessionPointer
+from nova.domain.models import AgentSessionPointer, PersistedChatMessage, WorkspaceSessionPointer
 
 
 @pytest.mark.asyncio
@@ -151,3 +152,62 @@ def test_resolve_default_history_db_path() -> None:
     env = {"XDG_DATA_HOME": "/custom/data"}
     resolved = resolve_default_history_db_path(env)
     assert resolved == Path("/custom/data/nova/history.db")
+
+
+@pytest.mark.asyncio
+async def test_nova017_ac9_agent_sessions_roundtrip_and_legacy_migration(tmp_path: Path) -> None:
+    db_file = tmp_path / "legacy_history.db"
+    # Pre-seed legacy NOVA-015 workspace_sessions table
+    conn = sqlite3.connect(str(db_file))
+    conn.executescript(
+        """
+        CREATE TABLE workspace_sessions (
+            workspace_canonical_path TEXT PRIMARY KEY,
+            pi_session_id TEXT,
+            agy_conversation_id TEXT,
+            updated_at REAL NOT NULL
+        );
+        INSERT INTO workspace_sessions (
+            workspace_canonical_path, pi_session_id, agy_conversation_id, updated_at
+        ) VALUES ('/home/user/legacy-ws', 'pi-legacy-1', 'agy-legacy-2', 1234.5);
+        """
+    )
+    conn.commit()
+    conn.close()
+
+    store = SqliteHistoryStore(db_file)
+    migrated_pi = await store.get_agent_session("/home/user/legacy-ws", "tier1", "pi")
+    migrated_agy = await store.get_agent_session("/home/user/legacy-ws", "tier2", "agy")
+    assert migrated_pi is not None
+    assert migrated_pi.session_id == "pi-legacy-1"
+    assert migrated_agy is not None
+    assert migrated_agy.session_id == "agy-legacy-2"
+
+    # Save multi-engine pointers for claude & opencode on same workspace
+    await store.save_agent_session(
+        AgentSessionPointer(
+            workspace_canonical_path="/home/user/legacy-ws",
+            tier="tier1",
+            agent_provider="opencode",
+            session_id="ses_oc_001",
+            updated_at=2000.0,
+        )
+    )
+    await store.save_agent_session(
+        AgentSessionPointer(
+            workspace_canonical_path="/home/user/legacy-ws",
+            tier="tier2",
+            agent_provider="claude",
+            session_id="claude-sess-999",
+            updated_at=2010.0,
+        )
+    )
+
+    oc_ptr = await store.get_agent_session("/home/user/legacy-ws", "tier1", "opencode")
+    claude_ptr = await store.get_agent_session("/home/user/legacy-ws", "tier2", "claude")
+    assert oc_ptr is not None and oc_ptr.session_id == "ses_oc_001"
+    assert claude_ptr is not None and claude_ptr.session_id == "claude-sess-999"
+    # Unrelated tier/engine remains None
+    assert await store.get_agent_session("/home/user/legacy-ws", "tier1", "claude") is None
+
+    await store.close()

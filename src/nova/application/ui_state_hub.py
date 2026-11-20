@@ -68,6 +68,7 @@ UiMessageModality = Literal[
     "text",
     "voice",
     "tier1_pi",
+    "tier1_agent",
     "tier2_runner",
     "milestone",
     "error",
@@ -355,8 +356,8 @@ class UiStateHub:
                 modality: UiMessageModality = "text"
                 if p.source == "voice":
                     modality = "voice"
-                elif p.source == "tier1_pi":
-                    modality = "tier1_pi"
+                elif p.source in ("tier1_pi", "tier1_agent"):
+                    modality = "tier1_agent" if p.source == "tier1_agent" else "tier1_pi"
                 elif p.source == "tier2_runner":
                     modality = "tier2_runner"
                 elif p.source == "error":

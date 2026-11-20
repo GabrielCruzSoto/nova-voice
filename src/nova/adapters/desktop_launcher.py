@@ -21,18 +21,19 @@ from typing import Literal, Protocol
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
-from nova.adapters.antigravity_adapter import AntigravityCLIAdapter, AntigravityRunnerConfig
+from nova.adapters.agent_registry import AgentAdapterRegistry, resolve_tier_engines
 from nova.adapters.audio_device_discovery import PipeWireDeviceDiscoveryAdapter
 from nova.adapters.audio_pipewire import PipeWireAudioAdapter, PipeWireAudioSettings
 from nova.adapters.config_store import TomlConfigStore, resolve_config_file_path
 from nova.adapters.control_ipc import UnixControlIpcServer
+from nova.adapters.credential_store import SystemCredentialStore
 from nova.adapters.desktop_ui_server import DesktopUiServer, DesktopUiServerSettings
 from nova.adapters.diagnostics_probes import build_live_diagnostics_service
 from nova.adapters.folder_picker_gtk import GtkFolderPickerAdapter
 from nova.adapters.gatekeeper_ipc import GatekeeperIPCConfig, UnixSocketGatekeeperServer
 from nova.adapters.models_downloader import download_models
 from nova.adapters.pi_auditor_adapter import PiAuditorAdapter, PiAuditorConfig
-from nova.adapters.pi_rpc_client import PiRpcClient, PiRpcConfig
+from nova.adapters.pi_rpc_client import PiRpcClient
 from nova.adapters.shortcut_registrar import LinuxShortcutRegistrar
 from nova.adapters.sqlite_history_store import SqliteHistoryStore
 from nova.adapters.stt_faster_whisper import FasterWhisperSettings, FasterWhisperSttAdapter
@@ -216,6 +217,8 @@ class NovaDesktopConfig(BaseModel):
     pi_provider: str = Field(default="nvidia", min_length=1)
     pi_model: str = Field(default=DEFAULT_PI_MODEL, min_length=1)
     agy_executable: str = Field(default="agy", min_length=1)
+    claude_executable: str = Field(default="claude", min_length=1)
+    opencode_executable: str = Field(default="opencode", min_length=1)
     tier2_model: str = Field(default="claude-opus-5-5-high", min_length=1)
 
     wakeword_models: tuple[str, ...] = ()
@@ -506,6 +509,17 @@ class NovaDesktopRuntime:
             else resolve_config_file_path()
         )
         self._config_store = TomlConfigStore(config_path=cfg_path)
+        self._credential_store = SystemCredentialStore()
+        self._agent_registry = AgentAdapterRegistry(
+            which_resolver=self._which_resolver,
+            credential_store=self._credential_store,
+            executable_overrides={
+                "pi": self._config.pi_executable,
+                "agy": self._config.agy_executable,
+                "claude": self._config.claude_executable,
+                "opencode": self._config.opencode_executable,
+            },
+        )
         self._ipc_server: UnixSocketGatekeeperServer | None = None
         self._control_ipc: UnixControlIpcServer | None = None
         self._pi_client: PiRpcClient | None = None
@@ -782,11 +796,20 @@ class NovaDesktopRuntime:
                     )
                 )
 
+            initial_persisted = await asyncio.to_thread(self._config_store.load)
+            detected_engines = self._agent_registry.detect_engines()
+            resolved_t1, resolved_t2 = resolve_tier_engines(
+                initial_persisted.models, detected_engines
+            )
+            eff_t1_engine = resolved_t1 or "pi"
+            eff_t2_engine = resolved_t2 or "agy"
+
             auditor = PiAuditorAdapter(
                 PiAuditorConfig(
-                    executable=self._config.pi_executable,
-                    provider=self._config.pi_provider,
-                    model=self._config.pi_model,
+                    engine=eff_t1_engine,
+                    executable=detected_engines.get(eff_t1_engine) or eff_t1_engine,
+                    provider=initial_persisted.models.tier1_provider,
+                    model=initial_persisted.models.tier1_model,
                 )
             )
             gatekeeper = SecurityGatekeeper(
@@ -794,6 +817,7 @@ class NovaDesktopRuntime:
                 auditor=auditor,
                 event_bus=self._event_bus,
             )
+            self._credential_store.set_secret_callback(gatekeeper.register_ephemeral_secret)
             self._gatekeeper = gatekeeper
 
             ipc_server = UnixSocketGatekeeperServer(
@@ -809,36 +833,31 @@ class NovaDesktopRuntime:
                 self._config.allowed_roots,
                 initial_ws,
             )
-            pi_client = PiRpcClient(
-                PiRpcConfig(
-                    executable=self._config.pi_executable,
-                    provider=self._config.pi_provider,
-                    model=self._config.pi_model,
-                    workspace_path=initial_pi_cwd,
-                    workspace_active=initial_ws is not None,
-                    allowed_project_paths=(
-                        tuple(p.canonical_path for p in initial_ws.projects)
-                        if initial_ws is not None
-                        else ()
-                    ),
-                    no_session=not (initial_ws is not None),
-                    gatekeeper_ipc_env=ipc_env,
-                )
+            tier1_client = self._agent_registry.build_tier1_adapter(
+                eff_t1_engine,
+                models=initial_persisted.models,
+                workspace_path=initial_pi_cwd,
+                workspace_active=initial_ws is not None,
+                gatekeeper_ipc_env=ipc_env,
             )
-            self._pi_client = pi_client
+            self._pi_client = tier1_client if isinstance(tier1_client, PiRpcClient) else None
 
-            tier2_runner = AntigravityCLIAdapter(
-                AntigravityRunnerConfig(
-                    executable=self._config.agy_executable,
-                    gatekeeper_ipc_env=ipc_env,
-                )
+            tier2_runner = self._agent_registry.build_tier2_adapter(
+                eff_t2_engine,
+                models=initial_persisted.models,
+                workspace_path=initial_pi_cwd,
+                gatekeeper_ipc_env=ipc_env,
             )
             orchestrator = NovaOrchestrator(
                 workspace_resolver=workspace_resolver,
-                tier1_client=pi_client,
+                tier1_client=tier1_client,
                 tier2_runner=tier2_runner,
                 event_bus=self._event_bus,
-                settings=OrchestratorSettings(default_tier2_model=self._config.tier2_model),
+                settings=OrchestratorSettings(
+                    tier1_engine=eff_t1_engine,
+                    tier2_engine=eff_t2_engine,
+                    default_tier2_model=self._config.tier2_model,
+                ),
                 security_gatekeeper=gatekeeper,
                 history_store=self._history_store,
             )
@@ -873,7 +892,6 @@ class NovaDesktopRuntime:
 
             self._voice_coordinator = voice_coord
 
-            initial_persisted = await asyncio.to_thread(self._config_store.load)
             settings_service = SettingsService(
                 config_store=self._config_store,
                 initial_settings=initial_persisted,
@@ -892,6 +910,8 @@ class NovaDesktopRuntime:
                     pi_provider=self._config.pi_provider,
                     pi_model=self._config.pi_model,
                     agy_executable=self._config.agy_executable,
+                    claude_executable=self._config.claude_executable,
+                    opencode_executable=self._config.opencode_executable,
                     tier2_model=self._config.tier2_model,
                     tts_engine_label=self._config.tts_engine,
                     gatekeeper_ipc_env=ipc_env,
@@ -933,8 +953,8 @@ class NovaDesktopRuntime:
                         orchestrator._tier2_conversations[initial_ws.canonical_path] = (
                             pointer.agy_conversation_id
                         )
-                    if pointer.pi_session_id:
-                        await pi_client.switch_workspace(
+                    if pointer.pi_session_id and self._pi_client is not None:
+                        await self._pi_client.switch_workspace(
                             initial_ws.canonical_path,
                             workspace_active=True,
                             allowed_project_paths=tuple(
@@ -961,6 +981,10 @@ class NovaDesktopRuntime:
                 workspace_resolver=workspace_resolver,
                 diagnostics_service=diagnostics_service,
                 health_report_provider=lambda: self._health_report,
+                agent_catalog_provider=lambda: self._agent_registry.build_catalog(
+                    settings_service.current_settings.models
+                ),
+                credential_store=self._credential_store,
                 health_recheck_callback=self.recheck_health_and_reload_voice,
                 models_provisioning_service=models_provisioning,
                 shutdown_callback=self.request_shutdown,

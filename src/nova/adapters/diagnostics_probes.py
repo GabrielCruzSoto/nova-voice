@@ -12,6 +12,8 @@ from nova.adapters.antigravity_adapter import (
     AntigravityRunnerConfig,
 )
 from nova.adapters.audio_pipewire import PipeWireAudioAdapter, PipeWireAudioSettings
+from nova.adapters.claude_adapter import ClaudeCodeAdapter, ClaudeCodeConfig
+from nova.adapters.opencode_adapter import OpenCodeAdapter, OpenCodeConfig
 from nova.adapters.pi_rpc_client import PiRpcClient, PiRpcConfig
 from nova.application.live_diagnostics import (
     AudioInputFactory,
@@ -101,6 +103,52 @@ async def default_agy_probe_runner(
     ]
 
 
+async def default_claude_probe_runner(
+    executable: str,
+    extra_args: tuple[str, ...],
+    model: str,
+    probe_dir: str,
+    gatekeeper_ipc_env: dict[str, str] | None,
+) -> None:
+    """Execute a bounded Claude Code headless stream-json ping inside `probe_dir`."""
+    adapter = ClaudeCodeAdapter(
+        ClaudeCodeConfig(
+            executable=executable,
+            extra_leading_args=extra_args,
+            model=model,
+            workspace_path=probe_dir,
+            timeout_seconds=14.0,
+            gatekeeper_ipc_env=gatekeeper_ipc_env,
+            enable_gatekeeper_hook=False,
+        )
+    )
+    _ = [delta async for delta in adapter.stream_prompt("Responde unicamente OK")]
+
+
+async def default_opencode_probe_runner(
+    executable: str,
+    extra_args: tuple[str, ...],
+    provider: str,
+    model: str,
+    probe_dir: str,
+    gatekeeper_ipc_env: dict[str, str] | None,
+) -> None:
+    """Execute a bounded OpenCode headless JSON ping inside `probe_dir`."""
+    adapter = OpenCodeAdapter(
+        OpenCodeConfig(
+            executable=executable,
+            extra_leading_args=extra_args,
+            provider=provider,
+            model=model,
+            workspace_path=probe_dir,
+            timeout_seconds=14.0,
+            gatekeeper_ipc_env=gatekeeper_ipc_env,
+            enable_gatekeeper_plugin=False,
+        )
+    )
+    _ = [delta async for delta in adapter.stream_prompt("Responde unicamente OK")]
+
+
 def build_live_diagnostics_service(
     *,
     config: LiveDiagnosticsConfig | None = None,
@@ -119,6 +167,8 @@ def build_live_diagnostics_service(
         audio_output_factory=audio_output_factory,
         pi_probe_runner=default_pi_probe_runner,
         agy_probe_runner=default_agy_probe_runner,
+        claude_probe_runner=default_claude_probe_runner,
+        opencode_probe_runner=default_opencode_probe_runner,
         stt_port=stt_port,
         tts_port=tts_port,
         extra_secrets_provider=extra_secrets_provider,
