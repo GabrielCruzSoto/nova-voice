@@ -30,6 +30,7 @@ from nova.adapters.desktop_ui_server import DesktopUiServer, DesktopUiServerSett
 from nova.adapters.diagnostics_probes import build_live_diagnostics_service
 from nova.adapters.folder_picker_gtk import GtkFolderPickerAdapter
 from nova.adapters.gatekeeper_ipc import GatekeeperIPCConfig, UnixSocketGatekeeperServer
+from nova.adapters.models_downloader import download_models
 from nova.adapters.pi_auditor_adapter import PiAuditorAdapter, PiAuditorConfig
 from nova.adapters.pi_rpc_client import PiRpcClient, PiRpcConfig
 from nova.adapters.shortcut_registrar import LinuxShortcutRegistrar
@@ -45,6 +46,7 @@ from nova.application.health_diagnostics import (
     resolve_model_path,
 )
 from nova.application.live_diagnostics import LiveDiagnosticsConfig, LiveDiagnosticsService
+from nova.application.models_provisioning import VoiceModelsProvisioningService
 from nova.application.orchestrator import NovaOrchestrator, OrchestratorSettings
 from nova.application.security_gatekeeper import SecurityGatekeeper
 from nova.application.settings_service import SettingsService
@@ -511,6 +513,7 @@ class NovaDesktopRuntime:
         self._voice_coordinator: VoiceRuntimePort | None = None
         self._settings_service: SettingsService | None = None
         self._diagnostics_service: LiveDiagnosticsService | None = None
+        self._models_provisioning: VoiceModelsProvisioningService | None = None
         self._state_hub: UiStateHub | None = None
         self._ui_server: DesktopUiServer | None = None
         self._gatekeeper: SecurityGatekeeper | None = None
@@ -557,6 +560,72 @@ class NovaDesktopRuntime:
     @property
     def gatekeeper_socket_path(self) -> str:
         return self._ipc_server.socket_path if self._ipc_server is not None else ""
+
+    async def recheck_health_and_reload_voice(self) -> tuple[SystemHealthReport, bool]:
+        """Re-run pre-flight diagnostics and hot-start the voice stack if now ready."""
+        report = check_system_components(
+            self._config,
+            which_resolver=self._which_resolver,
+        )
+        self._health_report = report
+
+        voice_prereqs_ok = all(
+            comp.installed
+            for comp in report.components
+            if comp.required and comp.category in ("audio", "model")
+        )
+        if (
+            self._config.enable_voice
+            and not self._voice_enabled
+            and voice_prereqs_ok
+            and self._orchestrator is not None
+            and self._gatekeeper is not None
+        ):
+            try:
+                maybe_voice = self._voice_factory(
+                    config=self._config,
+                    orchestrator=self._orchestrator,
+                    event_bus=self._event_bus,
+                    security_gatekeeper=self._gatekeeper,
+                    extra_secrets_provider=lambda: (
+                        self._ui_server.extra_secrets if self._ui_server is not None else ()
+                    ),
+                )
+                resolved_voice: VoiceRuntimePort = (
+                    await maybe_voice if inspect.isawaitable(maybe_voice) else maybe_voice
+                )
+                await resolved_voice.start()
+                self._voice_coordinator = resolved_voice
+                self._voice_enabled = True
+                if self._ui_server is not None:
+                    self._ui_server.set_voice_coordinator(resolved_voice)
+                if self._diagnostics_service is not None:
+                    live_stt = getattr(resolved_voice, "_stt", None)
+                    live_tts = getattr(resolved_voice, "_tts", None)
+                    if live_stt is not None and hasattr(self._diagnostics_service, "_stt_port"):
+                        self._diagnostics_service._stt_port = live_stt
+                    if live_tts is not None and hasattr(self._diagnostics_service, "_tts_port"):
+                        self._diagnostics_service._tts_port = live_tts
+                self._log("voice_pipeline_hot_reloaded")
+            except (VoicePipelineError, ImportError, OSError, ValueError) as exc:
+                self._voice_enabled = False
+                self._log("voice_pipeline_hot_reload_failed", reason=str(exc))
+
+        if self._state_hub is not None:
+            voice_ref = self._voice_coordinator
+            self._state_hub.update_runtime_health(
+                all_ok=report.all_ok,
+                voice_enabled=self._voice_enabled,
+                call_session_provider=(
+                    (lambda: voice_ref.session) if voice_ref is not None else None
+                ),
+                alert_message=report.alert_message,
+            )
+
+        return report, self._voice_enabled
+
+    async def _on_models_provisioned(self) -> None:
+        await self.recheck_health_and_reload_voice()
 
     @property
     def event_bus(self) -> OrchestratorEventBus:
@@ -875,6 +944,13 @@ class NovaDesktopRuntime:
                             no_session=False,
                         )
 
+            models_provisioning = VoiceModelsProvisioningService(
+                downloader=download_models,
+                models_dir=getattr(self._config, "models_dir", None),
+                on_provisioned=self._on_models_provisioned,
+            )
+            self._models_provisioning = models_provisioning
+
             ui_server = DesktopUiServer(
                 orchestrator=orchestrator,
                 state_hub=state_hub,
@@ -885,6 +961,8 @@ class NovaDesktopRuntime:
                 workspace_resolver=workspace_resolver,
                 diagnostics_service=diagnostics_service,
                 health_report_provider=lambda: self._health_report,
+                health_recheck_callback=self.recheck_health_and_reload_voice,
+                models_provisioning_service=models_provisioning,
                 shutdown_callback=self.request_shutdown,
                 settings=DesktopUiServerSettings(host="127.0.0.1", port=self._config.port),
             )
@@ -957,6 +1035,11 @@ class NovaDesktopRuntime:
             with contextlib.suppress(Exception):
                 await self._ui_server.close()
             self._ui_server = None
+
+        if self._models_provisioning is not None:
+            with contextlib.suppress(Exception):
+                await self._models_provisioning.close()
+            self._models_provisioning = None
 
         if self._state_hub is not None:
             with contextlib.suppress(Exception):
