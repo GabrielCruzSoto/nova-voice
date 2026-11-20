@@ -23,6 +23,7 @@ import {
   resolveHumanNotice,
 } from "./components.js";
 import type {
+  AgentTaskStatus,
   AgentsFilterKey,
   AntigravityDiagnosticResponse,
   AudioDeviceCatalog,
@@ -38,6 +39,7 @@ import type {
   SettingsGetResponse,
   SettingsPutResponse,
   ShortcutRegisterResponse,
+  UiAgentTask,
   UiApprovalItem,
   UiChatMessage,
   UiEventEnvelope,
@@ -379,6 +381,90 @@ export class DesktopAppController {
       return;
     }
     this.#updateModel({ agentsFilter: filter });
+  }
+
+  async handleAgentTaskAction(
+    taskId: string,
+    action: "approve" | "cancel" | "pause" | "inspect",
+  ): Promise<void> {
+    if (this.#disposed || !taskId) {
+      return;
+    }
+    const overview = this.#model.agentsOverview ?? getDefaultAgentsOverview(this.#model.activeWorkspace?.canonical_path);
+    const targetTask = overview.tasks.find((t) => t.id === taskId);
+    if (!targetTask) {
+      return;
+    }
+
+    if (action === "inspect") {
+      const detail = targetTask.lastLog ? ` — ${targetTask.lastLog}` : "";
+      this.#updateModel({
+        lastMilestone: `#tsk-${targetTask.id}: ${targetTask.title}${detail}`,
+      });
+      return;
+    }
+
+    if (action === "approve" || action === "cancel") {
+      const matchingApproval = this.#model.pendingApprovals.find((a) => a.audit_id === taskId);
+      if (matchingApproval) {
+        await this.resolveApproval(taskId, action === "approve");
+      }
+    }
+
+    let nextStatus: AgentTaskStatus = targetTask.status;
+    let nextLog = targetTask.lastLog;
+    let milestone = "";
+
+    if (action === "approve" && targetTask.status === "gatekeeper_blocked") {
+      nextStatus = "running";
+      nextLog = "> Aprobado por el usuario; reanudando ejecución...";
+      milestone = `Tarea #tsk-${taskId} aprobada.`;
+    } else if (action === "pause" && targetTask.status === "running") {
+      nextStatus = "queued";
+      nextLog = "Pausada por el usuario.";
+      milestone = `Tarea #tsk-${taskId} pausada.`;
+    } else if (
+      action === "cancel" &&
+      (targetTask.status === "running" ||
+        targetTask.status === "queued" ||
+        targetTask.status === "gatekeeper_blocked")
+    ) {
+      nextStatus = "failed";
+      nextLog = "Cancelada por el usuario.";
+      milestone = `Tarea #tsk-${taskId} cancelada.`;
+    } else {
+      return;
+    }
+
+    const updatedTasks: readonly UiAgentTask[] = overview.tasks.map((task) =>
+      task.id === taskId
+        ? {
+            ...task,
+            status: nextStatus,
+            ...(nextLog !== undefined ? { lastLog: nextLog } : {}),
+          }
+        : task,
+    );
+
+    const updatedSlots = overview.poolSlots.map((slot) => {
+      const activeForTier = updatedTasks.filter(
+        (t) => t.tier === slot.tier && (t.status === "running" || t.status === "gatekeeper_blocked"),
+      ).length;
+      return {
+        ...slot,
+        activeSlots: activeForTier,
+        status: activeForTier > 0 ? ("active" as const) : ("idle" as const),
+      };
+    });
+
+    this.#updateModel({
+      agentsOverview: {
+        ...overview,
+        poolSlots: updatedSlots,
+        tasks: updatedTasks,
+      },
+      lastMilestone: milestone,
+    });
   }
   toggleInitWorkspaceForm(): void {
     if (this.#disposed) {
@@ -1403,6 +1489,18 @@ export class DesktopAppController {
         } else if (action === "filter-agents") {
           const filter = (target.dataset["filter"] as AgentsFilterKey) || "all";
           this.setAgentsFilter(filter);
+        } else if (action === "approve-task") {
+          const taskId = target.dataset["taskId"] ?? "";
+          void this.handleAgentTaskAction(taskId, "approve");
+        } else if (action === "cancel-task") {
+          const taskId = target.dataset["taskId"] ?? "";
+          void this.handleAgentTaskAction(taskId, "cancel");
+        } else if (action === "pause-task") {
+          const taskId = target.dataset["taskId"] ?? "";
+          void this.handleAgentTaskAction(taskId, "pause");
+        } else if (action === "inspect-task") {
+          const taskId = target.dataset["taskId"] ?? "";
+          void this.handleAgentTaskAction(taskId, "inspect");
         } else if (action === "toggle-ui-mode") {
           void this.toggleUiMode();
         } else if (action === "quit-app") {
