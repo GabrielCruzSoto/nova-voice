@@ -831,16 +831,52 @@ async def test_nova018_ac10_desktop_runtime_wires_half_duplex_confirmation_and_h
 
     proj = tmp_path / "demo_hd"
     proj.mkdir()
+
+    class _HotVoiceStub:
+        def __init__(self) -> None:
+            self.session = CallSession(
+                call_id="call-hot",
+                state="standby",
+                last_activity_monotonic=0.0,
+            )
+            self.updated_half_duplex: list[bool | None] = []
+
+        async def start(self) -> None:
+            pass
+
+        async def start_call(self, reason: str = "ui_call_start") -> None:
+            del reason
+
+        async def end_call(self, reason: str = "ui_call_end") -> None:
+            del reason
+
+        async def barge_in(self) -> None:
+            pass
+
+        async def shutdown(self) -> None:
+            pass
+
+        def update_settings(self, **kwargs: object) -> None:
+            self.updated_half_duplex.append(
+                kwargs.get("half_duplex_turn_mode")
+                if isinstance(kwargs.get("half_duplex_turn_mode"), bool)
+                else None
+            )
+
+    voice_stub = _HotVoiceStub()
     runtime_cfg = NovaDesktopConfig(
         port=0,
         allowed_roots=(str(tmp_path),),
         initial_workspace=str(proj),
         open_browser=False,
-        enable_voice=False,
+        enable_voice=True,
         ipc_runtime_dir=str(tmp_path / "sock_hd"),
         config_path=str(cfg_file),
     )
-    async with NovaDesktopRuntime(runtime_cfg) as runtime:
+    async with NovaDesktopRuntime(
+        runtime_cfg,
+        voice_factory=lambda **_kw: voice_stub,
+    ) as runtime:
         assert runtime._orchestrator is not None
         assert runtime._orchestrator._settings.require_voice_confirmation is True
         assert runtime._settings_service is not None
@@ -850,6 +886,14 @@ async def test_nova018_ac10_desktop_runtime_wires_half_duplex_confirmation_and_h
         )
         assert res["requires_restart"] is False
         assert runtime._orchestrator._settings.require_voice_confirmation is False
+        assert voice_stub.updated_half_duplex == [False]
+
+    # F1 regression: verify settings actually persisted to disk and survive reload
+    from nova.adapters.config_store import TomlConfigStore
+
+    reloaded = TomlConfigStore(cfg_file).load()
+    assert reloaded.voice.half_duplex_turn_mode is False
+    assert reloaded.voice.require_voice_confirmation is False
 
 
 

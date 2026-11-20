@@ -1289,6 +1289,16 @@ class VoiceCallCoordinator:
                     and self._pending_approvals[0].audit_id == head_approval.audit_id
                 ):
                     self._pending_approvals.popleft()
+                if (
+                    self._active_turn_tasks
+                    and not self._has_active_pending_approval()
+                    and self._call_open
+                ):
+                    await self._transition_state(
+                        "executing",
+                        reason="approval_resolved_resuming_turn",
+                        correlation_id=corr_id,
+                    )
                 try:
                     await self._orchestrator.resolve_command_approval(
                         head_approval.audit_id,

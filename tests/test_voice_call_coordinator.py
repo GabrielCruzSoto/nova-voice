@@ -2274,6 +2274,118 @@ async def test_nova018_e2e_half_duplex_real_orchestrator_confirmation_and_gateke
     await coordinator.shutdown()
 
 
+async def test_nova018_f2_approval_resolution_transitions_to_executing_and_closes_without_tts() -> (
+    None
+):
+    bus = OrchestratorEventBus()
+    audio_in = _ScriptedAudioInput()
+    audio_out = _ControlledAudioOutput(hold_playback=False)
+    vad = _FakeVad()
+    tts = _FakeTts()
+    stt = _FakeStt(transcripts=["Oye Nova, corre comando lento", "Oye Nova, aprobar comando"])
+
+    approval_released = asyncio.Event()
+    finish_command = asyncio.Event()
+    now = [20.0]
+
+    class _SlowSilentAfterApprovalOrch(_FakeOrchestrator):
+        async def handle_user_utterance(
+            self,
+            utterance: str,
+            correlation_id: str | None = None,
+            *,
+            origin: str = "chat",
+        ) -> None:
+            del origin
+            self.utterances.append((utterance, correlation_id))
+            await bus.publish(
+                CommandApprovalRequestedEvent(
+                    audit_id="aud-f2-1",
+                    correlation_id=correlation_id or "c-f2",
+                    source="tier1_pi",
+                    sanitized_command="sudo long-job",
+                    cwd="/tmp",
+                    risk_level="high",
+                    spoken_summary="Aprobar comando lento.",
+                    technical_explanation="Long job",
+                    expires_in_seconds=60.0,
+                )
+            )
+            await bus.publish(
+                VoiceMilestoneEvent(
+                    correlation_id=correlation_id or "c-f2",
+                    summary_text="Aprobar comando lento.",
+                    priority="interrupt",
+                )
+            )
+            await approval_released.wait()
+            # Simulate a slow command running after approval that emits no extra TTS at end
+            await finish_command.wait()
+
+        async def resolve_command_approval(
+            self,
+            audit_id: str,
+            *,
+            approved: bool,
+            resolved_by: str = "user_voice_or_ui",
+        ) -> CommandApprovalResolvedEvent:
+            ev = await super().resolve_command_approval(
+                audit_id, approved=approved, resolved_by=resolved_by
+            )
+            approval_released.set()
+            return ev
+
+    orch = _SlowSilentAfterApprovalOrch(event_bus=bus)
+    coordinator = VoiceCallCoordinator(
+        audio_input=audio_in,
+        audio_output=audio_out,
+        wake_word=_FakeWakeWord(),
+        vad=vad,
+        stt=stt,
+        tts=tts,
+        orchestrator=orch,
+        event_bus=bus,
+        settings=VoiceCoordinatorSettings(
+            min_speech_frames=2,
+            end_silence_frames=2,
+            enable_wake_earcon=False,
+            half_duplex_turn_mode=True,
+        ),
+        clock=lambda: now[0],
+    )
+    await coordinator.start()
+
+    # 1. Command held -> warning spoken -> standby
+    vad.probs = [0.95, 0.95, 0.05, 0.05]
+    for _ in range(4):
+        audio_in.push_frame(_ac_frame(4000))
+    await asyncio.sleep(0.08)
+    assert _state_of(coordinator) == "standby"
+
+    # 2. User approves -> MUST transition immediately to 'executing' (not stay 'listening')
+    now[0] = 25.0
+    vad.probs = [0.95, 0.95, 0.05, 0.05]
+    for _ in range(4):
+        audio_in.push_frame(_ac_frame(4000))
+    await asyncio.wait_for(approval_released.wait(), timeout=1.0)
+    await asyncio.sleep(0.05)
+    assert _state_of(coordinator) == "executing"
+
+    # Loud mic audio while slow approved command runs MUST NOT trigger barge-in or capture
+    vad.probs = [0.99, 0.99, 0.99, 0.99]
+    for _ in range(4):
+        audio_in.push_frame(_ac_frame(12000))
+    await asyncio.sleep(0.04)
+    assert orch.barge_in_calls == 0
+    assert _state_of(coordinator) == "executing"
+
+    # 3. Command finishes without extra TTS -> session returns cleanly to 'standby'
+    finish_command.set()
+    await asyncio.sleep(0.08)
+    assert _state_of(coordinator) == "standby"
+    await coordinator.shutdown()
+
+
 
 
 

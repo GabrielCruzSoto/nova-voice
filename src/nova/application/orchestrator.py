@@ -77,7 +77,7 @@ _XML_OPEN_TAG_RE = re.compile(
     r"<(cd|search|bash|shell|command|tool|thinking|think)\b[^>]*>",
     re.IGNORECASE,
 )
-_STRAY_TAG_RE = re.compile(r"</?[a-zA-Z_][\w-]*\b[^>]*>")
+_STRAY_TAG_RE = re.compile(r"</?(?!REDACTED:)[a-zA-Z_][\w-]*\b[^>]*>")
 _URL_RE = re.compile(r"https?://\S+", re.IGNORECASE)
 _PATH_TOKEN_RE = re.compile(r"(?:~|/)[\w./-]+")
 _MD_LINE_PREFIX_RE = re.compile(r"(?m)^\s*(?:#{1,6}\s+|[-*•]\s+|\d+\.\s+|>\s*)")
@@ -145,16 +145,20 @@ def sanitize_spoken_chunk(
     extra_secrets: tuple[str, ...] = (),
 ) -> str:
     """Clean Markdown, code blocks, XML pseudo-tags, paths, and secrets for natural TTS."""
-    without_code = _CODE_BLOCK_RE.sub(" ", raw_text)
+    redacted_first = redact_sensitive_text(raw_text, extra_secrets=extra_secrets)
+    without_code = _CODE_BLOCK_RE.sub(" ", redacted_first)
     without_xml = _PSEUDO_XML_BLOCK_RE.sub(" ", without_code)
     without_tags = _STRAY_TAG_RE.sub(" ", without_xml)
     without_urls = _URL_RE.sub("enlace", without_tags)
     without_paths = _PATH_TOKEN_RE.sub("archivo del proyecto", without_urls)
     redacted = redact_sensitive_text(without_paths, extra_secrets=extra_secrets)
     without_prefixes = _MD_LINE_PREFIX_RE.sub(" ", redacted)
-    cleaned = re.sub(r"[`*_~|>]+", " ", without_prefixes)
+    cleaned = re.sub(r"[`*_~|]+", " ", without_prefixes)
     cleaned = re.sub(r"\s+([,.;:!?])", r"\1", cleaned)
-    return " ".join(cleaned.split())
+    normalized = " ".join(cleaned.split())
+    if not any(ch.isalnum() for ch in normalized):
+        return ""
+    return normalized
 
 
 def _split_long_spoken_text(text: str, *, max_chars: int) -> list[str]:
@@ -277,9 +281,12 @@ class VoiceSentenceStreamSplitter:
                 continue
 
             # Emit completed sentence only once subsequent text has started so final chunk
-            # naturally flushes with is_final=True when the stream ends.
-            match = _SENTENCE_BOUNDARY_RE.search(self._raw_buf)
-            if match is not None and self._raw_buf[match.end() :].strip():
+            # naturally flushes with is_final=True when the stream ends. Scan across multiple
+            # boundaries so a short prefix ("Claro. ", "1. ") never stalls streaming (F3).
+            emitted_sentence = False
+            for match in _SENTENCE_BOUNDARY_RE.finditer(self._raw_buf):
+                if not self._raw_buf[match.end() :].strip():
+                    break
                 candidate = self._raw_buf[: match.end()]
                 cleaned = sanitize_spoken_chunk(candidate, extra_secrets=self._extra_secrets)
                 if len(cleaned) >= self._min_chunk_chars or cleaned.endswith(("?", "!")):
@@ -287,20 +294,31 @@ class VoiceSentenceStreamSplitter:
                     emitted.extend(
                         _split_long_spoken_text(cleaned, max_chars=self._target_max_chars)
                     )
-                    continue
+                    emitted_sentence = True
+                    break
+            if emitted_sentence:
+                continue
 
             if len(self._raw_buf) >= self._target_max_chars * 2:
-                cleaned_all = sanitize_spoken_chunk(
-                    self._raw_buf,
+                # Preserve a short raw tail so split ``` or <tag delimiters are not corrupted
+                tail_guard = 12
+                head_raw = self._raw_buf[:-tail_guard]
+                tail_raw = self._raw_buf[-tail_guard:]
+                cleaned_head = sanitize_spoken_chunk(
+                    head_raw,
                     extra_secrets=self._extra_secrets,
                 )
                 split_parts = _split_long_spoken_text(
-                    cleaned_all,
+                    cleaned_head,
                     max_chars=self._target_max_chars,
                 )
                 if len(split_parts) > 1:
                     emitted.extend(split_parts[:-1])
-                    self._raw_buf = split_parts[-1]
+                    self._raw_buf = split_parts[-1] + " " + tail_raw
+                    continue
+                if len(split_parts) == 1:
+                    emitted.append(split_parts[0])
+                    self._raw_buf = tail_raw
                     continue
             break
 
@@ -587,7 +605,10 @@ class NovaOrchestrator:
         )
         if not chunks:
             cleaned_fb = sanitize_spoken_chunk(fallback, extra_secrets=self._extra_secrets())
-            chunks = [cleaned_fb or fallback]
+            safe_fb = cleaned_fb or "Operación completada."
+            chunks = _split_long_spoken_text(safe_fb, max_chars=MAX_SPEECH_CHUNK_CHARS)
+            if not chunks:
+                chunks = ["Operación completada."]
         last_idx = len(chunks) - 1
         for idx, chunk in enumerate(chunks):
             await self._event_bus.publish(
@@ -764,11 +785,33 @@ class NovaOrchestrator:
                     redacted_corr = self._redact(decision.cleaned_text).strip()
                     if not redacted_corr:
                         return
+                    if pending.revision >= self._settings.max_voice_confirmation_revisions:
+                        self._pending_voice_task = None
+                        self._log(
+                            "voice_task_revision_limit_reached",
+                            task_id=pending.task_id,
+                            correlation_id=corr_id,
+                        )
+                        limit_msg = (
+                            "Alcanzaste el máximo de correcciones para esta tarea. "
+                            "Cancelé el borrador; dime de nuevo la instrucción completa."
+                        )
+                        await self._event_bus.publish(
+                            ChatStreamEvent(
+                                correlation_id=corr_id,
+                                delta=limit_msg,
+                                source="tier1_pi",
+                                step_type="voice_confirmation",
+                            )
+                        )
+                        await self._publish_spoken_text_chunks(
+                            limit_msg,
+                            correlation_id=corr_id,
+                            fallback=limit_msg,
+                        )
+                        return
                     now = self._clock()
-                    next_rev = min(
-                        pending.revision + 1,
-                        self._settings.max_voice_confirmation_revisions,
-                    )
+                    next_rev = pending.revision + 1
                     updated_utterance = f"{pending.utterance}. Corrección: {redacted_corr}"
                     updated_summary = (
                         f"En {active_ws.name}: {updated_utterance}"

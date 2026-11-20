@@ -226,3 +226,33 @@ def test_nova017_ac3_config_v10_migrates_to_multi_tier_v11_roundtrip(tmp_path: P
     assert reloaded.models.tier2_engine == "claude"
     assert reloaded.models.tier2_model == "opus"
     assert reloaded.models.single_engine_mode is False
+
+
+def test_nova018_f1_config_store_roundtrips_half_duplex_and_confirmation_flags(
+    tmp_path: Path,
+) -> None:
+    cfg_path = tmp_path / "nova" / "config.toml"
+    store = TomlConfigStore(config_path=cfg_path)
+    base = store.load()
+    assert base.voice.half_duplex_turn_mode is True
+    assert base.voice.require_voice_confirmation is True
+
+    updated = base.model_copy(
+        update={
+            "voice": base.voice.model_copy(
+                update={
+                    "half_duplex_turn_mode": False,
+                    "require_voice_confirmation": False,
+                }
+            )
+        }
+    )
+    store.save(updated)
+
+    raw_text = cfg_path.read_text(encoding="utf-8")
+    assert "half_duplex_turn_mode = false" in raw_text
+    assert "require_voice_confirmation = false" in raw_text
+
+    reloaded = store.load()
+    assert reloaded.voice.half_duplex_turn_mode is False
+    assert reloaded.voice.require_voice_confirmation is False

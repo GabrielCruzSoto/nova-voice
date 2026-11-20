@@ -210,3 +210,49 @@ async def test_claude_pre_tool_hook_enforces_gatekeeper_and_fail_closed(tmp_path
             env_ok,
         )
         assert denied_resp["hookSpecificOutput"]["permissionDecision"] == "deny"
+
+
+@pytest.mark.asyncio
+async def test_nova018_f10_claude_tier1_receives_voice_append_system_prompt(
+    tmp_path: Path,
+) -> None:
+    from nova.adapters.agent_registry import AgentAdapterRegistry
+    from nova.adapters.pi_rpc_client import NOVA_VOICE_SYSTEM_PROMPT
+    from nova.domain.models import ModelsSettingsSection
+
+    dump_file = tmp_path / "claude_argv.json"
+    fake_claude = tmp_path / "fake_claude_prompt.py"
+    fake_claude.write_text(
+        f"""
+import json, sys
+with open({str(dump_file)!r}, "w", encoding="utf-8") as fh:
+    json.dump(sys.argv[1:], fh, ensure_ascii=False)
+print(json.dumps({{"type": "system", "subtype": "init", "session_id": "s-1"}}), flush=True)
+print(json.dumps({{"type": "result", "session_id": "s-1", "result": "listo"}}), flush=True)
+""".strip()
+        + "\n",
+        encoding="utf-8",
+    )
+    adapter = ClaudeCodeAdapter(
+        ClaudeCodeConfig(
+            executable=sys.executable,
+            extra_leading_args=("-u", str(fake_claude)),
+            workspace_path=str(tmp_path),
+            enable_gatekeeper_hook=False,
+            append_system_prompt=NOVA_VOICE_SYSTEM_PROMPT,
+        )
+    )
+    out = [chunk async for chunk in adapter.stream_prompt("hola")]
+    assert "".join(out) == "listo"
+    captured = json.loads(dump_file.read_text(encoding="utf-8"))
+    assert "--append-system-prompt" in captured
+    assert captured[captured.index("--append-system-prompt") + 1] == NOVA_VOICE_SYSTEM_PROMPT
+
+    registry = AgentAdapterRegistry(which_resolver=lambda name: f"/usr/bin/{name}")
+    t1 = registry.build_tier1_adapter(
+        "claude",
+        models=ModelsSettingsSection(tier1_engine="claude", tier1_model="haiku"),
+        workspace_path=str(tmp_path),
+    )
+    assert isinstance(t1, ClaudeCodeAdapter)
+    assert t1._config.append_system_prompt == NOVA_VOICE_SYSTEM_PROMPT

@@ -905,3 +905,90 @@ async def test_nova018_ac4_ac5_cancel_correct_ttl_expiry_and_chat_direct(
     assert t2_chunks[-1].is_final is True
 
 
+def test_nova018_f3_f4_f5_splitter_short_prefix_secret_redaction_and_punctuation_only() -> None:
+    # F3: Short leading sentence ("Claro. ") or numbered prefix ("1. ") must NOT stall streaming
+    splitter = VoiceSentenceStreamSplitter()
+    emitted_mid: list[str] = []
+    for delta in [
+        "Claro. ",
+        "Este proyecto implementa Nova con arquitectura hexagonal. ",
+        "Siguiente oración en curso.",
+    ]:
+        emitted_mid.extend(splitter.feed(delta))
+    assert len(emitted_mid) >= 1, "Short leading sentence must not block streaming emission"
+    full = " ".join(emitted_mid + splitter.flush())
+    assert "Claro." in full and "arquitectura hexagonal" in full
+
+    # F4: Secret containing '/' is redacted BEFORE path rewriting and preserves <REDACTED:...>
+    slash_secret = "tok/abc123/xyz999"
+    cleaned_secret = sanitize_spoken_chunk(
+        f"Credencial usada {slash_secret} en el entorno.",
+        extra_secrets=(slash_secret,),
+    )
+    assert "tok" not in cleaned_secret
+    assert "xyz999" not in cleaned_secret
+    assert "<REDACTED:secret>" in cleaned_secret
+
+    # F5: Punctuation-only / markdown divider chunks return empty string (never sent to TTS)
+    assert sanitize_spoken_chunk("---") == ""
+    assert sanitize_spoken_chunk("... : ;") == ""
+    assert sanitize_spoken_chunk("###   ") == ""
+
+
+async def test_nova018_f5_f6_oversized_fallback_and_max_revisions_enforced(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "Proyectos"
+    repo = root / "rev-app"
+    repo.mkdir(parents=True)
+
+    bus = OrchestratorEventBus()
+    events: list[OrchestratorEvent] = []
+
+    async def collect(ev: OrchestratorEvent) -> None:
+        events.append(ev)
+
+    bus.subscribe(collect)
+    resolver = LocalWorkspaceResolver(allowed_roots=[root], event_bus=bus)
+    orchestrator = NovaOrchestrator(
+        workspace_resolver=resolver,
+        tier1_client=_FakeTier1Client(),
+        tier2_runner=_FakeTier2Runner(),
+        event_bus=bus,
+        settings=OrchestratorSettings(
+            require_voice_confirmation=True,
+            max_voice_confirmation_revisions=2,
+        ),
+    )
+    await orchestrator.select_workspace(str(repo), mode="exact_path")
+
+    # F5: Oversized fallback in _publish_spoken_text_chunks splits without ValidationError
+    huge_fallback = "Palabra " * 120
+    await orchestrator._publish_spoken_text_chunks(
+        "---",
+        correlation_id="c-fb",
+        fallback=huge_fallback,
+    )
+    fb_chunks = [
+        e for e in events if isinstance(e, VoiceSpeechChunkEvent) and e.correlation_id == "c-fb"
+    ]
+    assert len(fb_chunks) >= 2
+    assert fb_chunks[-1].is_final is True
+
+    # F6: Exceeding max_voice_confirmation_revisions=2 cancels draft instead of unbounded growth
+    await orchestrator.handle_user_utterance("Tarea inicial", correlation_id="c-r1", origin="voice")
+    assert orchestrator.pending_voice_task is not None
+    assert orchestrator.pending_voice_task.revision == 1
+
+    await orchestrator.handle_user_utterance(
+        "primera corrección", correlation_id="c-r2", origin="voice"
+    )
+    assert orchestrator.pending_voice_task is not None
+    assert orchestrator.pending_voice_task.revision == 2
+
+    await orchestrator.handle_user_utterance(
+        "segunda corrección excedida", correlation_id="c-r3", origin="voice"
+    )
+    assert orchestrator.pending_voice_task is None
+
+
