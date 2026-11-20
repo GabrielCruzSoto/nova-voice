@@ -35,8 +35,8 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-if [[ "$MODE" != "pr" && "$MODE" != "release" ]]; then
-  echo "build.sh: Mode must be 'pr' or 'release', got '$MODE'." >&2
+if [[ "$MODE" != "pr" && "$MODE" != "dev" && "$MODE" != "release" ]]; then
+  echo "build.sh: Mode must be 'pr', 'dev', or 'release', got '$MODE'." >&2
   exit 1
 fi
 
@@ -57,6 +57,8 @@ PROJECT_VERSION="$(python3 -c 'import tomllib; print(tomllib.load(open("pyprojec
 if [[ "$MODE" == "pr" ]]; then
   COMMIT_SHA7="$(git -C "$REPO_ROOT" rev-parse --short=7 HEAD 2>/dev/null || echo "0000000")"
   DEB_VERSION="${PROJECT_VERSION}+git${COMMIT_SHA7}"
+elif [[ "$MODE" == "dev" ]]; then
+  DEB_VERSION="${PROJECT_VERSION}-dev"
 else
   DEB_VERSION="${PROJECT_VERSION}"
 fi
