@@ -54,6 +54,8 @@ nova = [
     "ui/static/*",
     "extensions/*.ts",
     "plugins/agy_gatekeeper/*",
+    "plugins/claude_gatekeeper/*",
+    "plugins/opencode_gatekeeper/*",
     "config/*.json",
 ]
 
