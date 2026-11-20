@@ -105,16 +105,24 @@ def test_deb_control_fields_and_depends(built_deb_packages: dict[str, Path]) -> 
         assert forb not in ctrl_pr, f"Forbidden dependency present: {forb}"
 
 
-def test_deb_contents_listing_no_models_no_pycache(built_deb_packages: dict[str, Path]) -> None:
+def test_deb_contents_listing_includes_base_models_and_no_pycache(
+    built_deb_packages: dict[str, Path],
+) -> None:
     pr_deb = built_deb_packages["pr"]
     r = subprocess.run(["dpkg-deb", "-c", str(pr_deb)], capture_output=True, text=True, check=True)
     listing = r.stdout
 
-    # No standalone downloaded models or models directory
-    assert "opt/nova/models" not in listing
-    assert "oye_nova.onnx" not in listing
-    assert "es_ES-davefx-medium" not in listing
-    assert not re.search(r"/opt/nova/[^/]*\.onnx", listing)
+    # Base voice models bundled in /opt/nova/models for offline first-run (NOVA-016 Option B)
+    required_models = (
+        "opt/nova/models/oye_nova.onnx",
+        "opt/nova/models/melspectrogram.onnx",
+        "opt/nova/models/embedding_model.onnx",
+        "opt/nova/models/silero_vad.onnx",
+        "opt/nova/models/es_ES-davefx-medium.onnx",
+        "opt/nova/models/es_ES-davefx-medium.onnx.json",
+    )
+    for model_relpath in required_models:
+        assert model_relpath in listing, f"Missing bundled base model in .deb: {model_relpath}"
 
     # Internal library assets (faster-whisper VAD) must remain intact
     assert "faster_whisper/assets/silero_vad_v6.onnx" in listing

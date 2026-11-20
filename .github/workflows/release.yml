@@ -58,6 +58,11 @@ jobs:
           DECISION="$(echo "${OUTPUT}" | grep -E '^decision=' | head -n1 | cut -d'=' -f2)"
           echo "decision=${DECISION}" >> "$GITHUB_OUTPUT"
 
+      - name: Provision base voice models for package
+        if: steps.decision.outputs.decision == 'release'
+        timeout-minutes: 10
+        run: PYTHONPATH=src python3 -m nova.adapters.models_downloader --dest models
+
       - name: Build Debian package (release mode)
         if: steps.decision.outputs.decision == 'release'
         timeout-minutes: 10

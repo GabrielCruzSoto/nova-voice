@@ -138,27 +138,35 @@ fi
 echo "Installing runtime dependencies and nova-voice..."
 "$PIP_BIN" --python "${VENV_TARGET}/bin/python" install --prefer-binary -r "${SCRIPT_DIR}/constraints.txt" >/dev/null
 "$PIP_BIN" --python "${VENV_TARGET}/bin/python" install --no-deps "openwakeword==0.6.0" >/dev/null
-OWW_RESOURCES_DIR="${VENV_TARGET}/lib/python3.12/site-packages/openwakeword/resources/models"
-mkdir -p "${OWW_RESOURCES_DIR}"
-if [[ -f "${REPO_ROOT}/models/melspectrogram.onnx" ]]; then
-  cp "${REPO_ROOT}/models/melspectrogram.onnx" "${OWW_RESOURCES_DIR}/melspectrogram.onnx"
-fi
-if [[ -f "${REPO_ROOT}/models/embedding_model.onnx" ]]; then
-  cp "${REPO_ROOT}/models/embedding_model.onnx" "${OWW_RESOURCES_DIR}/embedding_model.onnx"
-fi
 "$PIP_BIN" --python "${VENV_TARGET}/bin/python" install --no-deps "$REPO_ROOT" >/dev/null
 
-# 6. Hygiene: remove pyc, pycache, models, and leaks
-echo "Cleaning byte-code, models, and build host references..."
+# 5b. Provision verified base voice models into /opt/nova/models (Option B: offline-ready .deb)
+echo "Provisioning base voice models into /opt/nova/models..."
+MODELS_TARGET="${STAGING_DIR}/opt/nova/models"
+mkdir -p "${MODELS_TARGET}"
+MODELS_IMPORT_ARGS=()
+if [[ -n "${NOVA_BUILD_MODELS_DIR:-}" && -d "${NOVA_BUILD_MODELS_DIR}" ]]; then
+  MODELS_IMPORT_ARGS=(--import "${NOVA_BUILD_MODELS_DIR}")
+elif [[ -d "${REPO_ROOT}/models" ]]; then
+  MODELS_IMPORT_ARGS=(--import "${REPO_ROOT}/models")
+elif [[ -n "$WORKSPACE_ROOT" && -d "${WORKSPACE_ROOT}/repositories/nova/models" ]]; then
+  MODELS_IMPORT_ARGS=(--import "${WORKSPACE_ROOT}/repositories/nova/models")
+fi
+"${VENV_TARGET}/bin/python" -m nova.adapters.models_downloader \
+  --dest "${MODELS_TARGET}" "${MODELS_IMPORT_ARGS[@]}"
+chmod 0644 "${MODELS_TARGET}"/*
+
+OWW_RESOURCES_DIR="${VENV_TARGET}/lib/python3.12/site-packages/openwakeword/resources/models"
+mkdir -p "${OWW_RESOURCES_DIR}"
+cp "${MODELS_TARGET}/melspectrogram.onnx" "${OWW_RESOURCES_DIR}/melspectrogram.onnx"
+cp "${MODELS_TARGET}/embedding_model.onnx" "${OWW_RESOURCES_DIR}/embedding_model.onnx"
+
+# 6. Hygiene: remove pyc, pycache, and build host leaks
+echo "Cleaning byte-code and build host references..."
 find "${STAGING_DIR}" -type f -name "*.pyc" -delete
 find "${STAGING_DIR}" -type d -name "__pycache__" -delete
 find "${STAGING_DIR}" -type f -name "direct_url.json" -delete
-
-# Ensure /opt/nova/models is absent and standalone voice models are excluded
-rm -rf "${STAGING_DIR}/opt/nova/models" "${STAGING_DIR}/models"
-find "${STAGING_DIR}" -maxdepth 4 -name "silero_vad.onnx" -delete 2>/dev/null || true
-find "${STAGING_DIR}" -name "oye_nova.onnx" -delete 2>/dev/null || true
-find "${STAGING_DIR}" -name "es_ES-davefx-medium*" -delete 2>/dev/null || true
+rm -rf "${STAGING_DIR}/models"
 
 # Sanitize pyvenv.cfg
 cat > "${VENV_TARGET}/pyvenv.cfg" << 'EOF'

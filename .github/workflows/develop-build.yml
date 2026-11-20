@@ -46,6 +46,10 @@ jobs:
         timeout-minutes: 5
         run: npm ci
 
+      - name: Provision base voice models for package
+        timeout-minutes: 10
+        run: PYTHONPATH=src python3 -m nova.adapters.models_downloader --dest models
+
       - name: Derive development version
         id: version
         timeout-minutes: 2
