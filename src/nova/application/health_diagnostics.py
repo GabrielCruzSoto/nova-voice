@@ -27,6 +27,19 @@ class DiagnosticsConfig(Protocol):
 WhichResolver = Callable[[str], str | None]
 
 
+PackageManagerName = Literal["apt", "dnf", "pacman", "zypper", "brew", "winget", "unknown"]
+
+
+class HostEnvironmentInfo(BaseModel):
+    """Detected OS platform and package manager used to tailor install remedies."""
+
+    model_config = ConfigDict(frozen=True, extra="ignore")
+
+    platform: str
+    distro_id: str | None = None
+    package_manager: PackageManagerName = "unknown"
+
+
 class ComponentCheckResult(BaseModel):
     """Status of an individual system executable or local AI model."""
 
@@ -51,6 +64,148 @@ class SystemHealthReport(BaseModel):
     missing_optional_count: int = 0
     components: list[ComponentCheckResult] = Field(default_factory=list)
     alert_message: str | None = None
+    host_environment: HostEnvironmentInfo | None = None
+
+
+def _parse_os_release(os_release_path: Path) -> tuple[str | None, list[str]]:
+    if not os_release_path.is_file():
+        return None, []
+    distro_id: str | None = None
+    id_like: list[str] = []
+    try:
+        for line in os_release_path.read_text(encoding="utf-8", errors="ignore").splitlines():
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#") or "=" not in stripped:
+                continue
+            key, raw_val = stripped.split("=", 1)
+            val = raw_val.strip().strip('"').strip("'").lower()
+            if key == "ID" and val:
+                distro_id = val
+            elif key == "ID_LIKE" and val:
+                id_like = [tok for tok in val.split() if tok]
+    except OSError:
+        return None, []
+    return distro_id, id_like
+
+
+def detect_host_environment(
+    *,
+    which_resolver: WhichResolver = shutil.which,
+    os_release_path: Path | None = None,
+    platform_name: str | None = None,
+) -> HostEnvironmentInfo:
+    """Detect host OS family and preferred package manager without spawning subprocesses."""
+    plat = (platform_name or sys.platform).lower()
+    if plat.startswith("darwin"):
+        pm: PackageManagerName = "brew" if which_resolver("brew") else "unknown"
+        return HostEnvironmentInfo(platform="darwin", distro_id="macos", package_manager=pm)
+    if plat.startswith("win"):
+        pm = "winget" if which_resolver("winget") else "unknown"
+        return HostEnvironmentInfo(platform="windows", distro_id="windows", package_manager=pm)
+
+    release_file = os_release_path if os_release_path is not None else Path("/etc/os-release")
+    distro_id, id_like = _parse_os_release(release_file)
+
+    pm_checks: tuple[tuple[str, PackageManagerName], ...] = (
+        ("apt-get", "apt"),
+        ("apt", "apt"),
+        ("dnf", "dnf"),
+        ("pacman", "pacman"),
+        ("zypper", "zypper"),
+    )
+    for binary, candidate_pm in pm_checks:
+        if which_resolver(binary):
+            return HostEnvironmentInfo(
+                platform="linux",
+                distro_id=distro_id,
+                package_manager=candidate_pm,
+            )
+
+    tokens = {tok for tok in ([distro_id, *id_like] if distro_id else id_like) if tok}
+    if tokens & {"ubuntu", "debian", "linuxmint", "pop"}:
+        fallback_pm: PackageManagerName = "apt"
+    elif tokens & {"fedora", "rhel", "centos", "rocky", "almalinux"}:
+        fallback_pm = "dnf"
+    elif tokens & {"arch", "manjaro", "endeavouros"}:
+        fallback_pm = "pacman"
+    elif tokens & {"opensuse", "suse", "sles", "opensuse-tumbleweed", "opensuse-leap"}:
+        fallback_pm = "zypper"
+    else:
+        fallback_pm = "unknown"
+
+    return HostEnvironmentInfo(
+        platform="linux",
+        distro_id=distro_id,
+        package_manager=fallback_pm,
+    )
+
+
+def _node_install_prefix(pm: PackageManagerName) -> str | None:
+    if pm == "apt":
+        return "sudo apt update && sudo apt install -y nodejs npm"
+    if pm == "dnf":
+        return "sudo dnf install -y nodejs npm"
+    if pm == "pacman":
+        return "sudo pacman -S --needed nodejs npm"
+    if pm == "zypper":
+        return "sudo zypper install -y nodejs npm"
+    if pm == "brew":
+        return "brew install node"
+    if pm == "winget":
+        return "winget install OpenJS.NodeJS.LTS"
+    return None
+
+
+def build_component_remedy(
+    component_name: str,
+    env: HostEnvironmentInfo,
+    *,
+    which_resolver: WhichResolver = shutil.which,
+) -> str:
+    """Return an actionable, OS/package-manager-aware installation remedy for a missing item."""
+    pm = env.package_manager
+    if component_name in ("audio_capture", "audio_playback"):
+        if pm == "apt":
+            return "Ejecutá: sudo apt update && sudo apt install -y pipewire-bin pulseaudio-utils"
+        if pm == "dnf":
+            return "Ejecutá: sudo dnf install -y pipewire-utils pulseaudio-utils"
+        if pm == "pacman":
+            return "Ejecutá: sudo pacman -S --needed pipewire pipewire-pulse"
+        if pm == "zypper":
+            return "Ejecutá: sudo zypper install -y pipewire-tools pulseaudio-utils"
+        return "Instalá los paquetes pipewire o pulseaudio-utils con el gestor de tu sistema."
+
+    if component_name == "pi":
+        has_npm = bool(which_resolver("npm"))
+        if has_npm:
+            return (
+                "Instalá Pi CLI con: npm install -g @mariozechner/pi-coding-agent "
+                "(o creá un enlace en ~/.local/bin/pi)"
+            )
+        node_cmd = _node_install_prefix(pm)
+        if node_cmd:
+            return (
+                f"Instalá Node.js/npm y Pi CLI con: {node_cmd} && "
+                "npm install -g @mariozechner/pi-coding-agent"
+            )
+        return (
+            "Instalá Pi CLI con 'npm install -g @mariozechner/pi-coding-agent' "
+            "o creá un enlace en ~/.local/bin/pi"
+        )
+
+    if component_name == "agy":
+        return (
+            "Instalá Antigravity CLI en ~/.local/bin/agy "
+            "para tareas de programación profunda (opcional)"
+        )
+
+    if component_name.startswith("model_"):
+        return (
+            "Usá el botón 'Instalar modelos de voz' en el asistente inicial "
+            "o ejecutá 'nova-desktop --download-models'"
+        )
+
+    return "Instalá o configurá este componente en tu sistema y volvé a verificar."
 
 
 def _resolve_cli_binary(
@@ -137,6 +292,11 @@ def resolve_model_path(
             if src_candidate.is_file():
                 return src_candidate
 
+    # Step 7: Bundled package asset fallback (e.g., oye_nova.onnx shipped inside nova package)
+    bundled_candidate = Path(__file__).resolve().parent.parent / "assets" / "models" / filename
+    if bundled_candidate.is_file():
+        return bundled_candidate
+
     return None
 
 
@@ -145,9 +305,14 @@ def check_system_components(
     *,
     which_resolver: WhichResolver = shutil.which,
     source_root: Path | None = None,
+    os_release_path: Path | None = None,
 ) -> SystemHealthReport:
     """Audit system dependencies and voice models, producing a structured health report."""
     checks: list[ComponentCheckResult] = []
+    host_env = detect_host_environment(
+        which_resolver=which_resolver,
+        os_release_path=os_release_path,
+    )
 
     # 1. Multi-engine CLI agent detection (NOVA-017: claude, opencode, agy, pi)
     pi_name = config.pi_executable if config is not None else "pi"
@@ -192,7 +357,6 @@ def check_system_components(
             ),
         ),
     )
-
     detected_engines: list[tuple[str, str]] = []
     for engine_id, label, exe_name, fallbacks in cli_specs:
         ok, resolved_path = _resolve_cli_binary(
@@ -228,6 +392,7 @@ def check_system_components(
             )
         )
     else:
+        os_cli_remedy = build_component_remedy("pi", host_env, which_resolver=which_resolver)
         checks.append(
             ComponentCheckResult(
                 name="agent_runtime",
@@ -238,7 +403,8 @@ def check_system_components(
                 details="No se encontró ningún agente CLI compatible (claude, opencode, agy o pi)",
                 remedy=(
                     "Instalá al menos un agente CLI compatible: Claude Code (claude), "
-                    "OpenCode (opencode), Antigravity (agy) o Pi CLI (pi)."
+                    "OpenCode (opencode), Antigravity (agy) o Pi CLI (pi). "
+                    f"{os_cli_remedy}"
                 ),
             )
         )
@@ -258,7 +424,13 @@ def check_system_components(
                 if pw_rec_ok
                 else "No se encontró 'pw-record' ni 'parecord'"
             ),
-            remedy="" if pw_rec_ok else "Instalá los paquetes pipewire o pulseaudio-utils",
+            remedy=(
+                ""
+                if pw_rec_ok
+                else build_component_remedy(
+                    "audio_capture", host_env, which_resolver=which_resolver
+                )
+            ),
         )
     )
 
@@ -276,7 +448,13 @@ def check_system_components(
                 if pw_play_ok
                 else "No se encontró 'pw-play' ni 'paplay'"
             ),
-            remedy="" if pw_play_ok else "Instalá los paquetes pipewire o pulseaudio-utils",
+            remedy=(
+                ""
+                if pw_play_ok
+                else build_component_remedy(
+                    "audio_playback", host_env, which_resolver=which_resolver
+                )
+            ),
         )
     )
 
@@ -434,4 +612,5 @@ def check_system_components(
         missing_optional_count=len(missing_optional),
         components=checks,
         alert_message=alert_message,
+        host_environment=host_env,
     )

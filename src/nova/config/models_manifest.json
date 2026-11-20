@@ -31,7 +31,8 @@
     {
       "filename": "oye_nova.onnx",
       "type": "wakeword",
-      "source_type": "local-import",
+      "source_type": "bundled",
+      "asset_relpath": "assets/models/oye_nova.onnx",
       "sha256": "94a13cfe60075b132f6a472e7e462e8123ee70861bc3fb58434a73712ee0d2cb",
       "size_bytes": 1271370,
       "description": "Nova custom wake-word ONNX model ('Oye Nova') for OpenWakeWord"

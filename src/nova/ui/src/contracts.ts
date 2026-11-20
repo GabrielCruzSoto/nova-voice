@@ -38,7 +38,8 @@ export type UiEventType =
   | "call_state_changed"
   | "voice_transcription"
   | "settings_updated"
-  | "panel_toggle_requested";
+  | "panel_toggle_requested"
+  | "health_updated";
 
 export type UiMessageRole = "user" | "assistant" | "system" | "security";
 
@@ -364,6 +365,59 @@ export interface UiAgentsOverview {
   readonly tasks: readonly UiAgentTask[];
 }
 
+export interface HostEnvironmentInfo {
+  readonly platform: string;
+  readonly distro_id?: string | null | undefined;
+  readonly package_manager: string;
+}
+
+export interface ComponentCheckResult {
+  readonly name: string;
+  readonly category: "cli" | "audio" | "model";
+  readonly installed: boolean;
+  readonly path?: string | null | undefined;
+  readonly required: boolean;
+  readonly details: string;
+  readonly remedy: string;
+}
+
+export interface SystemHealthReport {
+  readonly all_ok: boolean;
+  readonly missing_critical_count: number;
+  readonly missing_optional_count: number;
+  readonly components: readonly ComponentCheckResult[];
+  readonly alert_message?: string | null | undefined;
+  readonly host_environment?: HostEnvironmentInfo | null | undefined;
+}
+
+export interface ModelItemStatus {
+  readonly filename: string;
+  readonly type: string;
+  readonly description: string;
+  readonly source_type: string;
+  readonly size_bytes: number;
+  readonly installed: boolean;
+  readonly path?: string | null | undefined;
+}
+
+export interface ModelsProvisionState {
+  readonly status: "idle" | "running" | "completed" | "error";
+  readonly all_installed: boolean;
+  readonly total_models: number;
+  readonly completed_models: number;
+  readonly current_model?: string | null | undefined;
+  readonly bytes_downloaded: number;
+  readonly total_bytes: number;
+  readonly percent: number;
+  readonly error?: string | null | undefined;
+  readonly models: readonly ModelItemStatus[];
+}
+
+export interface HealthRecheckResponse {
+  readonly health: SystemHealthReport;
+  readonly voice_enabled: boolean;
+}
+
 export interface PresentationalAppModel {
   readonly status: ViewStatus;
   readonly voiceEnabled: boolean;
@@ -404,4 +458,7 @@ export interface PresentationalAppModel {
   readonly diagnostics?: LiveDiagnosticsState | null | undefined;
   readonly agentCatalog?: AgentCatalogSnapshot | null | undefined;
   readonly agentProbeResult?: AgentDiagnosticResponse | null | undefined;
+  readonly healthReport?: SystemHealthReport | null | undefined;
+  readonly healthRechecking?: boolean | undefined;
+  readonly modelsStatus?: ModelsProvisionState | null | undefined;
 }

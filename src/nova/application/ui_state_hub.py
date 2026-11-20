@@ -61,6 +61,7 @@ UiEventType = Literal[
     "voice_transcription",
     "settings_updated",
     "panel_toggle_requested",
+    "health_updated",
 ]
 UiMessageRole = Literal["user", "assistant", "system", "security"]
 UiMessageModality = Literal[
@@ -499,6 +500,47 @@ class UiStateHub:
                 active_correlation_id=live.active_correlation_id,
             )
         return self._call_view
+
+    def clear_health_alerts(self) -> bool:
+        """Remove stale COMPONENTS_MISSING timeline error records once health recovers."""
+        before = len(self._messages)
+        if before == 0:
+            return False
+        kept = [rec for rec in self._messages if rec.step_type != "COMPONENTS_MISSING"]
+        if len(kept) == before:
+            return False
+        self._messages.clear()
+        self._messages.extend(kept)
+        return True
+
+    def update_runtime_health(
+        self,
+        *,
+        all_ok: bool,
+        voice_enabled: bool,
+        call_session_provider: Callable[[], CallSession] | None = None,
+        alert_message: str | None = None,
+    ) -> None:
+        """Apply hot-reloaded voice state and health status, broadcasting to UI subscribers."""
+        self._voice_enabled = voice_enabled
+        if call_session_provider is not None:
+            self._call_session_provider = call_session_provider
+        if all_ok:
+            self.clear_health_alerts()
+        call_view = self.sync_call_session()
+        self._seq += 1
+        self._emit_envelope(
+            seq=self._seq,
+            event_type="health_updated",
+            correlation_id="corr-health-recheck",
+            timestamp=datetime.now(UTC).isoformat(),
+            payload={
+                "all_ok": all_ok,
+                "voice_enabled": self._voice_enabled,
+                "call_session": call_view.model_dump(),
+                "alert_message": self._redact(alert_message) if alert_message else None,
+            },
+        )
 
     async def build_snapshot(self, *, csrf_token: str) -> UiStateSnapshot:
         """Construct an immutable UiStateSnapshot for GET /api/state or SSE snapshot."""

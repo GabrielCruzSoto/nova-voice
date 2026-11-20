@@ -14,7 +14,7 @@ import secrets
 import time
 import uuid
 from collections import OrderedDict
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import asdict, dataclass
 from http.cookies import SimpleCookie
 from pathlib import Path
@@ -25,6 +25,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from nova.adapters.workspace_resolver import LocalWorkspaceResolver
 from nova.application.live_diagnostics import LiveDiagnosticsService
+from nova.application.models_provisioning import VoiceModelsProvisioningService
 from nova.application.settings_service import SettingsService
 from nova.application.ui_state_hub import UiStateHub
 from nova.domain.errors import (
@@ -174,6 +175,8 @@ class DesktopUiServer:
         health_report_provider: Callable[[], Any] | None = None,
         agent_catalog_provider: Callable[[], AgentCatalogSnapshot] | None = None,
         credential_store: CredentialStorePort | None = None,
+        health_recheck_callback: Callable[[], Awaitable[tuple[Any, bool]]] | None = None,
+        models_provisioning_service: VoiceModelsProvisioningService | None = None,
         shutdown_callback: Callable[[str], None] | None = None,
         static_dir: Path | None = None,
         settings: DesktopUiServerSettings | None = None,
@@ -191,6 +194,8 @@ class DesktopUiServer:
         self._health_report_provider = health_report_provider
         self._agent_catalog_provider = agent_catalog_provider
         self._credential_store = credential_store
+        self._health_recheck_callback = health_recheck_callback
+        self._models_provisioning_service = models_provisioning_service
         self._shutdown_callback = shutdown_callback
         self._static_dir = static_dir or _default_static_dir()
         self._settings = settings or DesktopUiServerSettings()
@@ -210,6 +215,10 @@ class DesktopUiServer:
     @property
     def base_url(self) -> str:
         return f"http://127.0.0.1:{self._bound_port}"
+
+    def set_voice_coordinator(self, voice_coordinator: VoiceControlUiPort | None) -> None:
+        """Bind or replace the active voice coordinator after hot-reload."""
+        self._voice_coordinator = voice_coordinator
 
     @property
     def extra_secrets(self) -> tuple[str, ...]:
@@ -668,6 +677,40 @@ class DesktopUiServer:
                 return
             snapshot = self._agent_catalog_provider()
             await self._write_json(writer, 200, snapshot.model_dump(), corr_id)
+            return
+
+        if method == "GET" and path == "/api/models/status":
+            sess = self._validate_session_cookie(headers.get("cookie"))
+            if sess is None:
+                await self._write_error(
+                    writer,
+                    403,
+                    "UI_FORBIDDEN_ORIGIN_OR_CSRF",
+                    "Missing or invalid UI session cookie.",
+                    corr_id,
+                )
+                return
+            if self._models_provisioning_service is None:
+                await self._write_json(
+                    writer,
+                    200,
+                    {
+                        "status": "idle",
+                        "all_installed": True,
+                        "total_models": 0,
+                        "completed_models": 0,
+                        "current_model": None,
+                        "bytes_downloaded": 0,
+                        "total_bytes": 0,
+                        "percent": 100,
+                        "error": None,
+                        "models": [],
+                    },
+                    corr_id,
+                )
+                return
+            status_view = self._models_provisioning_service.get_status()
+            await self._write_json(writer, 200, status_view.model_dump(), corr_id)
             return
 
         if method == "GET" and path == "/api/events":
@@ -1227,6 +1270,58 @@ class DesktopUiServer:
 
         if path.startswith("/api/diagnostics/"):
             await self._handle_live_diagnostic(writer, path, payload, corr_id)
+            return
+
+        if path == "/api/models/provision":
+            if self._models_provisioning_service is None:
+                await self._write_error(
+                    writer,
+                    503,
+                    "UI_MODELS_PROVISIONING_UNAVAILABLE",
+                    "Models provisioning service is not configured.",
+                    corr_id,
+                )
+                return
+            state_view = await self._models_provisioning_service.start_provisioning()
+            await self._write_json(writer, 202, state_view.model_dump(), corr_id)
+            return
+
+        if path == "/api/health/recheck":
+            if self._health_recheck_callback is not None:
+                report, voice_enabled = await self._health_recheck_callback()
+                report_data = report.model_dump() if hasattr(report, "model_dump") else report
+                await self._write_json(
+                    writer,
+                    200,
+                    {"health": report_data, "voice_enabled": voice_enabled},
+                    corr_id,
+                )
+                return
+            report = (
+                self._health_report_provider()
+                if self._health_report_provider is not None
+                else None
+            )
+            report_data = (
+                report.model_dump()
+                if (report is not None and hasattr(report, "model_dump"))
+                else (
+                    report
+                    or {
+                        "all_ok": True,
+                        "missing_critical_count": 0,
+                        "missing_optional_count": 0,
+                        "components": [],
+                        "alert_message": None,
+                    }
+                )
+            )
+            await self._write_json(
+                writer,
+                200,
+                {"health": report_data, "voice_enabled": self._hub.voice_enabled},
+                corr_id,
+            )
             return
 
         if path == "/api/workspace/select":

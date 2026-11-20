@@ -191,6 +191,10 @@ jobs:
         timeout-minutes: 5
         run: npm ci
 
+      - name: Provision base voice models for package
+        timeout-minutes: 10
+        run: PYTHONPATH=src python3 -m nova.adapters.models_downloader --dest models
+
       - name: Build Debian package (PR mode)
         timeout-minutes: 10
         run: bash packaging/deb/build.sh --mode pr

@@ -9,7 +9,9 @@ import type {
   AudioDeviceInfo,
   CallSessionState,
   LiveDiagnosticsState,
+  ModelsProvisionState,
   PresentationalAppModel,
+  SystemHealthReport,
   UiAgentPoolSlot,
   UiAgentTask,
   UiAgentsOverview,
@@ -964,6 +966,116 @@ function renderLiveDiagnosticsPanel(diag: LiveDiagnosticsState | null | undefine
   `.trim();
 }
 
+export function renderOnboardingSystemReadiness(
+  healthReport: SystemHealthReport | null | undefined,
+  modelsStatus: ModelsProvisionState | null | undefined,
+  rechecking: boolean,
+): string {
+  const models = modelsStatus?.models ?? [];
+  const missingModels = models.filter((m) => !m.installed);
+  const isProvisioning = modelsStatus?.status === "running";
+  const allModelsOk = modelsStatus ? modelsStatus.all_installed : true;
+  const installedModelsCount = models.length - missingModels.length;
+
+  let modelsBlock = "";
+  if (modelsStatus && models.length > 0) {
+    if (isProvisioning) {
+      const pct = Math.max(0, Math.min(100, modelsStatus.percent));
+      const cur = modelsStatus.current_model ? escapeHtml(modelsStatus.current_model) : "modelos";
+      modelsBlock = `
+        <div class="nova-onboarding-readiness-row" data-slot="models-progress">
+          <div class="nova-onboarding-readiness-head">
+            <span>Descargando ${cur} (${modelsStatus.completed_models}/${modelsStatus.total_models})</span>
+            <strong>${pct}%</strong>
+          </div>
+          <progress max="100" value="${pct}" aria-label="Progreso de descarga de modelos de voz"></progress>
+        </div>
+      `.trim();
+    } else if (allModelsOk) {
+      modelsBlock = `
+        <div class="nova-onboarding-readiness-row nova-onboarding-readiness-row--ok" data-slot="models-ready">
+          <span>Modelos de voz locales listos (${installedModelsCount}/${models.length})</span>
+        </div>
+      `.trim();
+    } else {
+      const missingNames = missingModels.map((m) => escapeHtml(m.filename)).join(", ");
+      const errHtml = modelsStatus.error
+        ? `<p class="nova-settings-error" role="alert">${escapeHtml(modelsStatus.error)}</p>`
+        : "";
+      const btnLabel =
+        modelsStatus.status === "error"
+          ? "Reintentar instalación de modelos"
+          : "Instalar modelos de voz";
+      modelsBlock = `
+        <div class="nova-onboarding-readiness-row nova-onboarding-readiness-row--warn" data-slot="models-missing">
+          <p>Faltan modelos de voz: <code>${missingNames}</code></p>
+          ${errHtml}
+          <button type="button" class="btn btn--secondary" data-action="provision-models">
+            ${btnLabel}
+          </button>
+        </div>
+      `.trim();
+    }
+  }
+
+  const nonModelMissing = (healthReport?.components ?? []).filter(
+    (c) => c.category !== "model" && !c.installed,
+  );
+  const pmLabel =
+    healthReport?.host_environment?.package_manager &&
+    healthReport.host_environment.package_manager !== "unknown"
+      ? ` (${escapeHtml(healthReport.host_environment.package_manager)})`
+      : "";
+
+  let depsBlock = "";
+  if (nonModelMissing.length > 0) {
+    const itemsHtml = nonModelMissing
+      .map((c) => {
+        const badge = c.required ? "Requerido" : "Opcional";
+        const remedyHtml = c.remedy
+          ? `<code class="nova-onboarding-remedy">${escapeHtml(c.remedy)}</code>`
+          : "";
+        return `
+          <li class="nova-onboarding-dep-item" data-component="${escapeHtml(c.name)}">
+            <strong>${escapeHtml(c.name)}</strong> <span>[${badge}]</span>: ${escapeHtml(c.details)}
+            ${remedyHtml}
+          </li>
+        `.trim();
+      })
+      .join("");
+    depsBlock = `
+      <div class="nova-onboarding-readiness-row nova-onboarding-readiness-row--warn" data-slot="system-deps-missing">
+        <p>Dependencias del sistema faltantes${pmLabel}:</p>
+        <ul class="nova-onboarding-dep-list">${itemsHtml}</ul>
+      </div>
+    `.trim();
+  } else if (healthReport) {
+    depsBlock = `
+      <div class="nova-onboarding-readiness-row nova-onboarding-readiness-row--ok" data-slot="system-deps-ready">
+        <span>Herramientas del sistema y audio verificadas${pmLabel}.</span>
+      </div>
+    `.trim();
+  }
+
+  if (!modelsBlock && !depsBlock) {
+    return "";
+  }
+
+  const recheckDisabled = rechecking || isProvisioning ? " disabled" : "";
+  return `
+    <div class="nova-settings-section" data-slot="onboarding-system-readiness">
+      <h3 class="nova-settings-section-title">Componentes y modelos de voz</h3>
+      ${modelsBlock}
+      ${depsBlock}
+      <div class="nova-onboarding-readiness-actions">
+        <button type="button" class="btn btn--secondary" data-action="recheck-health"${recheckDisabled}>
+          ${rechecking ? "Verificando…" : "Volver a verificar"}
+        </button>
+      </div>
+    </div>
+  `.trim();
+}
+
 export function renderOnboardingModal(model: PresentationalAppModel): string {
   if (!model.onboardingOpen) {
     return "";
@@ -978,7 +1090,23 @@ export function renderOnboardingModal(model: PresentationalAppModel): string {
     model.onboardingDraftAudio !== undefined
       ? model.onboardingDraftAudio.playbackTarget || null
       : (model.settingsData?.audio.playback_target ?? null);
-  const savingAttr = model.onboardingSaving ? " disabled" : "";
+  const isProvisioning = model.modelsStatus?.status === "running";
+  const savingAttr = model.onboardingSaving || isProvisioning ? " disabled" : "";
+  const readinessHtml = renderOnboardingSystemReadiness(
+    model.healthReport,
+    model.modelsStatus,
+    Boolean(model.healthRechecking),
+  );
+  const modelsStillMissing =
+    model.modelsStatus !== undefined &&
+    model.modelsStatus !== null &&
+    model.modelsStatus.total_models > 0 &&
+    !model.modelsStatus.all_installed;
+  const finishLabel = model.onboardingSaving
+    ? "Guardando…"
+    : modelsStillMissing
+      ? "Finalizar en modo solo texto"
+      : "Finalizar configuración";
 
   return `
     <div class="nova-settings-backdrop" data-slot="onboarding-modal">
@@ -992,8 +1120,9 @@ export function renderOnboardingModal(model: PresentationalAppModel): string {
           <h2 class="nova-settings-title">Configuración inicial y diagnóstico</h2>
         </div>
         <p class="nova-onboarding-desc">
-          Verifica que el micrófono, la salida de audio y las conexiones con Pi y Antigravity respondan antes de comenzar. Al finalizar, Nova iniciará en modo conversacional sin workspace activo.
+          Verifica que el micrófono, la salida de audio, los modelos de voz y las conexiones con Pi y Antigravity respondan antes de comenzar. Al finalizar, Nova iniciará en modo conversacional sin workspace activo.
         </p>
+        ${readinessHtml}
         <div class="nova-settings-section">
           <h3 class="nova-settings-section-title">Dispositivos de audio</h3>
           <label class="nova-settings-field">
@@ -1019,7 +1148,7 @@ export function renderOnboardingModal(model: PresentationalAppModel): string {
             class="btn btn--primary"
             data-action="complete-onboarding"${savingAttr}
           >
-            ${model.onboardingSaving ? "Guardando…" : "Finalizar configuración"}
+            ${finishLabel}
           </button>
         </div>
       </section>

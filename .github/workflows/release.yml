@@ -58,6 +58,11 @@ jobs:
           DECISION="$(echo "${OUTPUT}" | grep -E '^decision=' | head -n1 | cut -d'=' -f2)"
           echo "decision=${DECISION}" >> "$GITHUB_OUTPUT"
 
+      - name: Provision base voice models for package
+        if: steps.decision.outputs.decision == 'release'
+        timeout-minutes: 10
+        run: PYTHONPATH=src python3 -m nova.adapters.models_downloader --dest models
+
       - name: Build Debian package (release mode)
         if: steps.decision.outputs.decision == 'release'
         timeout-minutes: 10
@@ -75,6 +80,17 @@ jobs:
           VERSION: ${{ steps.decision.outputs.version }}
         run: |
           python3 scripts/extract-release-notes.py --version "${VERSION}" --output dist/RELEASE_NOTES.md
+
+      - name: Upload release Debian package artifacts
+        if: steps.decision.outputs.decision == 'release'
+        timeout-minutes: 5
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.0
+        with:
+          name: nova-voice_${{ steps.decision.outputs.version }}_amd64.deb
+          path: |
+            dist/nova-voice_${{ steps.decision.outputs.version }}_amd64.deb
+            dist/nova-voice_${{ steps.decision.outputs.version }}_amd64.deb.sha256
+          retention-days: 30
 
       - name: Create tag and GitHub Release
         if: steps.decision.outputs.decision == 'release'

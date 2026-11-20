@@ -33,9 +33,13 @@ import type {
   AudioOutputDiagnosticResponse,
   DiagnosticTarget,
   ErrorResponse,
+  HealthRecheckResponse,
   InitializeWorkspaceParams,
   LiveDiagnosticsState,
   MicDiagnosticResponse,
+  ModelsProvisionState,
+  SystemHealthReport,
+  UiCallSessionView,
   NovaSettingsDocument,
   PiDiagnosticResponse,
   PresentationalAppModel,
@@ -221,19 +225,21 @@ export class DesktopAppController {
           signal: this.#abortController.signal,
         });
         if (healthResp.ok) {
-          const healthData = (await healthResp.json()) as {
-            all_ok?: boolean;
-            alert_message?: string | null;
-          };
+          const healthData = (await healthResp.json()) as SystemHealthReport;
           if (!healthData.all_ok && healthData.alert_message) {
             this.#updateModel({
+              healthReport: healthData,
               noticeBanner: resolveHumanNotice("COMPONENTS_MISSING", healthData.alert_message),
             });
+          } else {
+            this.#updateModel({ healthReport: healthData });
           }
         }
       } catch {
         // Non-blocking health probe
       }
+
+      await this.#fetchModelsStatus();
 
       void this.#consumeSseLoop();
     } catch (err) {
@@ -866,6 +872,116 @@ export class DesktopAppController {
       settingsData: payload.settings,
       lastMilestone: "Configuración inicial completada.",
     });
+    await this.recheckHealth();
+  }
+
+  async #fetchModelsStatus(): Promise<ModelsProvisionState | null> {
+    if (this.#disposed) {
+      return null;
+    }
+    try {
+      const resp = await this.#fetch("/api/models/status", {
+        method: "GET",
+        credentials: "same-origin",
+        signal: this.#abortController.signal,
+      });
+      if (!resp.ok) {
+        return null;
+      }
+      const data = (await resp.json()) as ModelsProvisionState;
+      this.#updateModel({ modelsStatus: data });
+      return data;
+    } catch {
+      return null;
+    }
+  }
+
+  async recheckHealth(): Promise<void> {
+    if (this.#disposed) {
+      return;
+    }
+    this.#updateModel({ healthRechecking: true });
+    try {
+      const resp = await this.#sendJson("POST", "/api/health/recheck", {});
+      if (resp.ok) {
+        const data = (await resp.json()) as HealthRecheckResponse;
+        const nextMessages = data.health.all_ok
+          ? this.#model.messages.filter((m) => m.step_type !== "COMPONENTS_MISSING")
+          : this.#model.messages;
+        const nextNotice =
+          data.health.all_ok && this.#model.noticeBanner?.code === "COMPONENTS_MISSING"
+            ? null
+            : !data.health.all_ok && data.health.alert_message
+              ? resolveHumanNotice("COMPONENTS_MISSING", data.health.alert_message)
+              : this.#model.noticeBanner;
+        this.#updateModel({
+          healthRechecking: false,
+          healthReport: data.health,
+          voiceEnabled: data.voice_enabled,
+          messages: nextMessages,
+          noticeBanner: nextNotice,
+        });
+      } else {
+        this.#updateModel({ healthRechecking: false });
+      }
+      await this.#fetchModelsStatus();
+    } catch {
+      this.#updateModel({ healthRechecking: false });
+    }
+  }
+
+  async provisionVoiceModels(): Promise<void> {
+    if (this.#disposed) {
+      return;
+    }
+    const resp = await this.#sendJson("POST", "/api/models/provision", {});
+    if (!resp.ok) {
+      const err = await this.#safeParseError(resp);
+      this.#updateModel({
+        modelsStatus: {
+          status: "error",
+          all_installed: false,
+          total_models: this.#model.modelsStatus?.total_models ?? 0,
+          completed_models: this.#model.modelsStatus?.completed_models ?? 0,
+          bytes_downloaded: 0,
+          total_bytes: this.#model.modelsStatus?.total_bytes ?? 0,
+          percent: 0,
+          error: err?.message ?? "No se pudo iniciar la descarga de modelos.",
+          models: this.#model.modelsStatus?.models ?? [],
+        },
+      });
+      return;
+    }
+    let state = (await resp.json()) as ModelsProvisionState;
+    this.#updateModel({ modelsStatus: state });
+
+    let polls = 0;
+    while (!this.#disposed && state.status === "running" && polls < 600) {
+      polls += 1;
+      await new Promise<void>((resolve) => {
+        const timer = setTimeout(resolve, 250);
+        this.#abortController.signal.addEventListener(
+          "abort",
+          () => {
+            clearTimeout(timer);
+            resolve();
+          },
+          { once: true },
+        );
+      });
+      if (this.#disposed) {
+        return;
+      }
+      const latest = await this.#fetchModelsStatus();
+      if (!latest) {
+        break;
+      }
+      state = latest;
+    }
+
+    if (!this.#disposed && state.status === "completed") {
+      await this.recheckHealth();
+    }
   }
 
   async #preloadSettingsAndDevices(): Promise<void> {
@@ -1267,6 +1383,39 @@ export class DesktopAppController {
       return;
     }
 
+    if (env.event_type === "health_updated") {
+      const allOk = Boolean(p["all_ok"]);
+      const voiceEnabled =
+        typeof p["voice_enabled"] === "boolean"
+          ? p["voice_enabled"]
+          : this.#model.voiceEnabled;
+      const nextMessages = allOk
+        ? this.#model.messages.filter((m) => m.step_type !== "COMPONENTS_MISSING")
+        : this.#model.messages;
+      const nextNotice =
+        allOk && this.#model.noticeBanner?.code === "COMPONENTS_MISSING"
+          ? null
+          : !allOk && typeof p["alert_message"] === "string" && p["alert_message"]
+            ? resolveHumanNotice("COMPONENTS_MISSING", p["alert_message"])
+            : this.#model.noticeBanner;
+      const rawCall = p["call_session"] as UiCallSessionView | undefined;
+      if (rawCall && typeof rawCall === "object" && typeof rawCall.state === "string") {
+        this.#updateModel({
+          voiceEnabled,
+          messages: nextMessages,
+          noticeBanner: nextNotice,
+          callSession: rawCall,
+        });
+      } else {
+        this.#updateModel({
+          voiceEnabled,
+          messages: nextMessages,
+          noticeBanner: nextNotice,
+        });
+      }
+      return;
+    }
+
     if (env.event_type === "call_state_changed") {
       const nextState = (p["state"] as PresentationalAppModel["callSession"]["state"]) ?? "standby";
       const turnCount =
@@ -1656,6 +1805,10 @@ export class DesktopAppController {
           if (prov && envVar) {
             void this.deleteProviderCredential(prov, envVar);
           }
+        } else if (action === "provision-models") {
+          void this.provisionVoiceModels();
+        } else if (action === "recheck-health") {
+          void this.recheckHealth();
         } else if (action === "complete-onboarding") {
           const capEl = root.querySelector<HTMLSelectElement>(
             '[name="onboarding.capture_target"]',

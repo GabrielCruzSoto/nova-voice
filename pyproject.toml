@@ -57,6 +57,7 @@ nova = [
     "plugins/claude_gatekeeper/*",
     "plugins/opencode_gatekeeper/*",
     "config/*.json",
+    "assets/models/*.onnx",
 ]
 
 [tool.pytest.ini_options]
