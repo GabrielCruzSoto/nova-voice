@@ -113,6 +113,27 @@ def test_pr_workflow_structure_and_security() -> None:
                 )
 
 
+def test_develop_build_workflow_uses_commit_sha() -> None:
+    dev_yml = _WORKFLOWS_DIR / "develop-build.yml"
+    assert dev_yml.is_file(), "develop-build.yml must exist"
+
+    data = _read_yaml(dev_yml)
+    jobs = data.get("jobs", {})
+    assert isinstance(jobs, dict)
+    dev_job = jobs.get("build-dev-deb")
+    assert isinstance(dev_job, dict)
+
+    steps = dev_job.get("steps", [])
+    upload_step = next(
+        s for s in steps if isinstance(s, dict) and "upload-artifact" in str(s.get("uses", ""))
+    )
+    with_args = upload_step.get("with", {})
+    assert with_args.get("name") == "nova-voice_${{ github.sha }}_amd64.deb"
+    upload_path = str(with_args.get("path", ""))
+    assert "dist/nova-voice_${{ github.sha }}_amd64.deb" in upload_path
+    assert "dist/nova-voice_${{ github.sha }}_amd64.deb.sha256" in upload_path
+
+
 def test_release_workflow_structure_and_security() -> None:
     rel_yml = _WORKFLOWS_DIR / "release.yml"
     assert rel_yml.is_file(), "release.yml must exist"

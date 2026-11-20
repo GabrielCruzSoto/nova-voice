@@ -57,10 +57,15 @@ PROJECT_VERSION="$(python3 -c 'import tomllib; print(tomllib.load(open("pyprojec
 if [[ "$MODE" == "pr" ]]; then
   COMMIT_SHA7="$(git -C "$REPO_ROOT" rev-parse --short=7 HEAD 2>/dev/null || echo "0000000")"
   DEB_VERSION="${PROJECT_VERSION}+git${COMMIT_SHA7}"
+  DEB_FILENAME="nova-voice_${DEB_VERSION}_amd64.deb"
 elif [[ "$MODE" == "dev" ]]; then
-  DEB_VERSION="${PROJECT_VERSION}-dev"
+  COMMIT_SHA="$(git -C "$REPO_ROOT" rev-parse HEAD 2>/dev/null || echo "0000000")"
+  COMMIT_SHA7="$(git -C "$REPO_ROOT" rev-parse --short=7 HEAD 2>/dev/null || echo "0000000")"
+  DEB_VERSION="${PROJECT_VERSION}-dev+git${COMMIT_SHA7}"
+  DEB_FILENAME="nova-voice_${COMMIT_SHA}_amd64.deb"
 else
   DEB_VERSION="${PROJECT_VERSION}"
+  DEB_FILENAME="nova-voice_${DEB_VERSION}_amd64.deb"
 fi
 
 echo "Building nova-voice Debian package version ${DEB_VERSION} (mode: ${MODE}, epoch: ${SOURCE_DATE_EPOCH})..."
@@ -131,8 +136,11 @@ if [[ -x "/usr/bin/python3" ]]; then
 fi
 
 echo "Creating isolated virtual environment at ${VENV_TARGET} using ${SYS_PYTHON}..."
-if ! "$SYS_PYTHON" -m venv --system-site-packages "$VENV_TARGET" 2>/dev/null; then
-  "$SYS_PYTHON" -m venv --without-pip --system-site-packages "$VENV_TARGET"
+# Keep build venv isolated from host system-site-packages so pip installs all
+# constraints.txt and transitive deps into /opt/nova/venv. Runtime access to
+# system GUI bindings (gi/PyQt6) is enabled later in pyvenv.cfg.
+if ! "$SYS_PYTHON" -m venv "$VENV_TARGET" 2>/dev/null; then
+  "$SYS_PYTHON" -m venv --without-pip "$VENV_TARGET"
 fi
 
 echo "Installing runtime dependencies and nova-voice..."
@@ -247,7 +255,6 @@ find "${STAGING_DIR}" -type d -exec touch -d "@${SOURCE_DATE_EPOCH}" {} +
 
 # 13. Build Debian Archive
 mkdir -p "$OUTPUT_DIR"
-DEB_FILENAME="nova-voice_${DEB_VERSION}_amd64.deb"
 DEB_PATH="${OUTPUT_DIR}/${DEB_FILENAME}"
 
 echo "Building final .deb archive with dpkg-deb..."

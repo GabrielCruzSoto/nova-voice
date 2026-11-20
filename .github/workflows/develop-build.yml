@@ -50,28 +50,16 @@ jobs:
         timeout-minutes: 10
         run: PYTHONPATH=src python3 -m nova.adapters.models_downloader --dest models
 
-      - name: Derive development version
-        id: version
-        timeout-minutes: 2
-        run: |
-          BASE_VERSION="$(python3 -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')"
-          DEV_VERSION="${BASE_VERSION}-dev"
-          echo "dev_version=${DEV_VERSION}" >> "$GITHUB_OUTPUT"
-
       - name: Build Debian package (dev mode)
         timeout-minutes: 10
-        env:
-          DEV_VERSION: ${{ steps.version.outputs.dev_version }}
-        run: |
-          bash packaging/deb/build.sh --mode dev
-          (cd dist && sha256sum "nova-voice_${DEV_VERSION}_amd64.deb" > "nova-voice_${DEV_VERSION}_amd64.deb.sha256")
+        run: bash packaging/deb/build.sh --mode dev
 
       - name: Upload development Debian package artifacts
         timeout-minutes: 5
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02  # v4.6.0
         with:
-          name: nova-voice_${{ steps.version.outputs.dev_version }}_amd64.deb
+          name: nova-voice_${{ github.sha }}_amd64.deb
           path: |
-            dist/nova-voice_${{ steps.version.outputs.dev_version }}_amd64.deb
-            dist/nova-voice_${{ steps.version.outputs.dev_version }}_amd64.deb.sha256
+            dist/nova-voice_${{ github.sha }}_amd64.deb
+            dist/nova-voice_${{ github.sha }}_amd64.deb.sha256
           retention-days: 14

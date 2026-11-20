@@ -33,7 +33,7 @@ echo "Checking GTK3 introspection in venv..."
 /opt/nova/venv/bin/python -c "import gi; gi.require_version(\"Gtk\",\"3.0\")"
 
 echo "Checking core voice runtime imports in venv..."
-/opt/nova/venv/bin/python -c "import faster_whisper, openwakeword, onnxruntime, kokoro_onnx, piper; print(\"Container imports verified.\")"
+/opt/nova/venv/bin/python -c "import filelock, faster_whisper, openwakeword, onnxruntime, kokoro_onnx, piper; from huggingface_hub import hf_hub_download; print(\"Container imports verified.\")"
 
 echo "Checking tflite-runtime absence..."
 ! /opt/nova/venv/bin/python -m pip show tflite-runtime >/dev/null 2>&1
