@@ -18,6 +18,7 @@ from pydantic import BaseModel, ConfigDict, Field, ValidationError
 from nova.domain.errors import redact_sensitive_text
 from nova.domain.models import (
     DEFAULT_PI_MODEL,
+    AgentEngineId,
     AuditRiskLevel,
     CommandAuditInput,
     CommandAuditResult,
@@ -40,14 +41,15 @@ _RISK_ORDER: dict[AuditRiskLevel, int] = {"medium": 1, "high": 2, "critical": 3}
 
 
 class PiAuditorConfig(BaseModel):
-    """Configuration boundary for PiAuditorAdapter."""
+    """Configuration boundary for multi-engine Layer 2 command auditor."""
 
     model_config = ConfigDict(frozen=True, extra="ignore")
 
+    engine: AgentEngineId = "pi"
     executable: str = Field(default="pi", min_length=1)
     extra_leading_args: tuple[str, ...] = ()
-    provider: str = Field(default="nvidia", min_length=1)
-    model: str = Field(default=DEFAULT_PI_MODEL, min_length=1)
+    provider: str = Field(default="nvidia", max_length=64)
+    model: str = Field(default=DEFAULT_PI_MODEL, max_length=160)
     timeout_seconds: float = Field(default=8.0, gt=0.0)
     cache_max_entries: int = Field(default=128, ge=1)
     cache_ttl_seconds: float = Field(default=120.0, gt=0.0)
@@ -160,25 +162,53 @@ class PiAuditorAdapter:
             while len(self._cache) > self._config.cache_max_entries:
                 self._cache.popitem(last=False)
 
-    async def audit(self, request: CommandAuditInput) -> CommandAuditResult:
-        """Analyze dubious shell command in isolated tool-less mode with fail-closed fallback."""
-        redacted_cmd = redact_sensitive_text(request.command)
-        cache_key = self._make_cache_key(request.workspace_path, request.rule_id, redacted_cmd)
-        cached = self._get_cached(cache_key)
-        if cached is not None:
-            if _RISK_ORDER[request.risk_hint] > _RISK_ORDER[cached.risk_level]:
-                return cached.model_copy(update={"risk_level": request.risk_hint})
-            return cached
+    def _build_audit_command(self, payload: str) -> list[str]:
+        if self._config.engine == "claude":
+            cmd = [
+                self._config.executable,
+                *self._config.extra_leading_args,
+                "-p",
+                f"{_AUDITOR_SYSTEM_PROMPT}\n\n{payload}",
+                "--output-format",
+                "text",
+                "--tools",
+                "",
+            ]
+            if self._config.model.strip():
+                cmd.extend(["--model", self._config.model.strip()])
+            return cmd
 
-        payload = json.dumps(
-            {
-                "command": redacted_cmd,
-                "rule_id": request.rule_id,
-                "risk_hint": request.risk_hint,
-            },
-            ensure_ascii=False,
-        )
-        cmd = [
+        if self._config.engine == "opencode":
+            cmd = [
+                self._config.executable,
+                *self._config.extra_leading_args,
+                "run",
+                "--format",
+                "default",
+            ]
+            if self._config.model.strip():
+                model_arg = (
+                    f"{self._config.provider.strip()}/{self._config.model.strip()}"
+                    if self._config.provider.strip() and "/" not in self._config.model
+                    else self._config.model.strip()
+                )
+                cmd.extend(["--model", model_arg])
+            cmd.append(f"{_AUDITOR_SYSTEM_PROMPT}\n\n{payload}")
+            return cmd
+
+        if self._config.engine == "agy":
+            cmd = [
+                self._config.executable,
+                *self._config.extra_leading_args,
+                "-p",
+                f"{_AUDITOR_SYSTEM_PROMPT}\n\n{payload}",
+                "--disable-slash-commands",
+            ]
+            if self._config.model.strip():
+                cmd.extend(["--model", self._config.model.strip()])
+            return cmd
+
+        return [
             self._config.executable,
             *self._config.extra_leading_args,
             "-p",
@@ -200,6 +230,26 @@ class PiAuditorAdapter:
             "--",
             payload,
         ]
+
+    async def audit(self, request: CommandAuditInput) -> CommandAuditResult:
+        """Analyze dubious shell command in isolated tool-less mode with fail-closed fallback."""
+        redacted_cmd = redact_sensitive_text(request.command)
+        cache_key = self._make_cache_key(request.workspace_path, request.rule_id, redacted_cmd)
+        cached = self._get_cached(cache_key)
+        if cached is not None:
+            if _RISK_ORDER[request.risk_hint] > _RISK_ORDER[cached.risk_level]:
+                return cached.model_copy(update={"risk_level": request.risk_hint})
+            return cached
+
+        payload = json.dumps(
+            {
+                "command": redacted_cmd,
+                "rule_id": request.rule_id,
+                "risk_hint": request.risk_hint,
+            },
+            ensure_ascii=False,
+        )
+        cmd = self._build_audit_command(payload)
 
         raw_stdout = await self._run_isolated_cli(cmd, cwd=request.workspace_path)
         if raw_stdout is None:

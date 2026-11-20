@@ -30,6 +30,8 @@ from nova.domain.events import (
     VoiceMilestoneEvent,
 )
 from nova.domain.models import (
+    AgentEngineId,
+    AgentSessionPointer,
     CodingTaskRequest,
     ResolveWorkspaceRequest,
     WorkspaceContext,
@@ -101,6 +103,8 @@ class OrchestratorSettings(BaseModel):
 
     model_config = ConfigDict(frozen=True, extra="ignore")
 
+    tier1_engine: AgentEngineId = "pi"
+    tier2_engine: AgentEngineId = "agy"
     default_tier2_model: str = Field(default="claude-opus-5-5-high", min_length=1)
 
 
@@ -166,6 +170,30 @@ class NovaOrchestrator:
                 update={"default_tier2_model": tier2_model.strip()}
             )
 
+    def update_engines(
+        self,
+        *,
+        tier1_client: Tier1ConversationPort | None = None,
+        tier2_runner: CodingRunnerPort | None = None,
+        tier1_engine: AgentEngineId | None = None,
+        tier2_engine: AgentEngineId | None = None,
+        tier2_model: str | None = None,
+    ) -> None:
+        """Hot-swap Tier 1 / Tier 2 adapters and engine metadata (NOVA-017)."""
+        if tier1_client is not None:
+            self._tier1_client = tier1_client
+        if tier2_runner is not None:
+            self._tier2_runner = tier2_runner
+        updates: dict[str, object] = {}
+        if tier1_engine is not None:
+            updates["tier1_engine"] = tier1_engine
+        if tier2_engine is not None:
+            updates["tier2_engine"] = tier2_engine
+        if tier2_model is not None and tier2_model.strip():
+            updates["default_tier2_model"] = tier2_model.strip()
+        if updates:
+            self._settings = self._settings.model_copy(update=updates)
+
     def _extra_secrets(self) -> tuple[str, ...]:
         if self._security_gatekeeper is None:
             return ()
@@ -212,24 +240,49 @@ class NovaOrchestrator:
                 )
             )
 
-            # Query session pointer from history store for continuity (NOVA-015)
-            pi_session_id: str | None = None
+            # Query session pointers from history store for continuity (NOVA-015 / NOVA-017)
+            tier1_session_id: str | None = None
             if self._history_store is not None:
-                pointer = await self._history_store.get_session_pointer(context.canonical_path)
-                if pointer is not None:
-                    if pointer.agy_conversation_id:
-                        self._tier2_conversations[context.canonical_path] = (
+                get_agent_fn = getattr(self._history_store, "get_agent_session", None)
+                if callable(get_agent_fn):
+                    t1_ptr = await get_agent_fn(
+                        context.canonical_path, "tier1", self._settings.tier1_engine
+                    )
+                    if t1_ptr is not None and getattr(t1_ptr, "session_id", None):
+                        tier1_session_id = str(t1_ptr.session_id)
+                    t2_ptr = await get_agent_fn(
+                        context.canonical_path, "tier2", self._settings.tier2_engine
+                    )
+                    if t2_ptr is not None and getattr(t2_ptr, "session_id", None):
+                        self._tier2_conversations[context.canonical_path] = str(t2_ptr.session_id)
+
+                if (
+                    tier1_session_id is None
+                    or context.canonical_path not in self._tier2_conversations
+                ):
+                    pointer = await self._history_store.get_session_pointer(context.canonical_path)
+                    if pointer is not None:
+                        if (
                             pointer.agy_conversation_id
-                        )
-                    if pointer.pi_session_id:
-                        pi_session_id = pointer.pi_session_id
+                            and context.canonical_path not in self._tier2_conversations
+                            and self._settings.tier2_engine == "agy"
+                        ):
+                            self._tier2_conversations[context.canonical_path] = (
+                                pointer.agy_conversation_id
+                            )
+                        if (
+                            pointer.pi_session_id
+                            and tier1_session_id is None
+                            and self._settings.tier1_engine == "pi"
+                        ):
+                            tier1_session_id = pointer.pi_session_id
 
             project_paths = tuple(p.canonical_path for p in context.projects)
             await self._switch_tier1_context(
                 context.canonical_path,
                 workspace_active=True,
                 allowed_project_paths=project_paths,
-                session_id=pi_session_id,
+                session_id=tier1_session_id,
             )
             self._log(
                 "workspace_selected",
@@ -468,16 +521,37 @@ class NovaOrchestrator:
         joined = "".join(collected)
         active_ws = self._workspace_resolver.active_context
         if self._history_store is not None and active_ws is not None:
+            sess_id: str | None = None
             get_sess_fn = getattr(self._tier1_client, "get_session_id", None)
             if callable(get_sess_fn):
                 res = get_sess_fn()
-                sess_id = await res if inspect.isawaitable(res) else res
-                if sess_id:
+                raw_sid = await res if inspect.isawaitable(res) else res
+                if isinstance(raw_sid, str) and raw_sid.strip():
+                    sess_id = raw_sid.strip()
+            else:
+                attr_sid = getattr(self._tier1_client, "active_session_id", None)
+                if isinstance(attr_sid, str) and attr_sid.strip():
+                    sess_id = attr_sid.strip()
+
+            if sess_id:
+                now_ts = time.time()
+                save_agent_fn = getattr(self._history_store, "save_agent_session", None)
+                if callable(save_agent_fn):
+                    await save_agent_fn(
+                        AgentSessionPointer(
+                            workspace_canonical_path=active_ws.canonical_path,
+                            tier="tier1",
+                            agent_provider=self._settings.tier1_engine,
+                            session_id=sess_id,
+                            updated_at=now_ts,
+                        )
+                    )
+                if self._settings.tier1_engine == "pi":
                     await self._history_store.save_session_pointer(
                         WorkspaceSessionPointer(
                             workspace_canonical_path=active_ws.canonical_path,
                             pi_session_id=sess_id,
-                            updated_at=time.time(),
+                            updated_at=now_ts,
                         )
                     )
 
@@ -527,13 +601,26 @@ class NovaOrchestrator:
                 if progress.conversation_id and progress.conversation_id != "unknown":
                     self._tier2_conversations[workspace_path] = progress.conversation_id
                     if self._history_store is not None:
-                        await self._history_store.save_session_pointer(
-                            WorkspaceSessionPointer(
-                                workspace_canonical_path=workspace_path,
-                                agy_conversation_id=progress.conversation_id,
-                                updated_at=time.time(),
+                        now_ts = time.time()
+                        save_agent_fn = getattr(self._history_store, "save_agent_session", None)
+                        if callable(save_agent_fn):
+                            await save_agent_fn(
+                                AgentSessionPointer(
+                                    workspace_canonical_path=workspace_path,
+                                    tier="tier2",
+                                    agent_provider=self._settings.tier2_engine,
+                                    session_id=progress.conversation_id,
+                                    updated_at=now_ts,
+                                )
                             )
-                        )
+                        if self._settings.tier2_engine == "agy":
+                            await self._history_store.save_session_pointer(
+                                WorkspaceSessionPointer(
+                                    workspace_canonical_path=workspace_path,
+                                    agy_conversation_id=progress.conversation_id,
+                                    updated_at=now_ts,
+                                )
+                            )
 
                 if progress.kind == "delta" and progress.text_delta:
                     redacted_delta = self._redact(progress.text_delta)
