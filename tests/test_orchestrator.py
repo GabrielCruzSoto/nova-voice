@@ -9,7 +9,12 @@ from pathlib import Path
 import pytest
 
 from nova.adapters.workspace_resolver import LocalWorkspaceResolver
-from nova.application.orchestrator import NovaOrchestrator, OrchestratorSettings
+from nova.application.orchestrator import (
+    NovaOrchestrator,
+    OrchestratorSettings,
+    VoiceSentenceStreamSplitter,
+    sanitize_spoken_chunk,
+)
 from nova.domain.errors import CodingRunnerError
 from nova.domain.events import (
     ChatStreamEvent,
@@ -17,6 +22,7 @@ from nova.domain.events import (
     OrchestratorEventBus,
     RunnerFailureEvent,
     VoiceMilestoneEvent,
+    VoiceSpeechChunkEvent,
     WorkspaceChangedEvent,
 )
 from nova.domain.models import CodingTaskRequest, RunnerProgressEvent
@@ -677,5 +683,221 @@ async def test_orchestrator_session_continuity_with_sqlite_history_store(tmp_pat
     assert tier2_restart.requests[0].conversation_id == "conv-preserved-777"
 
     await store.close()
+
+
+def test_nova018_sanitize_spoken_chunk_and_sentence_splitter_streams_cleanly() -> None:
+    raw = (
+        "### Resumen\n"
+        "Este es el **proyecto Nova**, un asistente local de voz para Linux. "
+        "<search>\nfind /home/dev -name '*.py'\n</search>\n"
+        "```python\nprint('secret')\n```\n"
+        "Además utiliza /home/dev/Proyectos/nova/src/main.py con token nvapi-secret99999999. "
+        "¿Quieres profundizar en algún módulo?"
+    )
+    cleaned = sanitize_spoken_chunk(raw, extra_secrets=("nvapi-secret99999999",))
+    assert "###" not in cleaned
+    assert "**" not in cleaned
+    assert "<search>" not in cleaned
+    assert "find" not in cleaned
+    assert "print" not in cleaned
+    assert "/home/dev" not in cleaned
+    assert "nvapi-secret99999999" not in cleaned
+    assert "proyecto Nova" in cleaned
+    assert "profundizar" in cleaned
+
+    splitter = VoiceSentenceStreamSplitter(extra_secrets=("myTopSecret42",))
+    emitted_mid: list[str] = []
+    for delta in [
+        "Primera oración completa del proyecto Nova. ",
+        "Segunda oración hablando sobre la arquitectura hexagonal. ",
+        "Tercera oración con secreto myTopSecret42 para cerrar.",
+    ]:
+        emitted_mid.extend(splitter.feed(delta))
+    emitted_final = splitter.flush()
+
+    assert len(emitted_mid) >= 1, "Must emit first sentence before stream ends (NFR-1)"
+    all_chunks = emitted_mid + emitted_final
+    joined = " ".join(all_chunks)
+    assert "Primera oración completa" in joined
+    assert "Segunda oración" in joined
+    assert "Tercera oración" in joined
+    assert "myTopSecret42" not in joined
+    assert all(len(c) <= 600 for c in all_chunks)
+
+
+async def test_nova018_ac2_ac3_ac6_voice_confirmation_then_full_spoken_stream(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "Proyectos"
+    repo = root / "nova-demo"
+    repo.mkdir(parents=True)
+
+    bus = OrchestratorEventBus()
+    events: list[OrchestratorEvent] = []
+
+    async def collect(ev: OrchestratorEvent) -> None:
+        events.append(ev)
+
+    bus.subscribe(collect)
+    resolver = LocalWorkspaceResolver(allowed_roots=[root], event_bus=bus)
+    long_chunks = [
+        "Este es el proyecto Nova, un asistente local de ingenieria por voz diseñado para Linux. ",
+        "Combina reconocimiento local en GPU con un orquestador en dos niveles de agentes. ",
+        "El primer nivel conversa de manera fluida y el segundo ejecuta cambios profundos. ",
+        "Ademas integra un filtro de seguridad de dos capas antes de correr comandos peligrosos.",
+    ]
+    tier1 = _FakeTier1Client(chunks=long_chunks)
+    tier2 = _FakeTier2Runner()
+    now = [100.0]
+
+    orchestrator = NovaOrchestrator(
+        workspace_resolver=resolver,
+        tier1_client=tier1,
+        tier2_runner=tier2,
+        event_bus=bus,
+        clock=lambda: now[0],
+    )
+    await orchestrator.select_workspace(str(repo), mode="exact_path", correlation_id="c-ws")
+    events.clear()
+
+    # Phase 1: voice utterance must NOT invoke Tier 1 or Tier 2; must ask confirmation
+    await orchestrator.handle_user_utterance(
+        "Explícame de qué trata este proyecto",
+        correlation_id="c-voice-1",
+        origin="voice",
+    )
+    assert len(tier1.prompts) == 0
+    assert len(tier2.requests) == 0
+    assert orchestrator.pending_voice_task is not None
+    assert orchestrator.pending_voice_task.revision == 1
+    phase1_speech = [e for e in events if isinstance(e, VoiceSpeechChunkEvent)]
+    assert len(phase1_speech) >= 1
+    assert phase1_speech[-1].is_final is True
+    assert "nova-demo" in " ".join(e.text for e in phase1_speech)
+
+    events.clear()
+    # Phase 2: explicit voice confirmation executes and streams full spoken chunks (> 25 words)
+    await orchestrator.handle_user_utterance(
+        "Sí, eso es lo que entiendo",
+        correlation_id="c-voice-2",
+        origin="voice",
+    )
+    assert orchestrator.pending_voice_task is None
+    assert len(tier1.prompts) == 1
+    assert tier1.prompts[0] == "Explícame de qué trata este proyecto"
+    phase2_speech = [e for e in events if isinstance(e, VoiceSpeechChunkEvent)]
+    assert len(phase2_speech) >= 2
+    assert [c.chunk_index for c in phase2_speech] == list(range(len(phase2_speech)))
+    assert all(not c.is_final for c in phase2_speech[:-1])
+    assert phase2_speech[-1].is_final is True
+    full_spoken = " ".join(c.text for c in phase2_speech)
+    assert len(full_spoken.split()) > 35
+    assert "comandos peligrosos" in full_spoken
+
+    # Idempotency (NFR-2): a duplicate "sí" does NOT re-execute
+    events.clear()
+    await orchestrator.handle_user_utterance("Sí", correlation_id="c-voice-dup", origin="voice")
+    assert len(tier1.prompts) == 1
+    dup_speech = [e for e in events if isinstance(e, VoiceSpeechChunkEvent)]
+    assert len(dup_speech) >= 1
+    assert "pendiente" in " ".join(c.text.lower() for c in dup_speech)
+
+
+async def test_nova018_ac4_ac5_cancel_correct_ttl_expiry_and_chat_direct(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "Proyectos"
+    repo = root / "app-uno"
+    repo.mkdir(parents=True)
+
+    bus = OrchestratorEventBus()
+    events: list[OrchestratorEvent] = []
+
+    async def collect(ev: OrchestratorEvent) -> None:
+        events.append(ev)
+
+    bus.subscribe(collect)
+    resolver = LocalWorkspaceResolver(allowed_roots=[root], event_bus=bus)
+    tier1 = _FakeTier1Client(chunks=["Respuesta completa tras corrección."])
+    tier2 = _FakeTier2Runner()
+    now = [200.0]
+
+    orchestrator = NovaOrchestrator(
+        workspace_resolver=resolver,
+        tier1_client=tier1,
+        tier2_runner=tier2,
+        event_bus=bus,
+        settings=OrchestratorSettings(voice_confirmation_ttl_seconds=60.0),
+        clock=lambda: now[0],
+    )
+    await orchestrator.select_workspace(str(repo), mode="exact_path")
+    events.clear()
+
+    # 1. Request -> Cancel
+    await orchestrator.handle_user_utterance(
+        "Revisa el módulo de pagos", correlation_id="c-1", origin="voice"
+    )
+    assert orchestrator.pending_voice_task is not None
+    await orchestrator.handle_user_utterance("cancelar", correlation_id="c-2", origin="voice")
+    assert orchestrator.pending_voice_task is None
+    assert len(tier1.prompts) == 0
+
+    # 2. Request -> Correction -> Confirm
+    await orchestrator.handle_user_utterance(
+        "Revisa el módulo de audio", correlation_id="c-3", origin="voice"
+    )
+    await orchestrator.handle_user_utterance(
+        "no, mejor revisa el archivo orchestrator", correlation_id="c-4", origin="voice"
+    )
+    pending = orchestrator.pending_voice_task
+    assert pending is not None
+    assert pending.revision == 2
+    assert "orchestrator" in pending.utterance
+    assert len(tier1.prompts) == 0
+
+    await orchestrator.handle_user_utterance("adelante", correlation_id="c-5", origin="voice")
+    assert len(tier1.prompts) == 1
+    assert "orchestrator" in tier1.prompts[0]
+
+    # 3. Request -> TTL expires -> "sí" must NOT execute
+    await orchestrator.handle_user_utterance(
+        "Borra archivos temporales", correlation_id="c-6", origin="voice"
+    )
+    now[0] += 61.0
+    assert orchestrator.pending_voice_task is None
+    await orchestrator.handle_user_utterance("sí", correlation_id="c-7", origin="voice")
+    assert len(tier1.prompts) == 1
+
+    # 4. Typed chat (origin="chat") executes directly without confirmation gate (AC-8)
+    await orchestrator.handle_user_utterance(
+        "Consulta directa por chat", correlation_id="c-chat", origin="chat"
+    )
+    assert len(tier1.prompts) == 2
+    assert tier1.prompts[1] == "Consulta directa por chat"
+
+    # 5. Workspace change invalidates pending voice task (fail-safe)
+    repo2 = root / "app-dos"
+    repo2.mkdir(parents=True)
+    await orchestrator.handle_user_utterance(
+        "Modifica el README", correlation_id="c-ws-old", origin="voice"
+    )
+    assert orchestrator.pending_voice_task is not None
+    await orchestrator.select_workspace(str(repo2), mode="exact_path")
+    assert orchestrator.pending_voice_task is None
+
+    # 6. Complex Tier 2 voice task also requires confirmation and streams spoken chunks
+    events.clear()
+    await orchestrator.handle_user_utterance(
+        "[delegate_tier2] Refactoriza toda la arquitectura multi-archivo",
+        correlation_id="c-t2-1",
+        origin="voice",
+    )
+    assert len(tier2.requests) == 0
+    assert orchestrator.pending_voice_task is not None
+    await orchestrator.handle_user_utterance("confirmar", correlation_id="c-t2-2", origin="voice")
+    assert len(tier2.requests) == 1
+    t2_chunks = [e for e in events if isinstance(e, VoiceSpeechChunkEvent)]
+    assert len(t2_chunks) >= 2
+    assert t2_chunks[-1].is_final is True
 
 
