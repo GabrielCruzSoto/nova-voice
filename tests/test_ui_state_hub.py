@@ -19,9 +19,17 @@ from nova.domain.events import (
     VoiceMilestoneEvent,
     VoiceSpeechChunkEvent,
     VoiceTranscriptionEvent,
+    WhiteboardDeckCreatedEvent,
+    WhiteboardSlideChangedEvent,
     WorkspaceChangedEvent,
 )
-from nova.domain.models import CallSession, WorkspaceContext
+from nova.domain.models import (
+    CallSession,
+    WhiteboardDeck,
+    WhiteboardNode,
+    WhiteboardSlide,
+    WorkspaceContext,
+)
 
 
 async def test_ui_state_hub_assembles_streams_in_o1_and_caps_200_messages() -> None:
@@ -344,4 +352,111 @@ async def test_nova018_ui_state_hub_broadcasts_voice_speech_chunk_and_closes_on_
     finally:
         hub.unsubscribe_sse(sub)
         hub.close()
+
+
+def _sample_deck(deck_id: str, topic: str, *, secret: str = "") -> WhiteboardDeck:
+    slides = tuple(
+        WhiteboardSlide(
+            slide_index=idx,
+            title=f"Lámina {idx} {secret}".strip(),
+            visual_kind="flowchart" if idx == 0 else "mindmap",
+            nodes=(WhiteboardNode(id="n1", label=f"Nodo {idx}"),),
+            narration=f"Explicación de lámina {idx} {secret}".strip(),
+        )
+        for idx in range(2)
+    )
+    return WhiteboardDeck(
+        deck_id=deck_id,
+        correlation_id=f"corr-{deck_id}",
+        topic=topic,
+        slides=slides,
+    )
+
+
+async def test_nova019_ac8_ac9_ac10_whiteboard_ram_cache_lru_ttl_sse_and_redaction() -> None:
+    canary = "-".join(("WB", "CSRF", "7742"))
+    now = [1000.0]
+    bus = OrchestratorEventBus()
+    hub = UiStateHub(
+        event_bus=bus,
+        settings=UiHubSettings(
+            max_whiteboard_decks=10,
+            whiteboard_deck_ttl_seconds=1800.0,
+            whiteboard_ttl_jitter_ratio=0.0,
+        ),
+        extra_secrets_provider=lambda: (canary,),
+        clock=lambda: now[0],
+    )
+    hub.start()
+    sub = hub.subscribe_sse()
+    try:
+        # N/N-1 empty snapshot defaults
+        empty_snap = await hub.build_snapshot(csrf_token="csrf-1")
+        assert empty_snap.active_whiteboard is None
+        assert empty_snap.whiteboard_history == []
+
+        # Insert 12 decks -> LRU eviction caps at 10 under canonical cache keys
+        for i in range(12):
+            deck = _sample_deck(f"deck-{i:02d}", f"Tema {i}", secret=canary if i == 11 else "")
+            await bus.publish(
+                WhiteboardDeckCreatedEvent(
+                    correlation_id=f"corr-{i}",
+                    deck=deck,
+                    auto_open=True,
+                )
+            )
+            env_item = await sub.queue.get()
+            assert env_item.envelope is not None
+            assert env_item.envelope.event_type == "whiteboard_deck_created"
+
+        active, history = hub.get_whiteboard_state()
+        assert active is not None
+        assert active.deck_id == "deck-11"
+        assert len(history) == 10
+        assert all(h.deck_id not in ("deck-00", "deck-01") for h in history)
+        assert hub.whiteboard_cache_keys[0].startswith("nova:ui:whiteboard:deck:")
+        # Canary secret redacted everywhere
+        assert canary not in active.model_dump_json()
+        assert "<REDACTED:" in active.model_dump_json()
+
+        # Slide sync event updates active_slide_index and fans out SSE
+        await bus.publish(
+            WhiteboardSlideChangedEvent(
+                correlation_id="corr-sync",
+                deck_id="deck-11",
+                slide_index=1,
+                reason="narration_sync",
+            )
+        )
+        slide_env = await sub.queue.get()
+        assert slide_env.envelope is not None
+        assert slide_env.envelope.event_type == "whiteboard_slide_changed"
+        assert slide_env.envelope.payload["slide_index"] == 1
+
+        # Manual navigation validates range & is idempotent
+        nav_ok = hub.navigate_whiteboard(0, deck_id="deck-11", correlation_id="corr-nav")
+        assert nav_ok.active_slide_index == 0
+        _ = await sub.queue.get()
+
+        with pytest.raises(DesktopUiError) as oob_exc:
+            hub.navigate_whiteboard(5, deck_id="deck-11", correlation_id="corr-oob")
+        assert oob_exc.value.code == "WHITEBOARD_INVALID_SLIDE_INDEX"
+
+        # Select an earlier surviving deck
+        selected, _ = hub.select_whiteboard_deck("deck-05", correlation_id="corr-sel")
+        assert selected.deck_id == "deck-05"
+        _ = await sub.queue.get()
+
+        # TTL expiration purges decks and returns WHITEBOARD_DECK_NOT_FOUND
+        now[0] += 1801.0
+        expired_active, expired_hist = hub.get_whiteboard_state()
+        assert expired_active is None
+        assert expired_hist == []
+        with pytest.raises(DesktopUiError) as nf_exc:
+            hub.select_whiteboard_deck("deck-05", correlation_id="corr-exp")
+        assert nf_exc.value.code == "WHITEBOARD_DECK_NOT_FOUND"
+    finally:
+        hub.unsubscribe_sse(sub)
+        hub.close()
+
 

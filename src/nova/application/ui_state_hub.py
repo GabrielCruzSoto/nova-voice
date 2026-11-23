@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import random
 import time
 import uuid
 from collections import OrderedDict, deque
@@ -14,6 +15,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from nova.application.whiteboard import redact_whiteboard_deck
 from nova.domain.errors import DesktopUiError, redact_sensitive_text
 from nova.domain.events import (
     CallStateChangedEvent,
@@ -29,15 +31,22 @@ from nova.domain.events import (
     VoiceMilestoneEvent,
     VoiceSpeechChunkEvent,
     VoiceTranscriptionEvent,
+    WhiteboardDeckCreatedEvent,
+    WhiteboardSlideChangedEvent,
     WorkspaceChangedEvent,
     WorkspaceClearedEvent,
 )
 from nova.domain.models import (
+    DEFAULT_WHITEBOARD_TTL_SECONDS,
+    MAX_WHITEBOARD_DECKS,
     AuditRiskLevel,
     CallSession,
     CallSessionState,
     CommandSource,
     PersistedChatMessage,
+    WhiteboardDeck,
+    WhiteboardDeckSummary,
+    WhiteboardSlideChangeReason,
     WorkspaceCatalogEntry,
     WorkspaceContext,
     WorkspaceProject,
@@ -64,6 +73,8 @@ UiEventType = Literal[
     "settings_updated",
     "panel_toggle_requested",
     "health_updated",
+    "whiteboard_deck_created",
+    "whiteboard_slide_changed",
 ]
 UiMessageRole = Literal["user", "assistant", "system", "security"]
 UiMessageModality = Literal[
@@ -187,6 +198,8 @@ class UiStateSnapshot(BaseModel):
     available_workspaces: list[UiWorkspaceOption]
     pending_approvals: list[UiApprovalItem]
     messages: list[UiChatMessage]
+    active_whiteboard: WhiteboardDeck | None = None
+    whiteboard_history: list[WhiteboardDeckSummary] = Field(default_factory=list)
 
 
 class UiEventEnvelope(BaseModel):
@@ -242,6 +255,13 @@ class SseSubscription:
     queue: asyncio.Queue[SseOutboundItem]
 
 
+@dataclass(slots=True)
+class _WhiteboardCacheEntry:
+    cache_key: str
+    deck: WhiteboardDeck
+    expires_at_monotonic: float
+
+
 class UiHubSettings(BaseModel):
     """Memory and concurrency limits for UiStateHub (NFR-3 & contract.md §5)."""
 
@@ -251,6 +271,11 @@ class UiHubSettings(BaseModel):
     max_pending_approvals: int = Field(default=64, ge=1, le=256)
     max_sse_queue: int = Field(default=128, ge=2, le=512)
     max_sse_subscribers: int = Field(default=8, ge=1, le=64)
+    max_whiteboard_decks: int = Field(default=MAX_WHITEBOARD_DECKS, ge=1, le=32)
+    whiteboard_deck_ttl_seconds: float = Field(
+        default=DEFAULT_WHITEBOARD_TTL_SECONDS, ge=60.0, le=7200.0
+    )
+    whiteboard_ttl_jitter_ratio: float = Field(default=0.05, ge=0.0, le=0.25)
 
 
 class UiStateHub:
@@ -275,6 +300,7 @@ class UiStateHub:
         history_store: HistoryStorePort | None = None,
         voice_enabled: bool = False,
         clock: Callable[[], float] = time.monotonic,
+        rng: Callable[[float, float], float] = random.uniform,
     ) -> None:
         self._event_bus = event_bus
         self._settings = settings or UiHubSettings()
@@ -288,6 +314,7 @@ class UiStateHub:
         self._call_session_provider = call_session_provider
         self._voice_enabled = voice_enabled
         self._clock = clock
+        self._rng = rng
 
         default_call = initial_call_session or CallSession(
             call_id=f"call-{uuid.uuid4()}",
@@ -317,6 +344,8 @@ class UiStateHub:
         self._message_index: dict[str, _MutableChatRecord] = {}
         self._active_streams: dict[tuple[str, str, str], str] = {}
         self._pending_approvals: OrderedDict[str, tuple[UiApprovalItem, float]] = OrderedDict()
+        self._whiteboards: OrderedDict[str, _WhiteboardCacheEntry] = OrderedDict()
+        self._active_whiteboard_id: str | None = None
         self._subscribers: dict[str, SseSubscription] = {}
         self._seq = 0
         self._started = False
@@ -325,6 +354,12 @@ class UiStateHub:
     def indexed_message_count(self) -> int:
         """Diagnostic counter verifying O(1) index stays strictly bounded."""
         return len(self._message_index)
+
+    @property
+    def whiteboard_cache_keys(self) -> tuple[str, ...]:
+        """Return canonical active whiteboard RAM cache keys (newest last)."""
+        self._prune_whiteboards()
+        return tuple(self._whiteboards.keys())
 
     @property
     def subscriber_count(self) -> int:
@@ -403,11 +438,13 @@ class UiStateHub:
 
 
     def close(self) -> None:
-        """Unsubscribe from OrchestratorEventBus and clear SSE subscribers."""
+        """Unsubscribe from OrchestratorEventBus and clear SSE subscribers and RAM whiteboards."""
         if self._started:
             self._started = False
             self._event_bus.unsubscribe(self._on_event)
         self._subscribers.clear()
+        self._whiteboards.clear()
+        self._active_whiteboard_id = None
 
     def subscribe_sse(self) -> SseSubscription:
         """Register a new bounded SSE client queue (max 8 concurrent clients)."""
@@ -428,9 +465,161 @@ class UiStateHub:
         """Idempotently remove an SSE client subscription."""
         self._subscribers.pop(subscription.subscription_id, None)
 
+    def _extra_secrets(self) -> tuple[str, ...]:
+        return self._extra_secrets_provider() if self._extra_secrets_provider is not None else ()
+
     def _redact(self, text: str) -> str:
-        secrets = self._extra_secrets_provider() if self._extra_secrets_provider is not None else ()
-        return redact_sensitive_text(text, extra_secrets=secrets)
+        return redact_sensitive_text(text, extra_secrets=self._extra_secrets())
+
+    @staticmethod
+    def _whiteboard_cache_key(deck_id: str) -> str:
+        return f"nova:ui:whiteboard:deck:{deck_id}"
+
+    def _prune_whiteboards(self) -> None:
+        now = self._clock()
+        expired_keys = [
+            key
+            for key, entry in self._whiteboards.items()
+            if entry.expires_at_monotonic <= now
+        ]
+        for key in expired_keys:
+            self._whiteboards.pop(key, None)
+        if self._active_whiteboard_id is not None:
+            active_key = self._whiteboard_cache_key(self._active_whiteboard_id)
+            if active_key not in self._whiteboards:
+                if self._whiteboards:
+                    last_entry = next(reversed(self._whiteboards.values()))
+                    self._active_whiteboard_id = last_entry.deck.deck_id
+                else:
+                    self._active_whiteboard_id = None
+
+    def _whiteboard_summaries(self) -> list[WhiteboardDeckSummary]:
+        return [
+            WhiteboardDeckSummary(
+                deck_id=entry.deck.deck_id,
+                topic=entry.deck.topic,
+                slide_count=len(entry.deck.slides),
+                active_slide_index=entry.deck.active_slide_index,
+                created_at=entry.deck.created_at,
+                source=entry.deck.source,
+            )
+            for entry in reversed(self._whiteboards.values())
+        ]
+
+    def get_whiteboard_state(self) -> tuple[WhiteboardDeck | None, list[WhiteboardDeckSummary]]:
+        """Return the active RAM whiteboard deck and bounded newest-first session history."""
+        self._prune_whiteboards()
+        active: WhiteboardDeck | None = None
+        if self._active_whiteboard_id is not None:
+            entry = self._whiteboards.get(self._whiteboard_cache_key(self._active_whiteboard_id))
+            if entry is not None:
+                active = entry.deck
+        return active, self._whiteboard_summaries()
+
+    def _store_whiteboard_deck(self, deck: WhiteboardDeck) -> WhiteboardDeck:
+        self._prune_whiteboards()
+        redacted_deck = redact_whiteboard_deck(deck, extra_secrets=self._extra_secrets())
+        cache_key = self._whiteboard_cache_key(redacted_deck.deck_id)
+        if cache_key in self._whiteboards:
+            self._whiteboards.pop(cache_key, None)
+        while len(self._whiteboards) >= self._settings.max_whiteboard_decks:
+            self._whiteboards.popitem(last=False)
+        jitter = 1.0 + self._rng(
+            -self._settings.whiteboard_ttl_jitter_ratio,
+            self._settings.whiteboard_ttl_jitter_ratio,
+        )
+        ttl = self._settings.whiteboard_deck_ttl_seconds * jitter
+        self._whiteboards[cache_key] = _WhiteboardCacheEntry(
+            cache_key=cache_key,
+            deck=redacted_deck,
+            expires_at_monotonic=self._clock() + ttl,
+        )
+        self._active_whiteboard_id = redacted_deck.deck_id
+        return redacted_deck
+
+    def navigate_whiteboard(
+        self,
+        slide_index: int,
+        *,
+        deck_id: str | None = None,
+        correlation_id: str,
+        reason: WhiteboardSlideChangeReason = "manual_ui",
+    ) -> WhiteboardDeck:
+        """Validate slide bounds, update active slide in RAM, and fanout SSE sync (OP-4)."""
+        self._prune_whiteboards()
+        target_id = deck_id.strip() if isinstance(deck_id, str) and deck_id.strip() else (
+            self._active_whiteboard_id
+        )
+        if not target_id:
+            raise DesktopUiError(
+                code="WHITEBOARD_DECK_NOT_FOUND",
+                message="No active whiteboard deck found in this session.",
+            )
+        cache_key = self._whiteboard_cache_key(target_id)
+        entry = self._whiteboards.get(cache_key)
+        if entry is None:
+            raise DesktopUiError(
+                code="WHITEBOARD_DECK_NOT_FOUND",
+                message=f"Whiteboard deck '{target_id}' not found or expired.",
+            )
+        if slide_index < 0 or slide_index >= len(entry.deck.slides):
+            raise DesktopUiError(
+                code="WHITEBOARD_INVALID_SLIDE_INDEX",
+                message=(
+                    f"slide_index {slide_index} is out of range for deck '{target_id}' "
+                    f"({len(entry.deck.slides)} slides)."
+                ),
+            )
+        updated_deck = entry.deck.model_copy(update={"active_slide_index": slide_index})
+        entry.deck = updated_deck
+        self._whiteboards.move_to_end(cache_key)
+        self._active_whiteboard_id = target_id
+        self._seq += 1
+        self._emit_envelope(
+            seq=self._seq,
+            event_type="whiteboard_slide_changed",
+            correlation_id=correlation_id,
+            timestamp=utc_now_iso(),
+            payload={
+                "deck_id": target_id,
+                "slide_index": slide_index,
+                "reason": reason,
+            },
+        )
+        return updated_deck
+
+    def select_whiteboard_deck(
+        self,
+        deck_id: str,
+        *,
+        correlation_id: str,
+    ) -> tuple[WhiteboardDeck, list[WhiteboardDeckSummary]]:
+        """Switch active whiteboard deck from bounded session RAM history and fanout SSE (OP-5)."""
+        self._prune_whiteboards()
+        target_id = deck_id.strip()
+        cache_key = self._whiteboard_cache_key(target_id)
+        entry = self._whiteboards.get(cache_key)
+        if entry is None:
+            raise DesktopUiError(
+                code="WHITEBOARD_DECK_NOT_FOUND",
+                message=f"Whiteboard deck '{target_id}' not found or expired.",
+            )
+        self._whiteboards.move_to_end(cache_key)
+        self._active_whiteboard_id = target_id
+        summaries = self._whiteboard_summaries()
+        self._seq += 1
+        self._emit_envelope(
+            seq=self._seq,
+            event_type="whiteboard_deck_created",
+            correlation_id=correlation_id,
+            timestamp=utc_now_iso(),
+            payload={
+                "auto_open": False,
+                "deck": entry.deck.model_dump(),
+                "history": [s.model_dump() for s in summaries],
+            },
+        )
+        return entry.deck, summaries
 
     def _prune_approvals(self) -> None:
         now = self._clock()
@@ -590,6 +779,8 @@ class UiStateHub:
             else []
         )
 
+        active_wb, wb_history = self.get_whiteboard_state()
+
         return UiStateSnapshot(
             csrf_token=csrf_token,
             voice_enabled=self._voice_enabled,
@@ -601,6 +792,8 @@ class UiStateHub:
             available_workspaces=options,
             pending_approvals=[item for item, _ in self._pending_approvals.values()],
             messages=[rec.to_dto() for rec in self._messages],
+            active_whiteboard=active_wb,
+            whiteboard_history=wb_history,
         )
 
     async def _on_event(self, event: OrchestratorEvent) -> None:
@@ -695,18 +888,61 @@ class UiStateHub:
             if event.is_final:
                 self._close_streams_for_correlation(event.correlation_id)
             safe_text = self._redact(event.text)
+            payload: dict[str, Any] = {
+                "text": safe_text,
+                "chunk_index": event.chunk_index,
+                "is_final": event.is_final,
+                "priority": event.priority,
+            }
+            if event.deck_id is not None:
+                payload["deck_id"] = event.deck_id
+            if event.slide_index is not None:
+                payload["slide_index"] = event.slide_index
             self._emit_envelope(
                 seq=seq,
                 event_type="voice_speech_chunk",
                 correlation_id=event.correlation_id,
                 timestamp=event.timestamp,
+                payload=payload,
+            )
+            return
+
+        if isinstance(event, WhiteboardDeckCreatedEvent):
+            stored_deck = self._store_whiteboard_deck(event.deck)
+            self._emit_envelope(
+                seq=seq,
+                event_type="whiteboard_deck_created",
+                correlation_id=event.correlation_id,
+                timestamp=event.timestamp,
                 payload={
-                    "text": safe_text,
-                    "chunk_index": event.chunk_index,
-                    "is_final": event.is_final,
-                    "priority": event.priority,
+                    "auto_open": event.auto_open,
+                    "deck": stored_deck.model_dump(),
+                    "history": [s.model_dump() for s in self._whiteboard_summaries()],
                 },
             )
+            return
+
+        if isinstance(event, WhiteboardSlideChangedEvent):
+            self._prune_whiteboards()
+            cache_key = self._whiteboard_cache_key(event.deck_id)
+            entry = self._whiteboards.get(cache_key)
+            if entry is not None and 0 <= event.slide_index < len(entry.deck.slides):
+                entry.deck = entry.deck.model_copy(
+                    update={"active_slide_index": event.slide_index}
+                )
+                self._whiteboards.move_to_end(cache_key)
+                self._active_whiteboard_id = event.deck_id
+                self._emit_envelope(
+                    seq=seq,
+                    event_type="whiteboard_slide_changed",
+                    correlation_id=event.correlation_id,
+                    timestamp=event.timestamp,
+                    payload={
+                        "deck_id": event.deck_id,
+                        "slide_index": event.slide_index,
+                        "reason": event.reason,
+                    },
+                )
             return
 
         if isinstance(event, VoiceTranscriptionEvent):
