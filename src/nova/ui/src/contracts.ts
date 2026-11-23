@@ -40,7 +40,10 @@ export type UiEventType =
   | "voice_transcription"
   | "settings_updated"
   | "panel_toggle_requested"
-  | "health_updated";
+  | "health_updated"
+  | "task_created"
+  | "task_state_changed"
+  | "task_progress";
 
 export type UiMessageRole = "user" | "assistant" | "system" | "security";
 
@@ -122,6 +125,8 @@ export interface UiStateSnapshot {
   readonly available_workspaces: readonly UiWorkspaceOption[];
   readonly pending_approvals: readonly UiApprovalItem[];
   readonly messages: readonly UiChatMessage[];
+  readonly tasks?: readonly UiAgentTask[] | undefined;
+  readonly agents_overview?: UiAgentsOverview | null | undefined;
 }
 
 export interface UiEventEnvelope {
@@ -334,22 +339,30 @@ export type AgentTaskStatus =
   | "queued"
   | "completed"
   | "gatekeeper_blocked"
-  | "failed";
+  | "failed"
+  | "cancelled";
 
 export type AgentsFilterKey = "all" | "running" | "gatekeeper" | "queued" | "completed";
 
 export interface UiAgentTask {
   readonly id: string;
+  readonly task_id?: string | undefined;
   readonly title: string;
-  readonly description?: string;
+  readonly description?: string | undefined;
   readonly workspace: string;
+  readonly workspace_name?: string | undefined;
   readonly tier: "tier1_pi" | "tier2_agy";
+  readonly provider?: AgentEngineId | undefined;
+  readonly model?: string | undefined;
   readonly agentName: string;
   readonly status: AgentTaskStatus;
-  readonly progress?: number;
-  readonly duration?: string;
-  readonly lastLog?: string;
-  readonly branch?: string;
+  readonly progress?: number | undefined;
+  readonly duration?: string | null | undefined;
+  readonly lastLog?: string | null | undefined;
+  readonly result_summary?: string | null | undefined;
+  readonly error_code?: string | null | undefined;
+  readonly pending_audit_id?: string | null | undefined;
+  readonly branch?: string | undefined;
 }
 
 export interface UiAgentPoolSlot {
