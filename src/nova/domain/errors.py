@@ -86,6 +86,40 @@ class DesktopUiError(NovaDomainError):
     """Raised when the loopback Desktop UI bridge or native picker encounters a domain failure."""
 
 
+class TaskManagerError(NovaDomainError):
+    """Raised when TaskManager rejects a task dispatch, query, transition, or cancellation."""
+
+
+class TaskNotFoundError(TaskManagerError):
+    """Raised when a requested task_id does not exist in RAM or persistent storage."""
+
+    def __init__(self, task_id: str) -> None:
+        super().__init__(
+            code="TASK_NOT_FOUND",
+            message=f"Task '{task_id}' was not found.",
+        )
+
+
+class TaskQueueFullError(TaskManagerError):
+    """Raised when TaskManager reaches max_queued_tasks capacity."""
+
+    def __init__(self, max_queued: int) -> None:
+        super().__init__(
+            code="TASK_QUEUE_FULL",
+            message=f"Task queue capacity ({max_queued}) reached.",
+        )
+
+
+class TaskStateError(TaskManagerError):
+    """Raised on an illegal task state machine transition."""
+
+    def __init__(self, current_status: str, target_status: str) -> None:
+        super().__init__(
+            code="TASK_STATE_CONFLICT",
+            message=f"Invalid task state transition: '{current_status}' -> '{target_status}'.",
+        )
+
+
 _CONFIG_SECRET_KEY_RE = re.compile(
     r"(?i)(?:^|_|-)(?:api[_-]?key|token|secret|password|passwd|credential|private[_-]?key|auth)$"
 )
