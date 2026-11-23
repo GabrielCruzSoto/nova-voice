@@ -11,6 +11,12 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 MAX_SPOKEN_WORDS = 25
 MAX_SPEECH_CHUNK_CHARS = 600
+MAX_WHITEBOARD_SLIDES = 8
+MAX_WHITEBOARD_NODES = 12
+MAX_WHITEBOARD_EDGES = 18
+MAX_WHITEBOARD_CALLOUTS = 4
+MAX_WHITEBOARD_DECKS = 10
+DEFAULT_WHITEBOARD_TTL_SECONDS = 1800.0
 DEFAULT_PI_MODEL = "nvidia/nemotron-3.5-lightning-30b-a3b"
 
 
@@ -719,4 +725,191 @@ class AgentCatalogSnapshot(BaseModel):
     single_engine_mode: bool = False
     engines: tuple[AgentCatalogEntry, ...] = ()
     providers: tuple[ProviderCredentialStatus, ...] = ()
+
+
+WhiteboardVisualKind = Literal["flowchart", "mindmap", "architecture", "sketch_cards"]
+WhiteboardNodeShape = Literal["box", "pill", "decision", "database", "actor", "cloud", "note"]
+WhiteboardIcon = Literal[
+    "spark",
+    "brain",
+    "gear",
+    "database",
+    "cloud",
+    "shield",
+    "user",
+    "code",
+    "network",
+    "rocket",
+    "bulb",
+    "check",
+    "warning",
+    "layers",
+    "flow",
+    "book",
+]
+WhiteboardAccent = Literal["blue", "emerald", "amber", "violet", "rose", "slate"]
+WhiteboardEdgeStyle = Literal["solid", "dashed"]
+WhiteboardDeckSource = Literal["llm_structured", "deterministic_fallback"]
+WhiteboardSlideChangeReason = Literal["narration_sync", "manual_ui", "voice_command", "reset"]
+
+_WHITEBOARD_ID_RE = re.compile(r"^[A-Za-z0-9._-]{1,80}$")
+_WHITEBOARD_NODE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,32}$")
+
+
+class WhiteboardNode(BaseModel):
+    """Single visual concept, actor, or illustrated card on a whiteboard slide (NOVA-019)."""
+
+    model_config = ConfigDict(frozen=True, extra="ignore")
+
+    id: str = Field(min_length=1, max_length=32)
+    label: str = Field(min_length=1, max_length=60)
+    detail: str = Field(default="", max_length=120)
+    shape: WhiteboardNodeShape = "box"
+    icon: WhiteboardIcon = "spark"
+    accent: WhiteboardAccent = "blue"
+    group: str = Field(default="", max_length=40)
+
+    @field_validator("id")
+    @classmethod
+    def _validate_node_id(cls, value: str) -> str:
+        cleaned = value.strip()
+        if not _WHITEBOARD_NODE_ID_RE.fullmatch(cleaned):
+            raise ValueError("WHITEBOARD_INVALID_NODE_ID: node id must match ^[A-Za-z0-9_-]{1,32}$")
+        return cleaned
+
+    @field_validator("label")
+    @classmethod
+    def _validate_label(cls, value: str) -> str:
+        cleaned = " ".join(value.strip().split())
+        if not cleaned:
+            raise ValueError("WHITEBOARD_INVALID_LABEL: node label cannot be empty")
+        return cleaned
+
+
+class WhiteboardEdge(BaseModel):
+    """Directed visual relation between two WhiteboardNodes on the same slide (NOVA-019)."""
+
+    model_config = ConfigDict(frozen=True, extra="ignore")
+
+    source_id: str = Field(min_length=1, max_length=32)
+    target_id: str = Field(min_length=1, max_length=32)
+    label: str = Field(default="", max_length=40)
+    style: WhiteboardEdgeStyle = "solid"
+
+    @field_validator("source_id", "target_id")
+    @classmethod
+    def _validate_endpoint_id(cls, value: str) -> str:
+        cleaned = value.strip()
+        if not _WHITEBOARD_NODE_ID_RE.fullmatch(cleaned):
+            raise ValueError("WHITEBOARD_INVALID_EDGE_ENDPOINT: invalid node id reference")
+        return cleaned
+
+
+class WhiteboardSlide(BaseModel):
+    """Bounded interactive whiteboard scene with diagram/drawing metadata and narration."""
+
+    model_config = ConfigDict(frozen=True, extra="ignore")
+
+    slide_index: int = Field(ge=0, le=MAX_WHITEBOARD_SLIDES - 1)
+    title: str = Field(min_length=1, max_length=100)
+    subtitle: str = Field(default="", max_length=160)
+    visual_kind: WhiteboardVisualKind = "sketch_cards"
+    nodes: tuple[WhiteboardNode, ...] = Field(min_length=1, max_length=MAX_WHITEBOARD_NODES)
+    edges: tuple[WhiteboardEdge, ...] = Field(default=(), max_length=MAX_WHITEBOARD_EDGES)
+    callouts: tuple[str, ...] = Field(default=(), max_length=MAX_WHITEBOARD_CALLOUTS)
+    narration: str = Field(min_length=1, max_length=MAX_SPEECH_CHUNK_CHARS)
+
+    @field_validator("title", "narration")
+    @classmethod
+    def _validate_non_empty_text(cls, value: str) -> str:
+        cleaned = " ".join(value.strip().split())
+        if not cleaned:
+            raise ValueError("WHITEBOARD_INVALID_TEXT: title and narration cannot be empty")
+        return cleaned
+
+    @field_validator("callouts")
+    @classmethod
+    def _validate_callouts(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        cleaned_items: list[str] = []
+        for item in value:
+            norm = " ".join(item.strip().split())
+            if not norm:
+                raise ValueError("WHITEBOARD_INVALID_CALLOUT: callout cannot be empty")
+            if len(norm) > 140:
+                raise ValueError("WHITEBOARD_INVALID_CALLOUT: callout exceeds 140 chars")
+            cleaned_items.append(norm)
+        return tuple(cleaned_items)
+
+    @model_validator(mode="after")
+    def _validate_graph_integrity(self) -> WhiteboardSlide:
+        node_ids = [node.id for node in self.nodes]
+        if len(set(node_ids)) != len(node_ids):
+            raise ValueError("WHITEBOARD_DUPLICATE_NODE_ID: node ids must be unique per slide")
+        id_set = set(node_ids)
+        for edge in self.edges:
+            if edge.source_id not in id_set or edge.target_id not in id_set:
+                raise ValueError(
+                    "WHITEBOARD_DANGLING_EDGE: edge references missing node id "
+                    f"({edge.source_id} -> {edge.target_id})"
+                )
+        return self
+
+
+class WhiteboardDeck(BaseModel):
+    """Immutable bounded visual presentation deck for the Nova Pizarra tab (NOVA-019)."""
+
+    model_config = ConfigDict(frozen=True, extra="ignore")
+
+    deck_id: str = Field(min_length=1, max_length=80)
+    correlation_id: str = Field(min_length=1)
+    topic: str = Field(min_length=1, max_length=120)
+    summary: str = Field(default="", max_length=400)
+    slides: tuple[WhiteboardSlide, ...] = Field(min_length=1, max_length=MAX_WHITEBOARD_SLIDES)
+    active_slide_index: int = Field(default=0, ge=0, le=MAX_WHITEBOARD_SLIDES - 1)
+    created_at: str = Field(default_factory=utc_now_iso)
+    source: WhiteboardDeckSource = "llm_structured"
+
+    @field_validator("deck_id")
+    @classmethod
+    def _validate_deck_id(cls, value: str) -> str:
+        cleaned = value.strip()
+        if not _WHITEBOARD_ID_RE.fullmatch(cleaned):
+            raise ValueError("WHITEBOARD_INVALID_DECK_ID: invalid deck_id format")
+        return cleaned
+
+    @field_validator("topic")
+    @classmethod
+    def _validate_topic(cls, value: str) -> str:
+        cleaned = " ".join(value.strip().split())
+        if not cleaned:
+            raise ValueError("WHITEBOARD_INVALID_TOPIC: topic cannot be empty")
+        return cleaned
+
+    @model_validator(mode="after")
+    def _validate_slides_and_cursor(self) -> WhiteboardDeck:
+        for idx, slide in enumerate(self.slides):
+            if slide.slide_index != idx:
+                raise ValueError(
+                    f"WHITEBOARD_NON_CONSECUTIVE_SLIDES: expected slide_index {idx}, "
+                    f"got {slide.slide_index}"
+                )
+        if self.active_slide_index >= len(self.slides):
+            raise ValueError(
+                f"WHITEBOARD_INVALID_SLIDE_INDEX: active_slide_index {self.active_slide_index} "
+                f"out of range for {len(self.slides)} slides"
+            )
+        return self
+
+
+class WhiteboardDeckSummary(BaseModel):
+    """Compact session history summary for selecting recent whiteboards in RAM (NOVA-019)."""
+
+    model_config = ConfigDict(frozen=True, extra="ignore")
+
+    deck_id: str = Field(min_length=1, max_length=80)
+    topic: str = Field(min_length=1, max_length=120)
+    slide_count: int = Field(ge=1, le=MAX_WHITEBOARD_SLIDES)
+    active_slide_index: int = Field(ge=0, le=MAX_WHITEBOARD_SLIDES - 1)
+    created_at: str = Field(min_length=1)
+    source: WhiteboardDeckSource = "llm_structured"
 

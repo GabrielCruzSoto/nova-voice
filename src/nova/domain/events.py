@@ -13,11 +13,14 @@ from nova.domain.errors import redact_sensitive_text
 from nova.domain.models import (
     MAX_SPEECH_CHUNK_CHARS,
     MAX_SPOKEN_WORDS,
+    MAX_WHITEBOARD_SLIDES,
     AuditRiskLevel,
     CallSessionState,
     CommandSource,
     DecisionVerdict,
     InferenceDevice,
+    WhiteboardDeck,
+    WhiteboardSlideChangeReason,
     WorkspaceProject,
     WorkspaceQueryMode,
     WorkspaceTopology,
@@ -91,6 +94,8 @@ class VoiceSpeechChunkEvent(BaseModel):
     chunk_index: int = Field(default=0, ge=0)
     is_final: bool = True
     priority: Literal["normal", "interrupt"] = "normal"
+    deck_id: str | None = None
+    slide_index: int | None = Field(default=None, ge=0, le=MAX_WHITEBOARD_SLIDES - 1)
     timestamp: str = Field(default_factory=utc_now_iso)
 
     @field_validator("text")
@@ -215,6 +220,29 @@ class UiPanelToggleRequestedEvent(BaseModel):
     timestamp: str = Field(default_factory=utc_now_iso)
 
 
+class WhiteboardDeckCreatedEvent(BaseModel):
+    """Published when Nova builds a bounded visual whiteboard presentation deck (NOVA-019 OP-1)."""
+
+    model_config = ConfigDict(frozen=True, extra="ignore")
+
+    correlation_id: str = Field(min_length=1)
+    deck: WhiteboardDeck
+    auto_open: bool = True
+    timestamp: str = Field(default_factory=utc_now_iso)
+
+
+class WhiteboardSlideChangedEvent(BaseModel):
+    """Published when the active slide on a whiteboard changes (TTS sync or manual UI, OP-2)."""
+
+    model_config = ConfigDict(frozen=True, extra="ignore")
+
+    correlation_id: str = Field(min_length=1)
+    deck_id: str = Field(min_length=1, max_length=80)
+    slide_index: int = Field(ge=0, le=MAX_WHITEBOARD_SLIDES - 1)
+    reason: WhiteboardSlideChangeReason = "narration_sync"
+    timestamp: str = Field(default_factory=utc_now_iso)
+
+
 OrchestratorEvent = (
     WorkspaceChangedEvent
     | WorkspaceClearedEvent
@@ -229,6 +257,8 @@ OrchestratorEvent = (
     | VoiceTranscriptionEvent
     | SettingsUpdatedEvent
     | UiPanelToggleRequestedEvent
+    | WhiteboardDeckCreatedEvent
+    | WhiteboardSlideChangedEvent
 )
 EventSubscriber = Callable[[OrchestratorEvent], Awaitable[None]]
 
