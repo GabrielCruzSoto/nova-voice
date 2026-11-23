@@ -81,7 +81,9 @@ logger = logging.getLogger("nova.desktop_launcher")
 
 BrowserPreference = Literal["auto", "xdg-open", "firefox", "webview", "window"]
 
-_LOOPBACK_BROWSER_URL_RE = re.compile(r"^http://127\.0\.0\.1:[1-9][0-9]{0,4}/?$")
+_LOOPBACK_BROWSER_URL_RE = re.compile(
+    r"^http://127\.0\.0\.1:[1-9][0-9]{0,4}(?:/(?:\?tab=whiteboard(?:&deck=[A-Za-z0-9._-]{1,80})?)?)?$"
+)
 
 
 class BrowserProcessProtocol(Protocol):
@@ -996,6 +998,7 @@ class NovaDesktopRuntime:
                 health_recheck_callback=self.recheck_health_and_reload_voice,
                 models_provisioning_service=models_provisioning,
                 shutdown_callback=self.request_shutdown,
+                browser_opener=self._open_whiteboard_in_browser,
                 settings=DesktopUiServerSettings(host="127.0.0.1", port=self._config.port),
             )
             await ui_server.start()
@@ -1041,6 +1044,29 @@ class NovaDesktopRuntime:
         except BaseException:
             await self.close()
             raise
+
+    async def _open_whiteboard_in_browser(self, url: str) -> bool:
+        """Open the loopback whiteboard URL in a full system browser window (never 420x680)."""
+        opened = await open_local_browser_window(
+            url,
+            preference="xdg-open",
+            which_resolver=self._which_resolver,
+            spawner=self._browser_spawner,
+            reap_tasks=self._reap_tasks,
+            native_shell_available=lambda: False,
+            spawned_processes=self._spawned_processes,
+        )
+        if not opened:
+            opened = await open_local_browser_window(
+                url,
+                preference="firefox",
+                which_resolver=self._which_resolver,
+                spawner=self._browser_spawner,
+                reap_tasks=self._reap_tasks,
+                native_shell_available=lambda: False,
+                spawned_processes=self._spawned_processes,
+            )
+        return opened
 
     async def close(self) -> None:
         """Close spawned UI processes, UI server, SSE hub, voice stack, Pi RPC, and IPC."""

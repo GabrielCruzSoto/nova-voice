@@ -21,6 +21,7 @@ from nova.domain.events import (
     CommandApprovalRequestedEvent,
     OrchestratorEvent,
     OrchestratorEventBus,
+    WhiteboardDeckCreatedEvent,
 )
 from nova.domain.models import (
     CallSession,
@@ -31,6 +32,9 @@ from nova.domain.models import (
     CommandInterceptRequest,
     ResolveWorkspaceRequest,
     RunnerProgressEvent,
+    WhiteboardDeck,
+    WhiteboardNode,
+    WhiteboardSlide,
 )
 
 
@@ -934,4 +938,186 @@ async def test_nova013_onboarding_diagnostics_and_multiproject_workspace_http_ro
             assert st_inv == 422
             assert json.loads(inv_body)["error_code"] == "WORKSPACE_INVALID_MANIFEST"
     hub.close()
+
+
+async def test_nova019_op3_to_op6_whiteboard_http_routes_csrf_and_browser_open(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "Proyectos"
+    root.mkdir()
+    bus = OrchestratorEventBus()
+    resolver = LocalWorkspaceResolver(allowed_roots=[root], event_bus=bus)
+    orchestrator = NovaOrchestrator(
+        workspace_resolver=resolver,
+        tier1_client=_StubTier1(),
+        tier2_runner=_StubTier2(),
+        event_bus=bus,
+    )
+    hub = UiStateHub(event_bus=bus)
+    opened_urls: list[str] = []
+    allow_open = [True]
+
+    async def _fake_open_browser(url: str) -> bool:
+        if not allow_open[0]:
+            return False
+        opened_urls.append(url)
+        return True
+
+    server = DesktopUiServer(
+        orchestrator=orchestrator,
+        state_hub=hub,
+        event_bus=bus,
+        browser_opener=_fake_open_browser,
+        settings=DesktopUiServerSettings(host="127.0.0.1", port=0),
+    )
+
+    async with server:
+        port = server.port
+        _, idx_hdrs, _ = await _raw_http_request(port, "GET", "/")
+        cookie = idx_hdrs["set-cookie"].split(";", 1)[0]
+        _, _, st_body = await _raw_http_request(
+            port, "GET", "/api/state", headers={"Cookie": cookie}
+        )
+        csrf = json.loads(st_body.decode("utf-8"))["csrf_token"]
+        auth_hdrs = {
+            "Cookie": cookie,
+            "Origin": f"http://127.0.0.1:{port}",
+            "X-Nova-CSRF": csrf,
+            "Content-Type": "application/json",
+        }
+
+        # 1. Empty GET /api/whiteboard -> 200 with null active_whiteboard
+        st_empty, _, body_empty = await _raw_http_request(
+            port, "GET", "/api/whiteboard", headers={"Cookie": cookie}
+        )
+        assert st_empty == 200
+        parsed_empty = json.loads(body_empty)
+        assert parsed_empty["active_whiteboard"] is None
+        assert parsed_empty["history"] == []
+
+        # Publish two decks via event bus
+        for d_id, topic in (("deck-a", "OAuth2"), ("deck-b", "CQRS")):
+            deck = WhiteboardDeck(
+                deck_id=d_id,
+                correlation_id=f"corr-{d_id}",
+                topic=topic,
+                slides=(
+                    WhiteboardSlide(
+                        slide_index=0,
+                        title="Inicio",
+                        visual_kind="mindmap",
+                        nodes=(WhiteboardNode(id="n1", label="Centro"),),
+                        narration="Lámina cero.",
+                    ),
+                    WhiteboardSlide(
+                        slide_index=1,
+                        title="Detalle",
+                        visual_kind="flowchart",
+                        nodes=(WhiteboardNode(id="n1", label="Paso"),),
+                        narration="Lámina uno.",
+                    ),
+                ),
+            )
+            await bus.publish(WhiteboardDeckCreatedEvent(correlation_id=f"c-{d_id}", deck=deck))
+
+        # 2. GET /api/whiteboard returns newest active deck + 2 history items
+        st_get, _, body_get = await _raw_http_request(
+            port, "GET", "/api/whiteboard", headers={"Cookie": cookie}
+        )
+        assert st_get == 200
+        data_get = json.loads(body_get)
+        assert data_get["active_whiteboard"]["deck_id"] == "deck-b"
+        assert len(data_get["history"]) == 2
+
+        # 3. Missing CSRF on POST /api/whiteboard/navigate -> 403
+        st_nocsrf, _, body_nocsrf = await _raw_http_request(
+            port,
+            "POST",
+            "/api/whiteboard/navigate",
+            headers={"Cookie": cookie, "Origin": f"http://127.0.0.1:{port}"},
+            body=json.dumps({"slide_index": 1}).encode("utf-8"),
+        )
+        assert st_nocsrf == 403
+        assert json.loads(body_nocsrf)["error_code"] == "UI_FORBIDDEN_ORIGIN_OR_CSRF"
+
+        # 4. POST /api/whiteboard/navigate valid & idempotent -> 200; out-of-range -> 422
+        for _ in range(2):
+            st_nav, _, body_nav = await _raw_http_request(
+                port,
+                "POST",
+                "/api/whiteboard/navigate",
+                headers=auth_hdrs,
+                body=json.dumps({"deck_id": "deck-b", "slide_index": 1}).encode("utf-8"),
+            )
+            assert st_nav == 200
+            assert json.loads(body_nav)["active_whiteboard"]["active_slide_index"] == 1
+
+        st_oob, _, body_oob = await _raw_http_request(
+            port,
+            "POST",
+            "/api/whiteboard/navigate",
+            headers=auth_hdrs,
+            body=json.dumps({"deck_id": "deck-b", "slide_index": 9}).encode("utf-8"),
+        )
+        assert st_oob == 422
+        assert json.loads(body_oob)["error_code"] == "WHITEBOARD_INVALID_SLIDE_INDEX"
+
+        # 5. POST /api/whiteboard/select switches deck; missing -> 404
+        st_sel, _, body_sel = await _raw_http_request(
+            port,
+            "POST",
+            "/api/whiteboard/select",
+            headers=auth_hdrs,
+            body=json.dumps({"deck_id": "deck-a"}).encode("utf-8"),
+        )
+        assert st_sel == 200
+        assert json.loads(body_sel)["active_whiteboard"]["deck_id"] == "deck-a"
+
+        st_nf, _, body_nf = await _raw_http_request(
+            port,
+            "POST",
+            "/api/whiteboard/select",
+            headers=auth_hdrs,
+            body=json.dumps({"deck_id": "deck-missing"}).encode("utf-8"),
+        )
+        assert st_nf == 404
+        assert json.loads(body_nf)["error_code"] == "WHITEBOARD_DECK_NOT_FOUND"
+
+        # 6. POST /api/whiteboard/open-browser opens strictly loopback URL; 503 when unavailable
+        st_open, _, body_open = await _raw_http_request(
+            port,
+            "POST",
+            "/api/whiteboard/open-browser",
+            headers=auth_hdrs,
+            body=json.dumps({"deck_id": "deck-a"}).encode("utf-8"),
+        )
+        assert st_open == 200
+        open_data = json.loads(body_open)
+        assert open_data["opened"] is True
+        assert open_data["url"] == f"http://127.0.0.1:{port}/?tab=whiteboard&deck=deck-a"
+        assert opened_urls == [open_data["url"]]
+
+        # Invalid deck_id rejected -> 400
+        st_bad_id, _, body_bad_id = await _raw_http_request(
+            port,
+            "POST",
+            "/api/whiteboard/open-browser",
+            headers=auth_hdrs,
+            body=json.dumps({"deck_id": "../evil?x=1"}).encode("utf-8"),
+        )
+        assert st_bad_id == 400
+        assert json.loads(body_bad_id)["error_code"] == "UI_INVALID_JSON_OR_PAYLOAD"
+
+        allow_open[0] = False
+        st_unavail, _, body_unavail = await _raw_http_request(
+            port,
+            "POST",
+            "/api/whiteboard/open-browser",
+            headers=auth_hdrs,
+            body=b"{}",
+        )
+        assert st_unavail == 503
+        assert json.loads(body_unavail)["error_code"] == "WHITEBOARD_BROWSER_UNAVAILABLE"
+    hub.close()
+
 

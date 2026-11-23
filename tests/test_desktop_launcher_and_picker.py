@@ -896,6 +896,46 @@ async def test_nova018_ac10_desktop_runtime_wires_half_duplex_confirmation_and_h
     assert reloaded.voice.require_voice_confirmation is False
 
 
+async def test_nova019_open_local_browser_accepts_whiteboard_query_and_rejects_injection() -> None:
+    launched: list[tuple[str, ...]] = []
+
+    class _DoneProc:
+        async def wait(self) -> int:
+            return 0
+
+    async def _spawner(*argv: str) -> _DoneProc:
+        launched.append(argv)
+        return _DoneProc()
+
+    ok = await open_local_browser_window(
+        "http://127.0.0.1:41234/?tab=whiteboard&deck=deck-abc_1",
+        preference="xdg-open",
+        env={"DISPLAY": ":0"},
+        which_resolver=lambda cmd: "/usr/bin/xdg-open" if cmd == "xdg-open" else None,
+        spawner=_spawner,
+    )
+    assert ok is True
+    assert launched == [
+        ("/usr/bin/xdg-open", "http://127.0.0.1:41234/?tab=whiteboard&deck=deck-abc_1")
+    ]
+
+    for bad_url in (
+        "http://127.0.0.1:41234/?tab=whiteboard&evil=1",
+        "http://127.0.0.1:41234/?tab=other",
+        "https://evil.example/?tab=whiteboard",
+    ):
+        with pytest.raises(DesktopUiError) as exc_info:
+            await open_local_browser_window(
+                bad_url,
+                preference="xdg-open",
+                env={"DISPLAY": ":0"},
+                which_resolver=lambda cmd: "/usr/bin/xdg-open",
+                spawner=_spawner,
+            )
+        assert exc_info.value.code == "UI_INVALID_BROWSER_URL"
+
+
+
 
 
 

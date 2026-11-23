@@ -64,6 +64,7 @@ CSP_POLICY = (
 
 _SAFE_CORR_RE = re.compile(r"^[A-Za-z0-9._-]{1,80}$")
 _SAFE_AUDIT_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,80}$")
+_SAFE_DECK_ID_RE = re.compile(r"^[A-Za-z0-9._-]{1,80}$")
 _SAFE_ASSET_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}\.(js|css|svg)$")
 _APPROVAL_PATH_RE = re.compile(r"^/api/approvals/([A-Za-z0-9_-]{1,80})/resolve$")
 
@@ -178,6 +179,7 @@ class DesktopUiServer:
         health_recheck_callback: Callable[[], Awaitable[tuple[Any, bool]]] | None = None,
         models_provisioning_service: VoiceModelsProvisioningService | None = None,
         shutdown_callback: Callable[[str], None] | None = None,
+        browser_opener: Callable[[str], Awaitable[bool]] | None = None,
         static_dir: Path | None = None,
         settings: DesktopUiServerSettings | None = None,
         clock: Callable[[], float] = time.monotonic,
@@ -197,6 +199,7 @@ class DesktopUiServer:
         self._health_recheck_callback = health_recheck_callback
         self._models_provisioning_service = models_provisioning_service
         self._shutdown_callback = shutdown_callback
+        self._browser_opener = browser_opener
         self._static_dir = static_dir or _default_static_dir()
         self._settings = settings or DesktopUiServerSettings()
         self._clock = clock
@@ -711,6 +714,29 @@ class DesktopUiServer:
                 return
             status_view = self._models_provisioning_service.get_status()
             await self._write_json(writer, 200, status_view.model_dump(), corr_id)
+            return
+
+        if method == "GET" and path == "/api/whiteboard":
+            sess = self._validate_session_cookie(headers.get("cookie"))
+            if sess is None:
+                await self._write_error(
+                    writer,
+                    403,
+                    "UI_FORBIDDEN_ORIGIN_OR_CSRF",
+                    "Missing or invalid UI session cookie.",
+                    corr_id,
+                )
+                return
+            active_wb, wb_history = self._hub.get_whiteboard_state()
+            await self._write_json(
+                writer,
+                200,
+                {
+                    "active_whiteboard": active_wb.model_dump() if active_wb is not None else None,
+                    "history": [item.model_dump() for item in wb_history],
+                },
+                corr_id,
+            )
             return
 
         if method == "GET" and path == "/api/events":
@@ -1399,6 +1425,136 @@ class DesktopUiServer:
                 writer,
                 200,
                 {"audit_id": audit_id, "approved": approved, "resolved_by": "user_ui"},
+                corr_id,
+            )
+            return
+
+        if path == "/api/whiteboard/navigate":
+            raw_slide = payload.get("slide_index")
+            raw_deck = payload.get("deck_id")
+            if isinstance(raw_slide, bool) or not isinstance(raw_slide, int):
+                await self._write_error(
+                    writer,
+                    400,
+                    "UI_INVALID_JSON_OR_PAYLOAD",
+                    "Field 'slide_index' must be an integer.",
+                    corr_id,
+                )
+                return
+            if raw_deck is not None and (
+                not isinstance(raw_deck, str) or not _SAFE_DECK_ID_RE.fullmatch(raw_deck.strip())
+            ):
+                await self._write_error(
+                    writer,
+                    400,
+                    "UI_INVALID_JSON_OR_PAYLOAD",
+                    "Field 'deck_id' must match ^[A-Za-z0-9._-]{1,80}$.",
+                    corr_id,
+                )
+                return
+            try:
+                updated = self._hub.navigate_whiteboard(
+                    raw_slide,
+                    deck_id=raw_deck.strip() if isinstance(raw_deck, str) else None,
+                    correlation_id=corr_id,
+                    reason="manual_ui",
+                )
+            except DesktopUiError as exc:
+                status_code = 404 if exc.code == "WHITEBOARD_DECK_NOT_FOUND" else 422
+                await self._write_error(
+                    writer, status_code, exc.code, exc.sanitized_message, corr_id
+                )
+                return
+            await self._write_json(
+                writer, 200, {"active_whiteboard": updated.model_dump()}, corr_id
+            )
+            return
+
+        if path == "/api/whiteboard/select":
+            raw_deck = payload.get("deck_id")
+            if not isinstance(raw_deck, str) or not _SAFE_DECK_ID_RE.fullmatch(raw_deck.strip()):
+                await self._write_error(
+                    writer,
+                    400,
+                    "UI_INVALID_JSON_OR_PAYLOAD",
+                    "Field 'deck_id' must be a valid non-empty deck identifier.",
+                    corr_id,
+                )
+                return
+            try:
+                selected, history = self._hub.select_whiteboard_deck(
+                    raw_deck.strip(),
+                    correlation_id=corr_id,
+                )
+            except DesktopUiError as exc:
+                await self._write_error(writer, 404, exc.code, exc.sanitized_message, corr_id)
+                return
+            await self._write_json(
+                writer,
+                200,
+                {
+                    "active_whiteboard": selected.model_dump(),
+                    "history": [item.model_dump() for item in history],
+                },
+                corr_id,
+            )
+            return
+
+        if path == "/api/whiteboard/open-browser":
+            raw_deck = payload.get("deck_id")
+            safe_deck: str | None = None
+            if raw_deck is not None:
+                if not isinstance(raw_deck, str) or not _SAFE_DECK_ID_RE.fullmatch(
+                    raw_deck.strip()
+                ):
+                    await self._write_error(
+                        writer,
+                        400,
+                        "UI_INVALID_JSON_OR_PAYLOAD",
+                        "Field 'deck_id' must match ^[A-Za-z0-9._-]{1,80}$.",
+                        corr_id,
+                    )
+                    return
+                safe_deck = raw_deck.strip()
+            target_url = (
+                f"{self.base_url}/?tab=whiteboard&deck={safe_deck}"
+                if safe_deck
+                else f"{self.base_url}/?tab=whiteboard"
+            )
+            if self._browser_opener is None:
+                await self._write_error(
+                    writer,
+                    503,
+                    "WHITEBOARD_BROWSER_UNAVAILABLE",
+                    "No local graphical browser launcher is available in this session.",
+                    corr_id,
+                )
+                return
+            try:
+                opened = await self._browser_opener(target_url)
+            except Exception as exc:
+                safe_err = redact_sensitive_text(str(exc), extra_secrets=self.extra_secrets)
+                await self._write_error(
+                    writer,
+                    503,
+                    "WHITEBOARD_BROWSER_UNAVAILABLE",
+                    f"Could not launch local browser: {safe_err}",
+                    corr_id,
+                )
+                return
+            if not opened:
+                await self._write_error(
+                    writer,
+                    503,
+                    "WHITEBOARD_BROWSER_UNAVAILABLE",
+                    "No local graphical browser launcher is available in this session.",
+                    corr_id,
+                )
+                return
+            await self._write_json(
+                writer,
+                200,
+                {"opened": True, "url": target_url},
                 corr_id,
             )
             return
