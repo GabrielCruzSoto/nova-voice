@@ -18,6 +18,13 @@ from typing import Any, Literal
 from pydantic import BaseModel, ConfigDict, Field
 
 from nova.application.voice_intent import classify_confirmation_response
+from nova.application.whiteboard import (
+    build_whiteboard_prompt,
+    extract_explanation_topic,
+    format_whiteboard_chat_summary,
+    is_visual_explanation_request,
+    parse_whiteboard_deck,
+)
 from nova.domain.errors import (
     GatekeeperError,
     NovaDomainError,
@@ -30,6 +37,7 @@ from nova.domain.events import (
     RunnerFailureEvent,
     VoiceMilestoneEvent,
     VoiceSpeechChunkEvent,
+    WhiteboardDeckCreatedEvent,
 )
 from nova.domain.models import (
     MAX_SPEECH_CHUNK_CHARS,
@@ -686,7 +694,11 @@ class NovaOrchestrator:
                     redacted_draft = self._redact(decision.cleaned_text).strip()
                     if not redacted_draft:
                         return
-                    if active_ws is None and classify_complexity(redacted_draft) == "high":
+                    if (
+                        active_ws is None
+                        and not is_visual_explanation_request(redacted_draft)
+                        and classify_complexity(redacted_draft) == "high"
+                    ):
                         self._log(
                             "utterance_blocked_no_workspace",
                             correlation_id=corr_id,
@@ -865,7 +877,8 @@ class NovaOrchestrator:
                 )
 
             if active_ws is None:
-                tier = classify_complexity(effective_utterance)
+                is_visual = is_visual_explanation_request(effective_utterance)
+                tier = "low" if is_visual else classify_complexity(effective_utterance)
                 if tier == "high":
                     self._log(
                         "utterance_blocked_no_workspace",
@@ -900,6 +913,7 @@ class NovaOrchestrator:
                         effective_utterance,
                         corr_id,
                         speak_full_response=speak_full_response,
+                        visual_explanation=is_visual,
                     )
                 )
             else:
@@ -932,19 +946,27 @@ class NovaOrchestrator:
         corr_id: str,
         *,
         speak_full_response: bool = False,
+        visual_explanation: bool = False,
     ) -> None:
         self._log(
             "utterance_routed",
             correlation_id=corr_id,
-            tier="low",
+            tier="whiteboard" if visual_explanation else "low",
             workspace_name="none",
         )
         try:
-            await self._run_tier1(
-                utterance,
-                corr_id,
-                speak_full_response=speak_full_response,
-            )
+            if visual_explanation:
+                await self._run_whiteboard_explanation(
+                    utterance,
+                    corr_id,
+                    speak_full_response=speak_full_response,
+                )
+            else:
+                await self._run_tier1(
+                    utterance,
+                    corr_id,
+                    speak_full_response=speak_full_response,
+                )
         except NovaDomainError as exc:
             redacted_err = self._redact(exc.sanitized_message)
             self._log(
@@ -979,15 +1001,22 @@ class NovaOrchestrator:
         *,
         speak_full_response: bool = False,
     ) -> None:
-        tier = classify_complexity(utterance)
+        is_visual = is_visual_explanation_request(utterance)
+        tier = "low" if is_visual else classify_complexity(utterance)
         self._log(
             "utterance_routed",
             correlation_id=corr_id,
-            tier=tier,
+            tier="whiteboard" if is_visual else tier,
             workspace_name=active_ws.name,
         )
         try:
-            if tier == "low":
+            if is_visual:
+                await self._run_whiteboard_explanation(
+                    utterance,
+                    corr_id,
+                    speak_full_response=speak_full_response,
+                )
+            elif tier == "low":
                 await self._run_tier1(
                     utterance,
                     corr_id,
@@ -1058,6 +1087,136 @@ class NovaOrchestrator:
             resolved_by=resolved_by,
         )
 
+    async def _persist_tier1_session_pointer(self) -> None:
+        active_ws = self._workspace_resolver.active_context
+        if self._history_store is None or active_ws is None:
+            return
+        sess_id: str | None = None
+        get_sess_fn = getattr(self._tier1_client, "get_session_id", None)
+        if callable(get_sess_fn):
+            res = get_sess_fn()
+            raw_sid = await res if inspect.isawaitable(res) else res
+            if isinstance(raw_sid, str) and raw_sid.strip():
+                sess_id = raw_sid.strip()
+        else:
+            attr_sid = getattr(self._tier1_client, "active_session_id", None)
+            if isinstance(attr_sid, str) and attr_sid.strip():
+                sess_id = attr_sid.strip()
+
+        if sess_id:
+            now_ts = time.time()
+            save_agent_fn = getattr(self._history_store, "save_agent_session", None)
+            if callable(save_agent_fn):
+                await save_agent_fn(
+                    AgentSessionPointer(
+                        workspace_canonical_path=active_ws.canonical_path,
+                        tier="tier1",
+                        agent_provider=self._settings.tier1_engine,
+                        session_id=sess_id,
+                        updated_at=now_ts,
+                    )
+                )
+            if self._settings.tier1_engine == "pi":
+                await self._history_store.save_session_pointer(
+                    WorkspaceSessionPointer(
+                        workspace_canonical_path=active_ws.canonical_path,
+                        pi_session_id=sess_id,
+                        updated_at=now_ts,
+                    )
+                )
+
+    async def _run_whiteboard_explanation(
+        self,
+        utterance: str,
+        correlation_id: str,
+        *,
+        speak_full_response: bool = False,
+    ) -> None:
+        topic = extract_explanation_topic(utterance)
+        wrapped_prompt = build_whiteboard_prompt(utterance)
+        await self._event_bus.publish(
+            ChatStreamEvent(
+                correlation_id=correlation_id,
+                delta=f"Preparando la pizarra visual sobre {self._redact(topic)}...",
+                source="tier1_pi",
+                step_type="whiteboard_status",
+            )
+        )
+
+        collected: list[str] = []
+        async with _closing_async_iter(self._tier1_client.stream_prompt(wrapped_prompt)) as stream:
+            async for delta in stream:
+                collected.append(self._redact(delta))
+
+        await self._persist_tier1_session_pointer()
+
+        deck = parse_whiteboard_deck(
+            "".join(collected),
+            topic=topic,
+            correlation_id=correlation_id,
+            extra_secrets=self._extra_secrets(),
+        )
+        await self._event_bus.publish(
+            ChatStreamEvent(
+                correlation_id=correlation_id,
+                delta=format_whiteboard_chat_summary(deck),
+                source="tier1_pi",
+                step_type="whiteboard_summary",
+            )
+        )
+        await self._event_bus.publish(
+            WhiteboardDeckCreatedEvent(
+                correlation_id=correlation_id,
+                deck=deck,
+                auto_open=True,
+            )
+        )
+        self._log(
+            "whiteboard_deck_created",
+            correlation_id=correlation_id,
+            deck_id=deck.deck_id,
+            source=deck.source,
+        )
+
+        if speak_full_response:
+            tagged_chunks: list[tuple[int, str]] = []
+            for slide in deck.slides:
+                slide_parts = VoiceSentenceStreamSplitter.split_text(
+                    slide.narration,
+                    extra_secrets=self._extra_secrets(),
+                )
+                if not slide_parts:
+                    slide_parts = [f"Lámina {slide.slide_index + 1}: {slide.title}."]
+                for part in slide_parts:
+                    tagged_chunks.append((slide.slide_index, part))
+
+            total = len(tagged_chunks)
+            for idx, (slide_idx, chunk_text) in enumerate(tagged_chunks):
+                await self._event_bus.publish(
+                    VoiceSpeechChunkEvent(
+                        correlation_id=correlation_id,
+                        text=chunk_text,
+                        chunk_index=idx,
+                        is_final=(idx == total - 1),
+                        priority="normal",
+                        deck_id=deck.deck_id,
+                        slide_index=slide_idx,
+                    )
+                )
+            return
+
+        await self._event_bus.publish(
+            VoiceMilestoneEvent(
+                correlation_id=correlation_id,
+                summary_text=sanitize_for_voice(
+                    f"Pizarra lista con {len(deck.slides)} laminas sobre {deck.topic}.",
+                    fallback="Pizarra visual lista.",
+                    extra_secrets=self._extra_secrets(),
+                ),
+                priority="normal",
+            )
+        )
+
     async def _run_tier1(
         self,
         utterance: str,
@@ -1098,41 +1257,7 @@ class NovaOrchestrator:
                         chunk_index += 1
 
         joined = "".join(collected)
-        active_ws = self._workspace_resolver.active_context
-        if self._history_store is not None and active_ws is not None:
-            sess_id: str | None = None
-            get_sess_fn = getattr(self._tier1_client, "get_session_id", None)
-            if callable(get_sess_fn):
-                res = get_sess_fn()
-                raw_sid = await res if inspect.isawaitable(res) else res
-                if isinstance(raw_sid, str) and raw_sid.strip():
-                    sess_id = raw_sid.strip()
-            else:
-                attr_sid = getattr(self._tier1_client, "active_session_id", None)
-                if isinstance(attr_sid, str) and attr_sid.strip():
-                    sess_id = attr_sid.strip()
-
-            if sess_id:
-                now_ts = time.time()
-                save_agent_fn = getattr(self._history_store, "save_agent_session", None)
-                if callable(save_agent_fn):
-                    await save_agent_fn(
-                        AgentSessionPointer(
-                            workspace_canonical_path=active_ws.canonical_path,
-                            tier="tier1",
-                            agent_provider=self._settings.tier1_engine,
-                            session_id=sess_id,
-                            updated_at=now_ts,
-                        )
-                    )
-                if self._settings.tier1_engine == "pi":
-                    await self._history_store.save_session_pointer(
-                        WorkspaceSessionPointer(
-                            workspace_canonical_path=active_ws.canonical_path,
-                            pi_session_id=sess_id,
-                            updated_at=now_ts,
-                        )
-                    )
+        await self._persist_tier1_session_pointer()
 
         if splitter is not None:
             tail = splitter.flush()

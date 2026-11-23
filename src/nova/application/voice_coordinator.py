@@ -31,6 +31,8 @@ from nova.domain.events import (
     VoiceMilestoneEvent,
     VoiceSpeechChunkEvent,
     VoiceTranscriptionEvent,
+    WhiteboardDeckCreatedEvent,
+    WhiteboardSlideChangedEvent,
 )
 from nova.domain.models import (
     CallSession,
@@ -272,6 +274,7 @@ class VoiceCallCoordinator:
         self._tts_epoch = 0
         self._current_tts_priority: Literal["normal", "interrupt"] | None = None
         self._current_tts_item_task: asyncio.Task[None] | None = None
+        self._last_announced_whiteboard_slide: tuple[str, int] | None = None
 
         self._segment_queue: asyncio.Queue[tuple[bytes, int, float, int] | None] = asyncio.Queue(
             maxsize=8
@@ -647,6 +650,10 @@ class VoiceCallCoordinator:
             )
             return
 
+        if isinstance(event, WhiteboardDeckCreatedEvent):
+            self._last_announced_whiteboard_slide = None
+            return
+
         if isinstance(event, (VoiceMilestoneEvent, VoiceSpeechChunkEvent)):
             if self._session.state == "closed" or not self._call_open:
                 return
@@ -676,6 +683,7 @@ class VoiceCallCoordinator:
 
     async def _cancel_active_tts_playback(self) -> None:
         self._tts_epoch += 1
+        self._last_announced_whiteboard_slide = None
         item_task = self._current_tts_item_task
         if item_task is not None and not item_task.done():
             item_task.cancel()
@@ -1472,6 +1480,22 @@ class VoiceCallCoordinator:
             reason="tts_milestone_playback",
             correlation_id=milestone.correlation_id,
         )
+        if (
+            isinstance(milestone, VoiceSpeechChunkEvent)
+            and milestone.deck_id is not None
+            and milestone.slide_index is not None
+        ):
+            marker = (milestone.deck_id, milestone.slide_index)
+            if self._last_announced_whiteboard_slide != marker:
+                self._last_announced_whiteboard_slide = marker
+                await self._event_bus.publish(
+                    WhiteboardSlideChangedEvent(
+                        correlation_id=milestone.correlation_id,
+                        deck_id=milestone.deck_id,
+                        slide_index=milestone.slide_index,
+                        reason="narration_sync",
+                    )
+                )
         await self._audio_output.play_pcm(synth)
 
     async def _tts_worker(self) -> None:

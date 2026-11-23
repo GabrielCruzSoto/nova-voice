@@ -49,6 +49,12 @@ def test_ac1_visual_explanation_intent_detection_and_negative_guards() -> None:
     assert is_visual_explanation_request("Explícame y modifica el archivo main.py") is False
     assert is_visual_explanation_request("Ejecuta pytest en el repositorio") is False
     assert is_visual_explanation_request("[delegate_tier2] Explícame la arquitectura") is False
+    # Local repo/file inspection stays fast prose unless whiteboard/diagram is explicitly asked
+    assert is_visual_explanation_request("Explícame de qué trata este proyecto") is False
+    assert is_visual_explanation_request("Explica una linea") is False
+    assert (
+        is_visual_explanation_request("Explícame en la pizarra de qué trata este proyecto") is True
+    )
 
 
 def test_ac2_domain_models_enforce_hard_bounds_and_referential_integrity() -> None:

@@ -102,6 +102,14 @@ _CODE_MUTATION_GUARD_RE = re.compile(
     r")\b",
     re.IGNORECASE,
 )
+_LOCAL_INSPECTION_GUARD_RE = re.compile(
+    r"\b("
+    r"este\s+proyecto|el\s+proyecto|este\s+repositorio|este\s+archivo|"
+    r"esta\s+linea|una\s+linea|este\s+codigo|este\s+error|este\s+diff|"
+    r"el\s+estado\s+actual|this\s+project|this\s+file|this\s+line"
+    r")\b",
+    re.IGNORECASE,
+)
 _TOPIC_LEAD_RE = re.compile(
     r"^(?:por\s+favor\s+)?(?:oye\s+nova[,\s]+)?"
     r"(?:explicame|explícame|explica|ensename|enséñame|"
@@ -142,6 +150,8 @@ def is_visual_explanation_request(utterance: str) -> bool:
         return False
     if _EXPLICIT_BOARD_RE.search(folded) is not None:
         return True
+    if _LOCAL_INSPECTION_GUARD_RE.search(folded) is not None:
+        return False
     return _EXPLAIN_TRIGGER_RE.search(folded) is not None
 
 

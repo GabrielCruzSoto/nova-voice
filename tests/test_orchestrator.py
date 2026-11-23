@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import json
 import time
 from collections.abc import AsyncIterator
 from pathlib import Path
@@ -23,6 +25,7 @@ from nova.domain.events import (
     RunnerFailureEvent,
     VoiceMilestoneEvent,
     VoiceSpeechChunkEvent,
+    WhiteboardDeckCreatedEvent,
     WorkspaceChangedEvent,
 )
 from nova.domain.models import CodingTaskRequest, RunnerProgressEvent
@@ -990,5 +993,153 @@ async def test_nova018_f5_f6_oversized_fallback_and_max_revisions_enforced(
         "segunda corrección excedida", correlation_id="c-r3", origin="voice"
     )
     assert orchestrator.pending_voice_task is None
+
+
+async def test_nova019_ac1_ac2_ac5_whiteboard_chat_and_voice_confirmation_without_workspace(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "Proyectos"
+    root.mkdir(parents=True)
+
+    bus = OrchestratorEventBus()
+    events: list[OrchestratorEvent] = []
+
+    async def collect(ev: OrchestratorEvent) -> None:
+        events.append(ev)
+
+    bus.subscribe(collect)
+    resolver = LocalWorkspaceResolver(allowed_roots=[root], event_bus=bus)
+
+    deck_json = {
+        "topic": "Arquitectura de Microservicios",
+        "summary": "Servicios desacoplados comunicados por eventos.",
+        "slides": [
+            {
+                "title": "Componentes clave",
+                "subtitle": "Gateway y servicios",
+                "visual_kind": "architecture",
+                "nodes": [
+                    {"id": "gw", "label": "API Gateway", "icon": "cloud", "accent": "blue"},
+                    {"id": "svc", "label": "Servicio Pedidos", "icon": "gear", "accent": "emerald"},
+                ],
+                "edges": [{"source_id": "gw", "target_id": "svc", "label": "REST"}],
+                "callouts": ["Cada servicio posee su base de datos."],
+                "narration": "En la primera lámina vemos cómo el gateway enruta al servicio.",
+            },
+            {
+                "title": "Flujo de eventos",
+                "subtitle": "Mensajería asíncrona",
+                "visual_kind": "flowchart",
+                "nodes": [
+                    {"id": "p", "label": "Productor", "icon": "rocket", "accent": "amber"},
+                    {"id": "c", "label": "Consumidor", "icon": "brain", "accent": "violet"},
+                ],
+                "edges": [{"source_id": "p", "target_id": "c", "label": "evento"}],
+                "callouts": ["Desacoplamiento temporal."],
+                "narration": "En la segunda lámina los eventos fluyen de productor a consumidor.",
+            },
+        ],
+    }
+    raw_llm = f"```nova-whiteboard\n{json.dumps(deck_json)}\n```"
+    tier1 = _FakeTier1Client(chunks=[raw_llm])
+    tier2 = _FakeTier2Runner()
+
+    orchestrator = NovaOrchestrator(
+        workspace_resolver=resolver,
+        tier1_client=tier1,
+        tier2_runner=tier2,
+        event_bus=bus,
+        settings=OrchestratorSettings(require_voice_confirmation=True),
+    )
+
+    # 1. Chat visual explanation works WITHOUT active workspace (even mentioning
+    #    "arquitectura" + "microservicios"), emits WhiteboardDeckCreatedEvent,
+    #    never leaks raw JSON into chat, and stays silent (no VoiceSpeechChunkEvent).
+    await orchestrator.handle_user_utterance(
+        "Explícame la arquitectura de microservicios en la pizarra",
+        correlation_id="c-wb-chat",
+        origin="chat",
+    )
+    assert len(tier2.requests) == 0
+    created = [e for e in events if isinstance(e, WhiteboardDeckCreatedEvent)]
+    assert len(created) == 1
+    assert created[0].auto_open is True
+    assert len(created[0].deck.slides) == 2
+    chat_text = "".join(e.delta for e in events if isinstance(e, ChatStreamEvent))
+    assert "```nova-whiteboard" not in chat_text
+    assert "Componentes clave" in chat_text
+    assert [e for e in events if isinstance(e, VoiceSpeechChunkEvent)] == []
+    assert len([e for e in events if isinstance(e, VoiceMilestoneEvent)]) == 1
+
+    # 2. Voice visual explanation obeys NOVA-018 universal confirmation FIRST, then emits
+    #    per-slide tagged VoiceSpeechChunkEvents (deck_id + slide_index) on confirmation.
+    events.clear()
+    await orchestrator.handle_user_utterance(
+        "Explícame la arquitectura de microservicios",
+        correlation_id="c-wb-v1",
+        origin="voice",
+    )
+    assert orchestrator.pending_voice_task is not None
+    assert [e for e in events if isinstance(e, WhiteboardDeckCreatedEvent)] == []
+
+    events.clear()
+    await orchestrator.handle_user_utterance(
+        "Sí, adelante",
+        correlation_id="c-wb-v2",
+        origin="voice",
+    )
+    created_v = [e for e in events if isinstance(e, WhiteboardDeckCreatedEvent)]
+    assert len(created_v) == 1
+    deck_id = created_v[0].deck.deck_id
+    speech_chunks = [e for e in events if isinstance(e, VoiceSpeechChunkEvent)]
+    assert len(speech_chunks) >= 2
+    assert speech_chunks[0].deck_id == deck_id
+    assert speech_chunks[0].slide_index == 0
+    assert speech_chunks[-1].deck_id == deck_id
+    assert speech_chunks[-1].slide_index == 1
+    assert speech_chunks[-1].is_final is True
+
+
+async def test_nova019_ac10_barge_in_during_whiteboard_generation_emits_no_partial_deck(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "Proyectos"
+    root.mkdir(parents=True)
+    bus = OrchestratorEventBus()
+    events: list[OrchestratorEvent] = []
+
+    async def collect(ev: OrchestratorEvent) -> None:
+        events.append(ev)
+
+    bus.subscribe(collect)
+    resolver = LocalWorkspaceResolver(allowed_roots=[root], event_bus=bus)
+    started = asyncio.Event()
+
+    class _SlowTier1(_FakeTier1Client):
+        async def stream_prompt(self, message: str) -> AsyncIterator[str]:
+            self.prompts.append(message)
+            started.set()
+            yield "```nova-whiteboard\n{\"topic\": \"Incompleto\""
+            await asyncio.sleep(5.0)
+
+    orchestrator = NovaOrchestrator(
+        workspace_resolver=resolver,
+        tier1_client=_SlowTier1(),
+        tier2_runner=_FakeTier2Runner(),
+        event_bus=bus,
+    )
+    task = asyncio.create_task(
+        orchestrator.handle_user_utterance(
+            "Explícame cómo funciona Raft en la pizarra",
+            correlation_id="c-wb-abort",
+            origin="chat",
+        )
+    )
+    await asyncio.wait_for(started.wait(), timeout=1.0)
+    await orchestrator.barge_in()
+    await asyncio.wait_for(task, timeout=1.0)
+
+    assert [e for e in events if isinstance(e, WhiteboardDeckCreatedEvent)] == []
+
 
 

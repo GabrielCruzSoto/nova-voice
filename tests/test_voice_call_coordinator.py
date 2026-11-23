@@ -23,6 +23,7 @@ from nova.domain.events import (
     VoiceMilestoneEvent,
     VoiceSpeechChunkEvent,
     VoiceTranscriptionEvent,
+    WhiteboardSlideChangedEvent,
 )
 from nova.domain.models import (
     AudioFrame,
@@ -2384,6 +2385,110 @@ async def test_nova018_f2_approval_resolution_transitions_to_executing_and_close
     await asyncio.sleep(0.08)
     assert _state_of(coordinator) == "standby"
     await coordinator.shutdown()
+
+
+async def test_nova019_ac4_tts_advances_whiteboard_slides_and_stops_on_barge_in() -> None:
+    bus = OrchestratorEventBus()
+    slide_events: list[WhiteboardSlideChangedEvent] = []
+
+    async def _record_slide(ev: OrchestratorEvent) -> None:
+        if isinstance(ev, WhiteboardSlideChangedEvent):
+            slide_events.append(ev)
+
+    bus.subscribe(_record_slide)
+
+    class _StepAudioOutput(_ControlledAudioOutput):
+        def __init__(self) -> None:
+            super().__init__(hold_playback=True)
+            self.release_ev = asyncio.Event()
+
+        async def play_pcm(self, audio: SynthesizedAudio) -> None:
+            self._stop_ev.clear()
+            self.release_ev.clear()
+            self._playing = True
+            self.played.append(audio)
+            self.started_ev.set()
+            try:
+                stop_wait = asyncio.create_task(self._stop_ev.wait())
+                rel_wait = asyncio.create_task(self.release_ev.wait())
+                done, pending = await asyncio.wait(
+                    {stop_wait, rel_wait}, return_when=asyncio.FIRST_COMPLETED
+                )
+                for p in pending:
+                    p.cancel()
+            finally:
+                self._playing = False
+
+    audio_in = _ScriptedAudioInput()
+    audio_out = _StepAudioOutput()
+    coordinator = VoiceCallCoordinator(
+        audio_input=audio_in,
+        audio_output=audio_out,
+        wake_word=_FakeWakeWord(),
+        vad=_FakeVad(),
+        stt=_FakeStt(),
+        tts=_FakeTts(),
+        orchestrator=_FakeOrchestrator(event_bus=bus),
+        event_bus=bus,
+        settings=VoiceCoordinatorSettings(
+            min_speech_frames=2,
+            end_silence_frames=2,
+            enable_wake_earcon=False,
+        ),
+    )
+    await coordinator.start()
+    await coordinator.start_call()
+
+    # Queue 3 slides (slide 0 has 2 chunks to verify deduplication per slide)
+    for idx, (s_idx, text, is_final) in enumerate(
+        [
+            (0, "Lámina cero parte uno.", False),
+            (0, "Lámina cero parte dos.", False),
+            (1, "Lámina uno explicación.", False),
+            (2, "Lámina dos conclusión.", True),
+        ]
+    ):
+        await bus.publish(
+            VoiceSpeechChunkEvent(
+                correlation_id="c-wb-sync",
+                text=text,
+                chunk_index=idx,
+                is_final=is_final,
+                deck_id="deck-sync-1",
+                slide_index=s_idx,
+            )
+        )
+
+    # Slide 0 starts speaking -> emits slide 0 once
+    await asyncio.wait_for(audio_out.started_ev.wait(), timeout=1.0)
+    assert [(e.deck_id, e.slide_index, e.reason) for e in slide_events] == [
+        ("deck-sync-1", 0, "narration_sync")
+    ]
+
+    # Finish chunk 0 -> chunk 1 (still slide 0) must NOT emit duplicate slide change
+    audio_out.started_ev.clear()
+    audio_out.release_ev.set()
+    await asyncio.wait_for(audio_out.started_ev.wait(), timeout=1.0)
+    assert len(slide_events) == 1
+
+    # Finish chunk 1 -> slide 1 starts speaking -> emits slide 1
+    audio_out.started_ev.clear()
+    audio_out.release_ev.set()
+    await asyncio.wait_for(audio_out.started_ev.wait(), timeout=1.0)
+    assert [(e.deck_id, e.slide_index, e.reason) for e in slide_events] == [
+        ("deck-sync-1", 0, "narration_sync"),
+        ("deck-sync-1", 1, "narration_sync"),
+    ]
+
+    # Barge-in during slide 1 -> slide 2 MUST NEVER be emitted
+    await coordinator.barge_in()
+    await asyncio.sleep(0.05)
+    assert [(e.deck_id, e.slide_index) for e in slide_events] == [
+        ("deck-sync-1", 0),
+        ("deck-sync-1", 1),
+    ]
+    await coordinator.shutdown()
+
 
 
 
