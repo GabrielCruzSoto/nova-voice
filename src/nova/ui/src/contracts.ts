@@ -40,7 +40,88 @@ export type UiEventType =
   | "voice_transcription"
   | "settings_updated"
   | "panel_toggle_requested"
-  | "health_updated";
+  | "health_updated"
+  | "whiteboard_deck_created"
+  | "whiteboard_slide_changed";
+
+export type WhiteboardVisualKind = "flowchart" | "mindmap" | "architecture" | "sketch_cards";
+export type WhiteboardNodeShape =
+  | "box"
+  | "pill"
+  | "decision"
+  | "database"
+  | "actor"
+  | "cloud"
+  | "note";
+export type WhiteboardIcon =
+  | "spark"
+  | "brain"
+  | "gear"
+  | "database"
+  | "cloud"
+  | "shield"
+  | "user"
+  | "code"
+  | "network"
+  | "rocket"
+  | "bulb"
+  | "check"
+  | "warning"
+  | "layers"
+  | "flow"
+  | "book";
+export type WhiteboardAccent = "blue" | "emerald" | "amber" | "violet" | "rose" | "slate";
+export type WhiteboardEdgeStyle = "solid" | "dashed";
+export type WhiteboardDeckSource = "llm_structured" | "deterministic_fallback";
+export type WhiteboardSlideChangeReason = "narration_sync" | "manual_ui" | "voice_command" | "reset";
+
+export interface WhiteboardNode {
+  readonly id: string;
+  readonly label: string;
+  readonly detail: string;
+  readonly shape: WhiteboardNodeShape;
+  readonly icon: WhiteboardIcon;
+  readonly accent: WhiteboardAccent;
+  readonly group: string;
+}
+
+export interface WhiteboardEdge {
+  readonly source_id: string;
+  readonly target_id: string;
+  readonly label: string;
+  readonly style: WhiteboardEdgeStyle;
+}
+
+export interface WhiteboardSlide {
+  readonly slide_index: number;
+  readonly title: string;
+  readonly subtitle: string;
+  readonly visual_kind: WhiteboardVisualKind;
+  readonly nodes: readonly WhiteboardNode[];
+  readonly edges: readonly WhiteboardEdge[];
+  readonly callouts: readonly string[];
+  readonly narration: string;
+}
+
+export interface WhiteboardDeck {
+  readonly deck_id: string;
+  readonly correlation_id: string;
+  readonly topic: string;
+  readonly summary: string;
+  readonly slides: readonly WhiteboardSlide[];
+  readonly active_slide_index: number;
+  readonly created_at: string;
+  readonly source: WhiteboardDeckSource;
+}
+
+export interface WhiteboardDeckSummary {
+  readonly deck_id: string;
+  readonly topic: string;
+  readonly slide_count: number;
+  readonly active_slide_index: number;
+  readonly created_at: string;
+  readonly source: WhiteboardDeckSource;
+}
 
 export type UiMessageRole = "user" | "assistant" | "system" | "security";
 
@@ -122,6 +203,8 @@ export interface UiStateSnapshot {
   readonly available_workspaces: readonly UiWorkspaceOption[];
   readonly pending_approvals: readonly UiApprovalItem[];
   readonly messages: readonly UiChatMessage[];
+  readonly active_whiteboard?: WhiteboardDeck | null | undefined;
+  readonly whiteboard_history?: readonly WhiteboardDeckSummary[] | undefined;
 }
 
 export interface UiEventEnvelope {
@@ -434,7 +517,9 @@ export interface PresentationalAppModel {
   readonly pickerFallbackOpen: boolean;
   readonly lastMilestone: string | null;
   readonly uiMode: "panel" | "orb";
-  readonly activeTab?: "chat" | "agents" | undefined;
+  readonly activeTab?: "chat" | "agents" | "whiteboard" | undefined;
+  readonly activeWhiteboard?: WhiteboardDeck | null | undefined;
+  readonly whiteboardHistory?: readonly WhiteboardDeckSummary[] | undefined;
   readonly agentsFilter?: AgentsFilterKey | undefined;
   readonly agentsOverview?: UiAgentsOverview | undefined;
   readonly isStandby?: boolean | undefined;

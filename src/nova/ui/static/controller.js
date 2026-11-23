@@ -3,7 +3,7 @@
  * Holds CSRF token strictly in private JS memory, manages SSE + fetch lifecycle via
  * AbortController, and delegates rendering to pure components.ts functions.
  */
-import { escapeHtml, getDefaultAgentsOverview, renderAgentsMatrixView, renderAppShell, renderApprovalBanner, renderChatTimeline, renderDock, renderNoticeSlot, renderOnboardingModal, renderSettingsDrawer, renderWorkspaceBar, resolveHumanNotice, } from "./components.js";
+import { buildExportableWhiteboardHtml, escapeHtml, getDefaultAgentsOverview, renderAgentsMatrixView, renderAppShell, renderApprovalBanner, renderChatTimeline, renderDock, renderNoticeSlot, renderOnboardingModal, renderSettingsDrawer, renderWhiteboardView, renderWorkspaceBar, resolveHumanNotice, } from "./components.js";
 const MAX_CLIENT_MESSAGES = 200;
 const SETTINGS_DRAFT_FIELDS = [
     "audio.capture_target",
@@ -64,6 +64,7 @@ export class DesktopAppController {
     #onRender;
     #onMinimizeToHost;
     #onQuitHost;
+    #pendingInitialDeckId;
     #model = {
         status: "loading",
         voiceEnabled: false,
@@ -83,6 +84,8 @@ export class DesktopAppController {
         lastMilestone: null,
         uiMode: "panel",
         activeTab: "chat",
+        activeWhiteboard: null,
+        whiteboardHistory: [],
         agentsFilter: "all",
         agentsOverview: getDefaultAgentsOverview(),
         onboardingOpen: false,
@@ -104,6 +107,10 @@ export class DesktopAppController {
         this.#onRender = options.onRender;
         this.#onMinimizeToHost = options.onMinimizeToHost;
         this.#onQuitHost = options.onQuitHost;
+        this.#pendingInitialDeckId = options.initialDeckId;
+        if (options.initialTab) {
+            this.#model = { ...this.#model, activeTab: options.initialTab };
+        }
     }
     get model() {
         return this.#model;
@@ -130,6 +137,15 @@ export class DesktopAppController {
             }
             const snapshot = (await resp.json());
             this.#applySnapshot(snapshot);
+            if (this.#pendingInitialDeckId &&
+                this.#model.activeWhiteboard?.deck_id !== this.#pendingInitialDeckId) {
+                const requestedDeck = this.#pendingInitialDeckId;
+                this.#pendingInitialDeckId = undefined;
+                await this.selectWhiteboardDeck(requestedDeck);
+            }
+            else {
+                this.#pendingInitialDeckId = undefined;
+            }
             if (snapshot.onboarding_required) {
                 await this.#preloadSettingsAndDevices();
             }
@@ -294,6 +310,98 @@ export class DesktopAppController {
             return;
         }
         this.#updateModel({ activeTab: tab });
+    }
+    async navigateWhiteboard(slideIndex) {
+        if (this.#disposed) {
+            return;
+        }
+        const deck = this.#model.activeWhiteboard;
+        if (!deck || slideIndex < 0 || slideIndex >= deck.slides.length) {
+            return;
+        }
+        const nextDeck = { ...deck, active_slide_index: slideIndex };
+        const nextHistory = (this.#model.whiteboardHistory ?? []).map((h) => h.deck_id === deck.deck_id ? { ...h, active_slide_index: slideIndex } : h);
+        this.#updateModel({ activeWhiteboard: nextDeck, whiteboardHistory: nextHistory });
+        const resp = await this.#postJson("/api/whiteboard/navigate", {
+            deck_id: deck.deck_id,
+            slide_index: slideIndex,
+        });
+        if (!resp.ok) {
+            const errBody = await this.#safeParseError(resp);
+            const code = errBody?.error_code ?? "ORCHESTRATOR_UNEXPECTED_FAILURE";
+            this.#updateModel({ noticeBanner: resolveHumanNotice(code, errBody?.message) });
+        }
+    }
+    async stepWhiteboard(delta) {
+        const deck = this.#model.activeWhiteboard;
+        if (!deck) {
+            return;
+        }
+        const target = deck.active_slide_index + delta;
+        if (target < 0 || target >= deck.slides.length) {
+            return;
+        }
+        await this.navigateWhiteboard(target);
+    }
+    async selectWhiteboardDeck(deckId) {
+        const trimmed = deckId.trim();
+        if (!trimmed || this.#disposed) {
+            return;
+        }
+        const resp = await this.#postJson("/api/whiteboard/select", { deck_id: trimmed });
+        if (!resp.ok) {
+            const errBody = await this.#safeParseError(resp);
+            const code = errBody?.error_code ?? "WHITEBOARD_DECK_NOT_FOUND";
+            this.#updateModel({ noticeBanner: resolveHumanNotice(code, errBody?.message) });
+            return;
+        }
+        const data = (await resp.json());
+        if (data.active_whiteboard) {
+            this.#updateModel({
+                activeWhiteboard: data.active_whiteboard,
+                whiteboardHistory: data.history ?? this.#model.whiteboardHistory ?? [],
+            });
+        }
+    }
+    async openWhiteboardInBrowser() {
+        if (this.#disposed) {
+            return;
+        }
+        const deckId = this.#model.activeWhiteboard?.deck_id;
+        const payload = deckId ? { deck_id: deckId } : {};
+        const resp = await this.#postJson("/api/whiteboard/open-browser", payload);
+        if (!resp.ok) {
+            const errBody = await this.#safeParseError(resp);
+            const code = errBody?.error_code ?? "WHITEBOARD_BROWSER_UNAVAILABLE";
+            this.#updateModel({ noticeBanner: resolveHumanNotice(code, errBody?.message) });
+        }
+    }
+    exportWhiteboardHtml() {
+        const deck = this.#model.activeWhiteboard;
+        if (!deck || this.#disposed) {
+            return null;
+        }
+        const html = buildExportableWhiteboardHtml(deck);
+        if (typeof document !== "undefined" &&
+            typeof Blob !== "undefined" &&
+            typeof URL !== "undefined" &&
+            typeof URL.createObjectURL === "function") {
+            const slug = deck.topic
+                .toLowerCase()
+                .replace(/[^a-z0-9]+/g, "-")
+                .replace(/^-+|-+$/g, "")
+                .slice(0, 48) || "pizarra";
+            const blob = new Blob([html], { type: "text/html;charset=utf-8" });
+            const blobUrl = URL.createObjectURL(blob);
+            const link = document.createElement("a");
+            link.href = blobUrl;
+            link.download = `nova-pizarra-${slug}.html`;
+            document.body?.appendChild(link);
+            link.click();
+            link.remove();
+            setTimeout(() => URL.revokeObjectURL(blobUrl), 1000);
+        }
+        return html;
     }
     setAgentsFilter(filter) {
         if (this.#disposed) {
@@ -1177,6 +1285,8 @@ export class DesktopAppController {
             availableWorkspaces: snap.available_workspaces,
             pendingApprovals: snap.pending_approvals,
             messages: capped,
+            activeWhiteboard: snap.active_whiteboard ?? this.#model.activeWhiteboard ?? null,
+            whiteboardHistory: snap.whiteboard_history ?? this.#model.whiteboardHistory ?? [],
             errorBanner: null,
         });
     }
@@ -1347,6 +1457,34 @@ export class DesktopAppController {
             }
             return;
         }
+        if (env.event_type === "whiteboard_deck_created") {
+            const deck = p["deck"];
+            const history = Array.isArray(p["history"])
+                ? p["history"]
+                : this.#model.whiteboardHistory ?? [];
+            const autoOpen = Boolean(p["auto_open"]);
+            if (deck && typeof deck === "object" && Array.isArray(deck.slides)) {
+                this.#updateModel({
+                    activeWhiteboard: deck,
+                    whiteboardHistory: history,
+                    ...(autoOpen ? { activeTab: "whiteboard" } : {}),
+                });
+            }
+            return;
+        }
+        if (env.event_type === "whiteboard_slide_changed") {
+            const deckId = String(p["deck_id"] ?? "");
+            const slideIdx = typeof p["slide_index"] === "number" ? p["slide_index"] : -1;
+            const curr = this.#model.activeWhiteboard;
+            if (curr && curr.deck_id === deckId && slideIdx >= 0 && slideIdx < curr.slides.length) {
+                const nextHistory = (this.#model.whiteboardHistory ?? []).map((h) => h.deck_id === deckId ? { ...h, active_slide_index: slideIdx } : h);
+                this.#updateModel({
+                    activeWhiteboard: { ...curr, active_slide_index: slideIdx },
+                    whiteboardHistory: nextHistory,
+                });
+            }
+            return;
+        }
         if (env.event_type === "panel_toggle_requested") {
             if (this.#model.uiMode === "orb") {
                 void this.toggleUiMode();
@@ -1403,14 +1541,21 @@ export class DesktopAppController {
         }
         const overview = this.#model.agentsOverview ?? getDefaultAgentsOverview(this.#model.activeWorkspace?.canonical_path);
         const activeTaskCount = overview.tasks.filter((t) => t.status === "running" || t.status === "gatekeeper_blocked").length;
+        const wbSlideCount = this.#model.activeWhiteboard?.slides.length ?? 0;
         const headerSlot = this.#root.querySelector('[data-slot="header"]');
         if (headerSlot) {
-            headerSlot.innerHTML = renderWorkspaceBar(this.#model.activeWorkspace, this.#model.availableWorkspaces, this.#model.pickerFallbackOpen, this.#model.callSession.state, activeTab, activeTaskCount);
+            headerSlot.innerHTML = renderWorkspaceBar(this.#model.activeWorkspace, this.#model.availableWorkspaces, this.#model.pickerFallbackOpen, this.#model.callSession.state, activeTab, activeTaskCount, wbSlideCount);
         }
         if (activeTab === "agents") {
             const agentsSlot = this.#root.querySelector('[data-slot="agents-view"]');
             if (agentsSlot) {
                 agentsSlot.innerHTML = renderAgentsMatrixView(this.#model);
+            }
+        }
+        else if (activeTab === "whiteboard") {
+            const wbSlot = this.#root.querySelector('[data-slot="whiteboard-view"]');
+            if (wbSlot) {
+                wbSlot.innerHTML = renderWhiteboardView(this.#model);
             }
         }
         else {
@@ -1514,8 +1659,33 @@ export class DesktopAppController {
             }
             const action = target.dataset["action"];
             if (action === "switch-tab") {
-                const tab = target.dataset["tab"] || "chat";
+                const rawTab = target.dataset["tab"];
+                const tab = rawTab === "agents" || rawTab === "whiteboard" ? rawTab : "chat";
                 this.switchTab(tab);
+            }
+            else if (action === "whiteboard-prev") {
+                void this.stepWhiteboard(-1);
+            }
+            else if (action === "whiteboard-next") {
+                void this.stepWhiteboard(1);
+            }
+            else if (action === "whiteboard-goto") {
+                const idx = Number.parseInt(target.dataset["slideIndex"] ?? "", 10);
+                if (!Number.isNaN(idx)) {
+                    void this.navigateWhiteboard(idx);
+                }
+            }
+            else if (action === "whiteboard-open-browser") {
+                void this.openWhiteboardInBrowser();
+            }
+            else if (action === "whiteboard-export-html") {
+                this.exportWhiteboardHtml();
+            }
+            else if (action === "whiteboard-example") {
+                const prompt = target.dataset["prompt"] ?? "";
+                if (prompt.trim()) {
+                    void this.submitChat(prompt);
+                }
             }
             else if (action === "filter-agents") {
                 const filter = target.dataset["filter"] || "all";
@@ -1668,6 +1838,9 @@ export class DesktopAppController {
             if (target?.dataset["action"] === "select-workspace-dropdown" && target.value) {
                 void this.selectWorkspace(target.value);
             }
+            else if (target?.dataset["action"] === "select-whiteboard-deck" && target.value) {
+                void this.selectWhiteboardDeck(target.value);
+            }
             else if (target?.dataset["action"] === "onboarding-audio-select") {
                 const changedName = target.name || target.getAttribute?.("name") || "";
                 const capEl = root.querySelector('[name="onboarding.capture_target"]');
@@ -1769,6 +1942,20 @@ export class DesktopAppController {
                 return;
             }
             const target = ev.target;
+            const tag = target?.tagName ?? "";
+            const inEditable = tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT";
+            if (this.#model.activeTab === "whiteboard" && !inEditable) {
+                if (ev.key === "ArrowLeft") {
+                    ev.preventDefault();
+                    void this.stepWhiteboard(-1);
+                    return;
+                }
+                if (ev.key === "ArrowRight") {
+                    ev.preventDefault();
+                    void this.stepWhiteboard(1);
+                    return;
+                }
+            }
             if (target?.id === "nova-chat-input" &&
                 ev.key === "Enter" &&
                 !ev.shiftKey &&

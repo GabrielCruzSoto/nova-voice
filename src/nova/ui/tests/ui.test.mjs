@@ -3311,5 +3311,200 @@ test("NOVA-018 AC-9: sleep timer runs only in listening (never thinking/executin
   }
 });
 
+test("NOVA-019 AC-3, AC-6, AC-7, AC-9, NFR-1, NFR-4: Pizarra tab, 4 SVG diagram layouts, XSS safety, <50ms perf, SSE auto-open/sync, and script-free HTML export", async () => {
+  const wbMod = await import("../static/whiteboard.js");
+  assert.equal(typeof wbMod.renderWhiteboardSlideSvg, "function");
+  assert.equal(typeof wbMod.renderWhiteboardView, "function");
+  assert.equal(typeof wbMod.buildExportableWhiteboardHtml, "function");
+
+  const xss = `<script>alert("xss")</script><img src=x onerror="evil()">`;
+  const kinds = ["flowchart", "mindmap", "architecture", "sketch_cards"];
+  const icons = [
+    "spark", "brain", "gear", "database", "cloud", "shield", "user", "code",
+    "network", "rocket", "bulb", "check", "warning", "layers", "flow", "book",
+  ];
+  const shapes = ["box", "pill", "decision", "database", "actor", "cloud", "note"];
+  const accents = ["blue", "emerald", "amber", "violet", "rose", "slate"];
+
+  const slides = Array.from({ length: 8 }, (_, sIdx) => ({
+    slide_index: sIdx,
+    title: sIdx === 0 ? `Flujo seguro ${xss}` : `Lámina ${sIdx + 1}`,
+    subtitle: `Subtítulo ${sIdx + 1}`,
+    visual_kind: kinds[sIdx % kinds.length],
+    nodes: Array.from({ length: 12 }, (_, nIdx) => ({
+      id: `n${nIdx}`,
+      label: nIdx === 0 ? `Nodo ${xss}` : `Concepto ${nIdx + 1}`,
+      detail: `Detalle visual del concepto ${nIdx + 1}`,
+      shape: shapes[nIdx % shapes.length],
+      icon: icons[(sIdx * 3 + nIdx) % icons.length],
+      accent: accents[nIdx % accents.length],
+      group: `Capa ${(nIdx % 3) + 1}`,
+    })),
+    edges: Array.from({ length: 11 }, (_, eIdx) => ({
+      source_id: `n${eIdx}`,
+      target_id: `n${eIdx + 1}`,
+      label: `paso ${eIdx + 1}`,
+      style: eIdx % 2 === 0 ? "solid" : "dashed",
+    })),
+    callouts: [`Idea clave ${sIdx + 1} ${xss}`],
+    narration: `Explicación hablada de la lámina ${sIdx + 1}.`,
+  }));
+
+  const maxDeck = {
+    deck_id: "deck-perf-019",
+    correlation_id: "corr-019",
+    topic: `Arquitectura ${xss}`,
+    summary: "Resumen completo.",
+    slides,
+    active_slide_index: 0,
+    created_at: "2026-11-23T23:30:00Z",
+    source: "llm_structured",
+  };
+
+  // NFR-1: Rendering all 8 max-bound slides (12 nodes each) must complete in < 50 ms
+  const t0 = performance.now();
+  const svgs = maxDeck.slides.map((s) => wbMod.renderWhiteboardSlideSvg(s));
+  const elapsedMs = performance.now() - t0;
+  assert.ok(elapsedMs < 50, `Expected < 50 ms for 8 max slides, got ${elapsedMs.toFixed(2)} ms`);
+  for (const svg of svgs) {
+    assert.match(svg, /<svg[^>]+viewBox="/);
+    assert.ok(!svg.includes("<script>"));
+    assert.ok(!svg.includes(`onerror="evil()"`));
+  }
+
+  // AC-7 & AC-9: Standalone HTML export escapes XSS, contains zero <script> and zero external asset URLs
+  const exportedHtml = wbMod.buildExportableWhiteboardHtml(maxDeck);
+  assert.match(exportedHtml, /^<!doctype html>/i);
+  assert.ok(!/<script\b/i.test(exportedHtml));
+  assert.ok(!/<link\b/i.test(exportedHtml));
+  assert.ok(!exportedHtml.includes(`onerror="evil()"`));
+  assert.ok(!/(?:src|href)\s*=\s*["']https?:/i.test(exportedHtml));
+  assert.ok(!/url\(\s*["']?https?:/i.test(exportedHtml));
+  assert.ok(exportedHtml.includes("&lt;script&gt;"));
+  assert.ok(exportedHtml.includes('id="wb-dot-grid-0"'));
+  assert.ok(exportedHtml.includes('id="wb-dot-grid-7"'));
+
+  // AC-3 & AC-6: Controller auto-opens Pizarra tab on SSE whiteboard_deck_created,
+  // advances slide on whiteboard_slide_changed, and calls navigate/open-browser endpoints
+  const postCalls = [];
+  let sseController = null;
+  const encoder = new TextEncoder();
+  const fakeFetch = async (url, init = {}) => {
+    if (url === "/api/state") {
+      return new Response(
+        JSON.stringify({
+          schema_version: "1.3.0",
+          csrf_token: "csrf-wb",
+          voice_enabled: true,
+          call_session: { call_id: "c1", state: "standby", turn_count: 0, active_correlation_id: null },
+          active_workspace: null,
+          available_workspaces: [],
+          pending_approvals: [],
+          messages: [],
+          active_whiteboard: null,
+          whiteboard_history: [],
+        }),
+        { status: 200 },
+      );
+    }
+    if (url === "/api/health") {
+      return new Response(JSON.stringify({ all_ok: true, missing_critical_count: 0, missing_optional_count: 0, components: [] }), { status: 200 });
+    }
+    if (url === "/api/models/status") {
+      return new Response(JSON.stringify({ status: "idle", all_installed: true, total_models: 0, completed_models: 0, bytes_downloaded: 0, total_bytes: 0, percent: 100, models: [] }), { status: 200 });
+    }
+    if (url === "/api/events") {
+      const stream = new ReadableStream({
+        start(c) {
+          sseController = c;
+        },
+      });
+      return new Response(stream, { status: 200 });
+    }
+    if (init.method === "POST") {
+      const body = init.body ? JSON.parse(String(init.body)) : {};
+      postCalls.push({ url, body });
+      if (url === "/api/whiteboard/navigate") {
+        return new Response(
+          JSON.stringify({ active_whiteboard: { ...maxDeck, active_slide_index: body.slide_index } }),
+          { status: 200 },
+        );
+      }
+      if (url === "/api/whiteboard/open-browser") {
+        return new Response(
+          JSON.stringify({ opened: true, url: "http://127.0.0.1:41234/?tab=whiteboard" }),
+          { status: 200 },
+        );
+      }
+    }
+    return new Response("{}", { status: 404 });
+  };
+
+  let lastHtml = "";
+  const ctrl = new DesktopAppController({
+    fetchImpl: fakeFetch,
+    onRender: (html) => {
+      lastHtml = html;
+    },
+  });
+  await ctrl.start();
+  await Promise.resolve();
+
+  // Header must expose the Pizarra tab (role="tab", data-tab="whiteboard")
+  assert.match(lastHtml, /data-tab="whiteboard"/);
+
+  const emitSse = async (eventType, payload, seq) => {
+    sseController.enqueue(
+      encoder.encode(
+        `event: nova_event\ndata: ${JSON.stringify({
+          seq,
+          event_type: eventType,
+          correlation_id: "corr-019",
+          timestamp: "2026-11-23T23:31:00Z",
+          payload,
+        })}\n\n`,
+      ),
+    );
+    await Promise.resolve();
+    await Promise.resolve();
+  };
+
+  // Auto-open on whiteboard_deck_created
+  await emitSse(
+    "whiteboard_deck_created",
+    {
+      auto_open: true,
+      deck: maxDeck,
+      history: [{ deck_id: maxDeck.deck_id, topic: maxDeck.topic, slide_count: 8, active_slide_index: 0, created_at: maxDeck.created_at, source: "llm_structured" }],
+    },
+    1,
+  );
+  assert.equal(ctrl.model.activeTab, "whiteboard");
+  assert.equal(ctrl.model.activeWhiteboard?.deck_id, "deck-perf-019");
+  assert.match(lastHtml, /data-slot="whiteboard-view"/);
+  assert.match(lastHtml, /role="tabpanel"/);
+
+  // Sync advance on whiteboard_slide_changed
+  await emitSse("whiteboard_slide_changed", { deck_id: "deck-perf-019", slide_index: 2, reason: "narration_sync" }, 2);
+  assert.equal(ctrl.model.activeWhiteboard?.active_slide_index, 2);
+
+  // Manual navigation & browser expansion
+  await ctrl.stepWhiteboard(1);
+  assert.equal(ctrl.model.activeWhiteboard?.active_slide_index, 3);
+  await ctrl.openWhiteboardInBrowser();
+  assert.ok(postCalls.some((c) => c.url === "/api/whiteboard/navigate" && c.body.slide_index === 3));
+  assert.ok(postCalls.some((c) => c.url === "/api/whiteboard/open-browser"));
+
+  // Standalone export returns sanitized HTML
+  const exportedFromCtrl = ctrl.exportWhiteboardHtml();
+  assert.ok(exportedFromCtrl && exportedFromCtrl.startsWith("<!doctype html>"));
+
+  ctrl.dispose();
+  if (sseController) {
+    sseController.close();
+  }
+});
+
+
 
 

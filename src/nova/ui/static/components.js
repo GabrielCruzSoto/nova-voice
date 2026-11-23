@@ -3,6 +3,8 @@
  * Compliant with Nova Master Visual Identity & GNOME Desktop Specification.
  * Zero network calls, zero mutable state, strict HTML escaping against XSS.
  */
+import { buildExportableWhiteboardHtml, renderWhiteboardSlideSvg, renderWhiteboardView, } from "./whiteboard.js";
+export { buildExportableWhiteboardHtml, renderWhiteboardSlideSvg, renderWhiteboardView };
 const HTML_ESCAPE_MAP = {
     "&": "&amp;",
     "<": "&lt;",
@@ -247,7 +249,7 @@ export function renderCallControls(callState, voiceEnabled) {
     </nav>
   `.trim();
 }
-export function renderWorkspaceBar(active, options, pickerFallbackOpen, callState = "standby", activeTab = "chat", activeTaskCount = 0) {
+export function renderWorkspaceBar(active, options, pickerFallbackOpen, callState = "standby", activeTab = "chat", activeTaskCount = 0, whiteboardSlideCount = 0) {
     const safeState = escapeHtml(callState);
     const stateMeta = CALL_STATE_LABELS[callState] ?? CALL_STATE_LABELS.standby;
     const projectCount = active?.projects?.length ?? 0;
@@ -275,6 +277,9 @@ export function renderWorkspaceBar(active, options, pickerFallbackOpen, callStat
     const activeBadgeHtml = activeTaskCount > 0
         ? `<span class="nova-tab-badge" aria-label="${activeTaskCount} tareas activas">${activeTaskCount}</span>`
         : "";
+    const wbBadgeHtml = whiteboardSlideCount > 0
+        ? `<span class="nova-tab-badge nova-tab-badge--wb" aria-label="${whiteboardSlideCount} láminas en pizarra">${whiteboardSlideCount}</span>`
+        : "";
     return `
     <div class="workspace-bar">
       <div class="workspace-identity">
@@ -294,6 +299,17 @@ export function renderWorkspaceBar(active, options, pickerFallbackOpen, callStat
           title="Vista de conversación y chat"
         >
           <span class="tab-icon" aria-hidden="true">💬</span> Chat
+        </button>
+        <button
+          type="button"
+          role="tab"
+          class="nova-tab-btn ${activeTab === "whiteboard" ? "nova-tab-btn--active" : ""}"
+          data-action="switch-tab"
+          data-tab="whiteboard"
+          aria-selected="${activeTab === "whiteboard" ? "true" : "false"}"
+          title="Pizarra visual con dibujitos, diagramas y mapas mentales"
+        >
+          <span class="tab-icon" aria-hidden="true">🎨</span> Pizarra${wbBadgeHtml ? ` ${wbBadgeHtml}` : ""}
         </button>
         <button
           type="button"
@@ -431,6 +447,9 @@ const ERROR_CATALOG = {
     UI_SHUTDOWN_UNAVAILABLE: "El servicio de apagado no está disponible en este momento.",
     ORCHESTRATOR_UNEXPECTED_FAILURE: "Ocurrió un error inesperado al procesar la solicitud.",
     COMPONENTS_MISSING: "Faltan componentes necesarios para el funcionamiento de Nova.",
+    WHITEBOARD_DECK_NOT_FOUND: "La pizarra solicitada expiró o ya no está en memoria.",
+    WHITEBOARD_INVALID_SLIDE_INDEX: "El número de lámina solicitado está fuera de rango.",
+    WHITEBOARD_BROWSER_UNAVAILABLE: "No se pudo abrir el navegador local en esta sesión gráfica.",
 };
 const GENERIC_ERROR_FALLBACK = "Ocurrió un error inesperado al procesar la solicitud.";
 export function resolveHumanNotice(code, customMessage) {
@@ -1561,27 +1580,36 @@ export function renderAppShell(model) {
     const activeTab = model.activeTab ?? "chat";
     const overview = model.agentsOverview ?? getDefaultAgentsOverview(model.activeWorkspace?.canonical_path);
     const activeTaskCount = overview.tasks.filter((t) => t.status === "running" || t.status === "gatekeeper_blocked").length;
+    const wbSlideCount = model.activeWhiteboard?.slides.length ?? 0;
     const milestoneHtml = model.lastMilestone
         ? `<p class="nova-milestone-toast" aria-live="polite">${escapeHtml(model.lastMilestone)}</p>`
         : "";
+    const mainAriaLabel = activeTab === "agents"
+        ? "Matriz de agentes y tareas concurrentes"
+        : activeTab === "whiteboard"
+            ? "Pizarra visual interactiva"
+            : "Historial de conversación y aprobaciones";
+    const mainBodyHtml = activeTab === "agents"
+        ? `<div class="nova-agents-scroll" data-slot="agents-view" role="tabpanel">${renderAgentsMatrixView(model)}</div>`
+        : activeTab === "whiteboard"
+            ? `<div class="nova-whiteboard-scroll" data-slot="whiteboard-view" role="tabpanel">${renderWhiteboardView(model)}</div>`
+            : `
+          <div class="nova-timeline-scroll" data-slot="timeline">
+            ${renderChatTimeline(model.status, model.messages, model.errorBanner, model.activeWorkspace, model.availableWorkspaces, Boolean(model.initWorkspaceOpen), model.allowedRoots ?? [])}
+          </div>
+
+          <div class="nova-approvals-slot" data-slot="approvals">
+            ${renderApprovalBanner(model.pendingApprovals)}
+          </div>
+        `;
     return `
     <div class="nova-layout" data-ui-mode="panel" data-call-state="${escapeHtml(model.callSession.state)}" data-active-tab="${activeTab}">
       <header class="nova-header" data-slot="header">
-        ${renderWorkspaceBar(model.activeWorkspace, model.availableWorkspaces, model.pickerFallbackOpen, model.callSession.state, activeTab, activeTaskCount)}
+        ${renderWorkspaceBar(model.activeWorkspace, model.availableWorkspaces, model.pickerFallbackOpen, model.callSession.state, activeTab, activeTaskCount, wbSlideCount)}
       </header>
 
-      <main class="nova-main" aria-label="${activeTab === "agents" ? "Matriz de agentes y tareas concurrentes" : "Historial de conversación y aprobaciones"}">
-        ${activeTab === "agents"
-        ? `<div class="nova-agents-scroll" data-slot="agents-view">${renderAgentsMatrixView(model)}</div>`
-        : `
-              <div class="nova-timeline-scroll" data-slot="timeline">
-                ${renderChatTimeline(model.status, model.messages, model.errorBanner, model.activeWorkspace, model.availableWorkspaces, Boolean(model.initWorkspaceOpen), model.allowedRoots ?? [])}
-              </div>
-
-              <div class="nova-approvals-slot" data-slot="approvals">
-                ${renderApprovalBanner(model.pendingApprovals)}
-              </div>
-            `}
+      <main class="nova-main" aria-label="${mainAriaLabel}">
+        ${mainBodyHtml}
 
         <div data-slot="milestone" aria-live="polite">${milestoneHtml}</div>
 
