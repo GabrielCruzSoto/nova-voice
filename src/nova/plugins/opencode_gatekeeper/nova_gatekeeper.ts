@@ -81,6 +81,7 @@ export const NovaGatekeeperPlugin = async (ctx: { directory?: string }) => {
       const command = String(args.command ?? args.cmd ?? "");
       const cwd = String(args.workdir ?? args.cwd ?? ctx.directory ?? process.cwd());
       const source = (process.env.NOVA_GATEKEEPER_SOURCE ?? "tier2_opencode").trim();
+      const taskId = (process.env.NOVA_TASK_ID ?? "").trim();
 
       const decision = await queryGatekeeper(socketPath, {
         protocol_version: "1.0",
@@ -90,6 +91,7 @@ export const NovaGatekeeperPlugin = async (ctx: { directory?: string }) => {
         tool_name: toolName === "shell" ? "shell" : "bash",
         command,
         cwd,
+        ...(taskId ? { task_id: taskId } : {}),
       });
 
       if (decision.allowed !== true) {

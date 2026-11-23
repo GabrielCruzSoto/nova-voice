@@ -48,6 +48,7 @@ class _GatekeeperIPCRequest(BaseModel):
     tool_name: ToolInterceptName
     command: str
     cwd: str = Field(min_length=1)
+    task_id: str | None = None
 
 
 def _prepare_secure_socket_dir(custom_base: str | None) -> Path:
@@ -238,6 +239,7 @@ class UnixSocketGatekeeperServer:
                     tool_name=ipc_req.tool_name,
                     command=ipc_req.command,
                     cwd=ipc_req.cwd,
+                    task_id=ipc_req.task_id,
                 ),
             )
         except GatekeeperError as exc:

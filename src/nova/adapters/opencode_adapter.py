@@ -12,6 +12,7 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from nova.adapters._process_group import terminate_process_group
 from nova.domain.errors import CodingRunnerError
 from nova.domain.models import AgentTier, CodingTaskRequest, RunnerProgressEvent
 
@@ -35,6 +36,7 @@ class OpenCodeConfig(BaseModel):
     tier: AgentTier = "tier1"
     standalone: bool = False
     timeout_seconds: float = Field(default=300.0, gt=0.0)
+    stdout_heartbeat_timeout_seconds: float | None = Field(default=None, gt=0.0)
     max_line_bytes: int = Field(default=DEFAULT_MAX_LINE_BYTES, gt=0)
     gatekeeper_ipc_env: dict[str, str] | None = None
     provider_env: dict[str, str] | None = None
@@ -177,6 +179,7 @@ class OpenCodeAdapter:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 limit=self._config.max_line_bytes,
+                start_new_session=True,
             )
         except OSError as exc:
             raise CodingRunnerError(
@@ -202,9 +205,20 @@ class OpenCodeAdapter:
                         code="RUNNER_SUBPROCESS_TIMEOUT_OR_CRASH",
                         message="Timed out waiting for opencode JSON completion.",
                     )
+                hb = self._config.stdout_heartbeat_timeout_seconds
+                using_heartbeat = hb is not None and hb < remaining
+                read_timeout = hb if using_heartbeat and hb is not None else remaining
                 try:
-                    raw_line = await asyncio.wait_for(proc.stdout.readline(), timeout=remaining)
+                    raw_line = await asyncio.wait_for(proc.stdout.readline(), timeout=read_timeout)
                 except TimeoutError as exc:
+                    if using_heartbeat:
+                        raise CodingRunnerError(
+                            code="RUNNER_STDOUT_HEARTBEAT_TIMEOUT",
+                            message=(
+                                f"opencode CLI produced no stdout activity for {hb:.1f}s "
+                                "(stdout heartbeat timeout)."
+                            ),
+                        ) from exc
                     raise CodingRunnerError(
                         code="RUNNER_SUBPROCESS_TIMEOUT_OR_CRASH",
                         message="Timed out waiting for opencode JSON output.",
@@ -289,13 +303,4 @@ class OpenCodeAdapter:
 
     @staticmethod
     async def _terminate_process(proc: asyncio.subprocess.Process) -> None:
-        if proc.returncode is None:
-            with contextlib.suppress(ProcessLookupError):
-                proc.terminate()
-            try:
-                await asyncio.wait_for(proc.wait(), timeout=2.0)
-            except TimeoutError:
-                with contextlib.suppress(ProcessLookupError):
-                    proc.kill()
-                with contextlib.suppress(Exception):
-                    await proc.wait()
+        await terminate_process_group(proc, grace_seconds=2.0)

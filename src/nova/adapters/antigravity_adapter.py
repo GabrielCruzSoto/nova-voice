@@ -13,6 +13,7 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from nova.adapters._process_group import terminate_process_group
 from nova.domain.errors import CodingRunnerError
 from nova.domain.models import CodingTaskRequest, RunnerProgressEvent
 
@@ -40,6 +41,7 @@ class AntigravityRunnerConfig(BaseModel):
     extra_leading_args: tuple[str, ...] = ()
     allowed_models: frozenset[str] = ALLOWED_TIER2_MODELS
     timeout_seconds: float = Field(default=300.0, gt=0.0)
+    stdout_heartbeat_timeout_seconds: float | None = Field(default=None, gt=0.0)
     max_line_bytes: int = Field(default=DEFAULT_MAX_LINE_BYTES, gt=0)
     gatekeeper_ipc_env: dict[str, str] | None = None
     require_gatekeeper_plugin: bool = True
@@ -133,6 +135,7 @@ class AntigravityCLIAdapter:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 limit=self._config.max_line_bytes,
+                start_new_session=True,
             )
         except OSError as exc:
             raise CodingRunnerError(
@@ -156,9 +159,20 @@ class AntigravityCLIAdapter:
                         code="RUNNER_SUBPROCESS_TIMEOUT_OR_CRASH",
                         message="Timed out waiting for agy stream-json completion.",
                     )
+                hb = self._config.stdout_heartbeat_timeout_seconds
+                using_heartbeat = hb is not None and hb < remaining
+                read_timeout = hb if using_heartbeat and hb is not None else remaining
                 try:
-                    raw_line = await asyncio.wait_for(proc.stdout.readline(), timeout=remaining)
+                    raw_line = await asyncio.wait_for(proc.stdout.readline(), timeout=read_timeout)
                 except TimeoutError as exc:
+                    if using_heartbeat:
+                        raise CodingRunnerError(
+                            code="RUNNER_STDOUT_HEARTBEAT_TIMEOUT",
+                            message=(
+                                f"agy CLI produced no stdout activity for {hb:.1f}s "
+                                "(stdout heartbeat timeout)."
+                            ),
+                        ) from exc
                     raise CodingRunnerError(
                         code="RUNNER_SUBPROCESS_TIMEOUT_OR_CRASH",
                         message="Timed out waiting for agy stream-json output.",
@@ -438,18 +452,4 @@ class AntigravityCLIAdapter:
 
     @staticmethod
     async def _terminate_process(proc: asyncio.subprocess.Process) -> None:
-        if proc.returncode is None:
-            with contextlib.suppress(ProcessLookupError):
-                proc.terminate()
-            try:
-                await asyncio.wait_for(proc.wait(), timeout=2.0)
-            except TimeoutError:
-                with contextlib.suppress(ProcessLookupError):
-                    proc.kill()
-                with contextlib.suppress(Exception):
-                    await asyncio.wait_for(proc.wait(), timeout=1.0)
-        transport = getattr(proc, "_transport", None)
-        if transport is not None:
-            with contextlib.suppress(Exception):
-                transport.close()
-        await asyncio.sleep(0)
+        await terminate_process_group(proc, grace_seconds=2.0)

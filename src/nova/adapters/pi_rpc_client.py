@@ -14,6 +14,7 @@ from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from nova.adapters._process_group import terminate_process_group
 from nova.domain.errors import PiRpcError
 from nova.domain.models import DEFAULT_PI_MODEL
 
@@ -52,6 +53,7 @@ class PiRpcConfig(BaseModel):
     append_system_prompt: str | None = NOVA_VOICE_SYSTEM_PROMPT
     ack_timeout_seconds: float = Field(default=5.0, gt=0.0)
     run_timeout_seconds: float = Field(default=180.0, gt=0.0)
+    stdout_heartbeat_timeout_seconds: float | None = Field(default=None, gt=0.0)
     max_line_bytes: int = Field(default=DEFAULT_MAX_LINE_BYTES, gt=0)
     gatekeeper_ipc_env: dict[str, str] | None = None
     enable_gatekeeper_extension: bool = True
@@ -155,6 +157,7 @@ class PiRpcClient:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 limit=self._config.max_line_bytes,
+                start_new_session=True,
             )
         except OSError as exc:
             raise PiRpcError(
@@ -252,10 +255,21 @@ class PiRpcClient:
                         code="PI_RPC_SUBPROCESS_UNAVAILABLE",
                         message="Timed out waiting for Pi RPC agent_settled event.",
                     )
+                hb = self._config.stdout_heartbeat_timeout_seconds
+                using_heartbeat = hb is not None and hb < remaining
+                read_timeout = hb if using_heartbeat and hb is not None else remaining
                 try:
-                    record = await asyncio.wait_for(queue.get(), timeout=remaining)
+                    record = await asyncio.wait_for(queue.get(), timeout=read_timeout)
                 except TimeoutError as exc:
                     await self.close()
+                    if using_heartbeat:
+                        raise PiRpcError(
+                            code="RUNNER_STDOUT_HEARTBEAT_TIMEOUT",
+                            message=(
+                                f"Pi RPC produced no stdout activity for {hb:.1f}s "
+                                "(stdout heartbeat timeout)."
+                            ),
+                        ) from exc
                     raise PiRpcError(
                         code="PI_RPC_SUBPROCESS_UNAVAILABLE",
                         message="Timed out waiting for Pi RPC agent_settled event.",
@@ -466,18 +480,4 @@ class PiRpcClient:
 
     @staticmethod
     async def _terminate_process(proc: asyncio.subprocess.Process) -> None:
-        if proc.returncode is None:
-            with contextlib.suppress(ProcessLookupError):
-                proc.terminate()
-            try:
-                await asyncio.wait_for(proc.wait(), timeout=2.0)
-            except TimeoutError:
-                with contextlib.suppress(ProcessLookupError):
-                    proc.kill()
-                with contextlib.suppress(Exception):
-                    await asyncio.wait_for(proc.wait(), timeout=1.0)
-        transport = getattr(proc, "_transport", None)
-        if transport is not None:
-            with contextlib.suppress(Exception):
-                transport.close()
-        await asyncio.sleep(0)
+        await terminate_process_group(proc, grace_seconds=2.0)
