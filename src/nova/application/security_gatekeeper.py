@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import uuid
@@ -29,6 +30,7 @@ from nova.domain.models import (
     CommandAuditResult,
     CommandExecutionDecision,
     CommandInterceptRequest,
+    DecisionVerdict,
 )
 from nova.domain.ports import CommandAuditorPort, WorkspaceResolverPort
 
@@ -49,6 +51,8 @@ class _PendingApproval:
     audit_id: str
     correlation_id: str
     future: asyncio.Future[tuple[bool, str]]
+    task_id: str | None = None
+    resolved: bool = False
 
 
 class SecurityGatekeeper:
@@ -68,7 +72,19 @@ class SecurityGatekeeper:
         self._policy = policy or DeterministicCommandPolicy()
         self._settings = settings or GatekeeperSettings()
         self._pending: dict[str, _PendingApproval] = {}
+        self._task_workspaces: dict[str, str] = {}
         self._extra_secrets: list[str] = []
+
+    def register_task_workspace(self, task_id: str, workspace_canonical_path: str) -> None:
+        """Bind an active background task_id to its authoritative workspace canonical path."""
+        cleaned_id = task_id.strip()
+        cleaned_ws = workspace_canonical_path.strip()
+        if cleaned_id and cleaned_ws:
+            self._task_workspaces[cleaned_id] = cleaned_ws
+
+    def unregister_task_workspace(self, task_id: str) -> None:
+        """Remove a completed or cancelled task_id workspace binding."""
+        self._task_workspaces.pop(task_id.strip(), None)
 
     @property
     def event_bus(self) -> OrchestratorEventBus:
@@ -104,19 +120,34 @@ class SecurityGatekeeper:
         request: CommandInterceptRequest,
     ) -> CommandExecutionDecision:
         """Intercept a CLI command pre-execution and return allow/deny decision."""
-        active_ws = self._workspace_resolver.active_context
-        if active_ws is None:
-            return CommandExecutionDecision(
-                allowed=False,
-                verdict="invalid_request",
-                audit_id=None,
-                reason="No active workspace selected in Nova.",
-            )
+        workspace_canonical_path: str | None = None
+        if request.task_id is not None and request.task_id.strip():
+            workspace_canonical_path = self._task_workspaces.get(request.task_id.strip())
+            if workspace_canonical_path is None:
+                return CommandExecutionDecision(
+                    allowed=False,
+                    verdict="invalid_request",
+                    audit_id=None,
+                    reason=(
+                        "GATEKEEPER_TASK_UNBOUND: Unknown or expired task workspace binding "
+                        f"for task '{self._redact(request.task_id.strip())}'."
+                    ),
+                )
+        else:
+            active_ws = self._workspace_resolver.active_context
+            if active_ws is None:
+                return CommandExecutionDecision(
+                    allowed=False,
+                    verdict="invalid_request",
+                    audit_id=None,
+                    reason="No active workspace selected in Nova.",
+                )
+            workspace_canonical_path = active_ws.canonical_path
 
         layer1 = self._policy.evaluate(
             command=request.command,
             cwd=request.cwd,
-            workspace_canonical_path=active_ws.canonical_path,
+            workspace_canonical_path=workspace_canonical_path,
         )
         sanitized_cmd = self._redact(request.command)
 
@@ -151,7 +182,7 @@ class SecurityGatekeeper:
             audit_id=audit_id,
             request=request,
             sanitized_cmd=sanitized_cmd,
-            workspace_path=active_ws.canonical_path,
+            workspace_path=workspace_canonical_path,
             rule_id=layer1.rule_id,
             risk_hint=risk_hint,
         )
@@ -221,6 +252,7 @@ class SecurityGatekeeper:
             audit_id=audit_id,
             correlation_id=request.correlation_id,
             future=loop.create_future(),
+            task_id=request.task_id,
         )
         self._pending[audit_id] = pending
 
@@ -249,6 +281,7 @@ class SecurityGatekeeper:
                     spoken_summary=spoken,
                     technical_explanation=explanation,
                     expires_in_seconds=self._settings.approval_timeout_seconds,
+                    task_id=request.task_id,
                 )
             )
             await self._event_bus.publish(
@@ -288,7 +321,30 @@ class SecurityGatekeeper:
                 pending.future,
                 timeout=self._settings.approval_timeout_seconds,
             )
+        except asyncio.CancelledError:
+            if not pending.resolved:
+                pending.resolved = True
+                self._log(
+                    "command_approval_aborted",
+                    audit_id=pending.audit_id,
+                    correlation_id=pending.correlation_id,
+                )
+                with contextlib.suppress(Exception):
+                    await asyncio.shield(
+                        self._event_bus.publish(
+                            CommandApprovalResolvedEvent(
+                                audit_id=pending.audit_id,
+                                correlation_id=pending.correlation_id,
+                                approved=False,
+                                verdict="invalid_request",
+                                resolved_by="task_cancelled_or_disconnected",
+                                task_id=pending.task_id,
+                            )
+                        )
+                    )
+            raise
         except TimeoutError:
+            pending.resolved = True
             self._log(
                 "command_approval_timed_out",
                 audit_id=pending.audit_id,
@@ -301,6 +357,7 @@ class SecurityGatekeeper:
                     approved=False,
                     verdict="timed_out",
                     resolved_by="timeout",
+                    task_id=pending.task_id,
                 )
             )
             return CommandExecutionDecision(
@@ -310,7 +367,7 @@ class SecurityGatekeeper:
                 reason="GATEKEEPER_APPROVAL_TIMEOUT: Approval window expired (fail-closed).",
             )
 
-        verdict = "approved_by_human" if approved else "rejected_by_human"
+        verdict: DecisionVerdict = "approved_by_human" if approved else "rejected_by_human"
         reason = (
             f"Approved by {resolved_by}."
             if approved
@@ -332,11 +389,11 @@ class SecurityGatekeeper:
     ) -> CommandApprovalResolvedEvent:
         """Resolve a pending approval request explicitly."""
         pending = self._pending.get(audit_id)
-        if pending is None or pending.future.done():
+        if pending is None or pending.resolved or pending.future.done():
             raise ApprovalNotFoundError(audit_id)
 
-        pending.future.set_result((approved, resolved_by))
-        verdict = "approved_by_human" if approved else "rejected_by_human"
+        pending.resolved = True
+        verdict: DecisionVerdict = "approved_by_human" if approved else "rejected_by_human"
         self._log(
             "command_approval_resolved",
             audit_id=audit_id,
@@ -350,6 +407,9 @@ class SecurityGatekeeper:
             approved=approved,
             verdict=verdict,
             resolved_by=resolved_by,
+            task_id=pending.task_id,
         )
         await self._event_bus.publish(event)
+        if not pending.future.done():
+            pending.future.set_result((approved, resolved_by))
         return event

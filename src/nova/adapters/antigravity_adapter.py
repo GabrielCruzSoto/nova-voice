@@ -7,12 +7,13 @@ import contextlib
 import json
 import os
 import time
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from pathlib import Path
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from nova.adapters._process_group import await_with_heartbeat, terminate_process_group
 from nova.domain.errors import CodingRunnerError
 from nova.domain.models import CodingTaskRequest, RunnerProgressEvent
 
@@ -40,6 +41,7 @@ class AntigravityRunnerConfig(BaseModel):
     extra_leading_args: tuple[str, ...] = ()
     allowed_models: frozenset[str] = ALLOWED_TIER2_MODELS
     timeout_seconds: float = Field(default=300.0, gt=0.0)
+    stdout_heartbeat_timeout_seconds: float | None = Field(default=None, gt=0.0)
     max_line_bytes: int = Field(default=DEFAULT_MAX_LINE_BYTES, gt=0)
     gatekeeper_ipc_env: dict[str, str] | None = None
     require_gatekeeper_plugin: bool = True
@@ -74,8 +76,14 @@ class _AgyResult(BaseModel):
 class AntigravityCLIAdapter:
     """Executes `agy` non-interactively using verified NDJSON stream-json events."""
 
-    def __init__(self, config: AntigravityRunnerConfig | None = None) -> None:
+    def __init__(
+        self,
+        config: AntigravityRunnerConfig | None = None,
+        *,
+        heartbeat_pause_predicate: Callable[[], bool] | None = None,
+    ) -> None:
         self._config = config or AntigravityRunnerConfig()
+        self._heartbeat_pause_predicate = heartbeat_pause_predicate
         self._plugin_verified_until_monotonic: float = 0.0
 
     async def execute(self, request: CodingTaskRequest) -> AsyncIterator[RunnerProgressEvent]:
@@ -133,6 +141,7 @@ class AntigravityCLIAdapter:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 limit=self._config.max_line_bytes,
+                start_new_session=True,
             )
         except OSError as exc:
             raise CodingRunnerError(
@@ -156,18 +165,34 @@ class AntigravityCLIAdapter:
                         code="RUNNER_SUBPROCESS_TIMEOUT_OR_CRASH",
                         message="Timed out waiting for agy stream-json completion.",
                     )
+                hb = self._config.stdout_heartbeat_timeout_seconds
                 try:
-                    raw_line = await asyncio.wait_for(proc.stdout.readline(), timeout=remaining)
-                except TimeoutError as exc:
-                    raise CodingRunnerError(
-                        code="RUNNER_SUBPROCESS_TIMEOUT_OR_CRASH",
-                        message="Timed out waiting for agy stream-json output.",
-                    ) from exc
+                    raw_line, wait_status = await await_with_heartbeat(
+                        proc.stdout.readline(),
+                        deadline=deadline,
+                        heartbeat_seconds=hb,
+                        pause_predicate=self._heartbeat_pause_predicate,
+                    )
                 except (ValueError, asyncio.LimitOverrunError) as exc:
                     raise CodingRunnerError(
                         code="RUNNER_EXECUTION_FAILED",
                         message="agy stream-json record exceeded configured max_line_bytes.",
                     ) from exc
+                if wait_status == "heartbeat":
+                    hb_val = hb or 0.0
+                    raise CodingRunnerError(
+                        code="RUNNER_STDOUT_HEARTBEAT_TIMEOUT",
+                        message=(
+                            f"agy CLI produced no stdout activity for {hb_val:.1f}s "
+                            "(stdout heartbeat timeout)."
+                        ),
+                    )
+                if wait_status == "total":
+                    raise CodingRunnerError(
+                        code="RUNNER_SUBPROCESS_TIMEOUT_OR_CRASH",
+                        message="Timed out waiting for agy stream-json output.",
+                    )
+                assert raw_line is not None
 
                 if not raw_line:
                     break
@@ -438,18 +463,4 @@ class AntigravityCLIAdapter:
 
     @staticmethod
     async def _terminate_process(proc: asyncio.subprocess.Process) -> None:
-        if proc.returncode is None:
-            with contextlib.suppress(ProcessLookupError):
-                proc.terminate()
-            try:
-                await asyncio.wait_for(proc.wait(), timeout=2.0)
-            except TimeoutError:
-                with contextlib.suppress(ProcessLookupError):
-                    proc.kill()
-                with contextlib.suppress(Exception):
-                    await asyncio.wait_for(proc.wait(), timeout=1.0)
-        transport = getattr(proc, "_transport", None)
-        if transport is not None:
-            with contextlib.suppress(Exception):
-                transport.close()
-        await asyncio.sleep(0)
+        await terminate_process_group(proc, grace_seconds=2.0)

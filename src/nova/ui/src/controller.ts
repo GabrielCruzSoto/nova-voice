@@ -47,6 +47,7 @@ import type {
   SettingsPutResponse,
   ShortcutRegisterResponse,
   UiAgentTask,
+  UiAgentsOverview,
   UiApprovalItem,
   UiChatMessage,
   UiEventEnvelope,
@@ -410,17 +411,43 @@ export class DesktopAppController {
 
     if (action === "inspect") {
       const detail = targetTask.lastLog ? ` — ${targetTask.lastLog}` : "";
+      const displayId = targetTask.id.startsWith("tsk-") ? `#${targetTask.id}` : `#tsk-${targetTask.id}`;
       this.#updateModel({
-        lastMilestone: `#tsk-${targetTask.id}: ${targetTask.title}${detail}`,
+        lastMilestone: `${displayId}: ${targetTask.title}${detail}`,
       });
       return;
     }
 
     if (action === "approve" || action === "cancel") {
-      const matchingApproval = this.#model.pendingApprovals.find((a) => a.audit_id === taskId);
+      const targetAuditId = targetTask.pending_audit_id ?? taskId;
+      const matchingApproval = this.#model.pendingApprovals.find((a) => a.audit_id === targetAuditId);
       if (matchingApproval) {
-        await this.resolveApproval(taskId, action === "approve");
+        await this.resolveApproval(matchingApproval.audit_id, action === "approve");
       }
+    }
+
+    if (
+      action === "cancel" &&
+      (targetTask.status === "running" ||
+        targetTask.status === "queued" ||
+        targetTask.status === "gatekeeper_blocked")
+    ) {
+      const resp = await this.#postJson(`/api/tasks/${encodeURIComponent(taskId)}/cancel`, {});
+      if (!resp.ok) {
+        const err = await this.#safeParseError(resp);
+        this.#updateModel({
+          errorBanner: err?.message ?? `No se pudo cancelar la tarea ${taskId}.`,
+        });
+        return;
+      }
+      const data = (await resp.json()) as { task?: UiAgentTask };
+      const cancelledTask: UiAgentTask = data.task ?? {
+        ...targetTask,
+        status: "cancelled",
+        lastLog: "Cancelada por el usuario.",
+      };
+      this.#upsertTaskInOverview(cancelledTask, `Tarea ${taskId} cancelada.`);
+      return;
     }
 
     let nextStatus: AgentTaskStatus = targetTask.status;
@@ -430,20 +457,11 @@ export class DesktopAppController {
     if (action === "approve" && targetTask.status === "gatekeeper_blocked") {
       nextStatus = "running";
       nextLog = "> Aprobado por el usuario; reanudando ejecución...";
-      milestone = `Tarea #tsk-${taskId} aprobada.`;
+      milestone = `Tarea ${taskId} aprobada.`;
     } else if (action === "pause" && targetTask.status === "running") {
       nextStatus = "queued";
       nextLog = "Pausada por el usuario.";
-      milestone = `Tarea #tsk-${taskId} pausada.`;
-    } else if (
-      action === "cancel" &&
-      (targetTask.status === "running" ||
-        targetTask.status === "queued" ||
-        targetTask.status === "gatekeeper_blocked")
-    ) {
-      nextStatus = "failed";
-      nextLog = "Cancelada por el usuario.";
-      milestone = `Tarea #tsk-${taskId} cancelada.`;
+      milestone = `Tarea ${taskId} pausada.`;
     } else {
       return;
     }
@@ -1337,6 +1355,7 @@ export class DesktopAppController {
         : snap.onboarding_required === false
           ? false
           : Boolean(this.#model.onboardingOpen);
+    const nextOverview = this.#resolveOverviewFromSnapshot(snap);
     this.#updateModel({
       status: nextStatus,
       voiceEnabled: snap.voice_enabled,
@@ -1348,7 +1367,56 @@ export class DesktopAppController {
       availableWorkspaces: snap.available_workspaces,
       pendingApprovals: snap.pending_approvals,
       messages: capped,
+      agentsOverview: nextOverview,
       errorBanner: null,
+    });
+  }
+
+  #resolveOverviewFromSnapshot(snap: UiStateSnapshot): UiAgentsOverview {
+    if (snap.agents_overview) {
+      return snap.agents_overview;
+    }
+    const base =
+      this.#model.agentsOverview ??
+      getDefaultAgentsOverview(snap.active_workspace?.canonical_path);
+    if (Array.isArray(snap.tasks)) {
+      return this.#recomputeOverviewSlots(base, snap.tasks);
+    }
+    return base;
+  }
+
+  #recomputeOverviewSlots(
+    base: UiAgentsOverview,
+    tasks: readonly UiAgentTask[],
+  ): UiAgentsOverview {
+    const updatedSlots = base.poolSlots.map((slot) => {
+      const activeForTier = tasks.filter(
+        (t) => t.tier === slot.tier && (t.status === "running" || t.status === "gatekeeper_blocked"),
+      ).length;
+      return {
+        ...slot,
+        activeSlots: activeForTier,
+        status: activeForTier > 0 ? ("active" as const) : ("idle" as const),
+      };
+    });
+    return {
+      ...base,
+      poolSlots: updatedSlots,
+      tasks,
+    };
+  }
+
+  #upsertTaskInOverview(task: UiAgentTask, milestone?: string): void {
+    const overview =
+      this.#model.agentsOverview ??
+      getDefaultAgentsOverview(this.#model.activeWorkspace?.canonical_path);
+    const exists = overview.tasks.some((t) => t.id === task.id);
+    const updatedTasks = exists
+      ? overview.tasks.map((t) => (t.id === task.id ? task : t))
+      : [task, ...overview.tasks].slice(0, 100);
+    this.#updateModel({
+      agentsOverview: this.#recomputeOverviewSlots(overview, updatedTasks),
+      ...(milestone ? { lastMilestone: milestone } : {}),
     });
   }
 
@@ -1535,6 +1603,39 @@ export class DesktopAppController {
     if (env.event_type === "settings_updated") {
       if (this.#model.settingsDrawerOpen) {
         void this.openSettingsDrawer();
+      }
+      return;
+    }
+
+    if (env.event_type === "task_created" || env.event_type === "task_state_changed") {
+      const nextOverview = p["agents_overview"] as UiAgentsOverview | undefined;
+      const task = p["task"] as UiAgentTask | undefined;
+      if (nextOverview && Array.isArray(nextOverview.tasks)) {
+        this.#updateModel({ agentsOverview: nextOverview });
+      } else if (task && task.id) {
+        this.#upsertTaskInOverview(task);
+      }
+      return;
+    }
+
+    if (env.event_type === "task_progress") {
+      const task = p["task"] as UiAgentTask | undefined;
+      if (task && task.id) {
+        this.#upsertTaskInOverview(task);
+        return;
+      }
+      const taskId = String(p["task_id"] ?? "");
+      const lastLog = String(p["last_log"] ?? "");
+      if (taskId && lastLog) {
+        const overview =
+          this.#model.agentsOverview ??
+          getDefaultAgentsOverview(this.#model.activeWorkspace?.canonical_path);
+        const updatedTasks = overview.tasks.map((t) =>
+          t.id === taskId ? { ...t, lastLog } : t,
+        );
+        this.#updateModel({
+          agentsOverview: { ...overview, tasks: updatedTasks },
+        });
       }
       return;
     }

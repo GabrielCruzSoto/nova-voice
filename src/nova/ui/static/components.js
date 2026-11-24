@@ -1317,6 +1317,11 @@ const TASK_STATUS_META = {
         icon: "✕",
         cssClass: "status--failed",
     },
+    cancelled: {
+        label: "Cancelada",
+        icon: "⊘",
+        cssClass: "status--cancelled",
+    },
 };
 export function renderAgentsMatrixView(model) {
     const overview = model.agentsOverview ?? getDefaultAgentsOverview(model.activeWorkspace?.canonical_path);
@@ -1406,11 +1411,12 @@ export function renderAgentsMatrixView(model) {
                     : ""}
                 </div>
               `;
+            const displayTaskId = task.id.startsWith("tsk-") ? `#${task.id}` : `#tsk-${task.id}`;
             return `
               <article class="nova-task-card ${meta.cssClass}" data-task-id="${escapeHtml(task.id)}" data-task-status="${escapeHtml(task.status)}">
                 <div class="nova-task-card-header">
                   <div class="nova-task-title-group">
-                    <span class="nova-task-id">#tsk-${escapeHtml(task.id)}</span>
+                    <span class="nova-task-id">${escapeHtml(displayTaskId)}</span>
                     <h3 class="nova-task-title">${escapeHtml(task.title)}</h3>
                   </div>
                   <span class="nova-task-status-pill ${meta.cssClass}">

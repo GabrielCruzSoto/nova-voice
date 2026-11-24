@@ -3311,5 +3311,193 @@ test("NOVA-018 AC-9: sleep timer runs only in listening (never thinking/executin
   }
 });
 
+test("NOVA-020 AC-10: hydrates tasks from snapshot, applies task_* SSE events, and cancels via POST /api/tasks/{id}/cancel", async () => {
+  const { DesktopAppController } = await import("../static/controller.js");
+  const { renderAgentsMatrixView } = await import("../static/components.js");
+  const enc = new TextEncoder();
+  let sseController = null;
+  const cancelCalls = [];
+
+  const mockFetch = async (url, init = {}) => {
+    if (url === "/api/state") {
+      return new Response(
+        JSON.stringify({
+          schema_version: "1.3.0",
+          csrf_token: "csrf-nova020",
+          voice_enabled: true,
+          onboarding_required: false,
+          call_session: { call_id: "call-20", state: "standby", turn_count: 0, active_correlation_id: null },
+          active_workspace: { display_name: "alpha", canonical_path: "/ws/alpha", selected_via: "exact_path" },
+          available_workspaces: [],
+          pending_approvals: [],
+          messages: [],
+          tasks: [
+            {
+              id: "tsk-init-1",
+              task_id: "tsk-init-1",
+              title: "Initial queued job",
+              workspace: "/ws/alpha",
+              tier: "tier2_agy",
+              provider: "claude",
+              agentName: "Claude Code",
+              status: "queued",
+              lastLog: "En cola.",
+            },
+          ],
+          agents_overview: {
+            daemonStatus: "connected",
+            poolSlots: [
+              { name: "Tier 1: Conversacional", tier: "tier1_pi", activeSlots: 0, maxSlots: 1, status: "idle" },
+              { name: "Tier 2: Workers Asíncronos", tier: "tier2_agy", activeSlots: 0, maxSlots: 4, status: "idle" },
+            ],
+            tasks: [
+              {
+                id: "tsk-init-1",
+                task_id: "tsk-init-1",
+                title: "Initial queued job",
+                workspace: "/ws/alpha",
+                tier: "tier2_agy",
+                provider: "claude",
+                agentName: "Claude Code",
+                status: "queued",
+                lastLog: "En cola.",
+              },
+            ],
+          },
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      );
+    }
+    if (url === "/api/health") {
+      return new Response(JSON.stringify({ all_ok: true, components: [] }), { status: 200 });
+    }
+    if (url === "/api/models/status") {
+      return new Response(JSON.stringify({ status: "idle", all_installed: true, models: [] }), { status: 200 });
+    }
+    if (url === "/api/events") {
+      const stream = new ReadableStream({
+        start(controller) {
+          sseController = controller;
+        },
+      });
+      return new Response(stream, { status: 200, headers: { "Content-Type": "text/event-stream" } });
+    }
+    if (url === "/api/tasks/tsk-live-2/cancel" && init.method === "POST") {
+      cancelCalls.push({ url, csrf: init.headers?.["X-Nova-CSRF"] });
+      return new Response(
+        JSON.stringify({
+          task: {
+            id: "tsk-live-2",
+            task_id: "tsk-live-2",
+            title: "Live OpenCode task",
+            workspace: "/ws/alpha",
+            tier: "tier2_agy",
+            provider: "opencode",
+            agentName: "OpenCode",
+            status: "cancelled",
+            lastLog: "Cancelada por el usuario.",
+          },
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      );
+    }
+    return new Response(JSON.stringify({ ok: true }), { status: 200 });
+  };
+
+  const ctrl = new DesktopAppController({ fetchImpl: mockFetch });
+  try {
+    await ctrl.start();
+    assert.equal(ctrl.model.agentsOverview.tasks.length, 1);
+    assert.equal(ctrl.model.agentsOverview.tasks[0].id, "tsk-init-1");
+    assert.equal(ctrl.model.agentsOverview.tasks[0].agentName, "Claude Code");
+
+    const emitSse = async (eventType, payload, seq) => {
+      const frame = `event: nova_event\ndata: ${JSON.stringify({
+        seq,
+        event_type: eventType,
+        correlation_id: "c-20",
+        timestamp: "2026-11-23T23:40:00Z",
+        payload,
+      })}\n\n`;
+      sseController.enqueue(enc.encode(frame));
+      await new Promise((r) => setTimeout(r, 15));
+    };
+
+    await emitSse(
+      "task_created",
+      {
+        task: {
+          id: "tsk-live-2",
+          task_id: "tsk-live-2",
+          title: "Live OpenCode task",
+          workspace: "/ws/alpha",
+          tier: "tier2_agy",
+          provider: "opencode",
+          agentName: "OpenCode",
+          status: "running",
+          lastLog: "Iniciando...",
+        },
+        agents_overview: {
+          daemonStatus: "connected",
+          poolSlots: [
+            { name: "Tier 1: Conversacional", tier: "tier1_pi", activeSlots: 0, maxSlots: 1, status: "idle" },
+            { name: "Tier 2: Workers Asíncronos", tier: "tier2_agy", activeSlots: 1, maxSlots: 4, status: "active" },
+          ],
+          tasks: [
+            {
+              id: "tsk-live-2",
+              task_id: "tsk-live-2",
+              title: "Live OpenCode task",
+              workspace: "/ws/alpha",
+              tier: "tier2_agy",
+              provider: "opencode",
+              agentName: "OpenCode",
+              status: "running",
+              lastLog: "Iniciando...",
+            },
+          ],
+        },
+      },
+      1,
+    );
+    assert.equal(ctrl.model.agentsOverview.tasks[0].id, "tsk-live-2");
+    assert.equal(ctrl.model.agentsOverview.poolSlots[1].activeSlots, 1);
+
+    await emitSse(
+      "task_progress",
+      {
+        task_id: "tsk-live-2",
+        step_type: "editing",
+        last_log: "Aplicando cambios <script>bad</script>",
+      },
+      2,
+    );
+    assert.equal(ctrl.model.agentsOverview.tasks[0].lastLog, "Aplicando cambios <script>bad</script>");
+
+    await ctrl.handleAgentTaskAction("tsk-live-2", "inspect");
+    assert.ok(ctrl.model.lastMilestone?.includes("#tsk-live-2"), "F18: inspect toast shows #tsk-live-2");
+    assert.ok(!ctrl.model.lastMilestone?.includes("#tsk-tsk-"), "F18: no duplicate #tsk-tsk- prefix");
+
+    await ctrl.handleAgentTaskAction("tsk-live-2", "cancel");
+    assert.equal(cancelCalls.length, 1);
+    assert.equal(cancelCalls[0].csrf, "csrf-nova020");
+    assert.equal(ctrl.model.agentsOverview.tasks[0].status, "cancelled");
+
+    const rendered = renderAgentsMatrixView(ctrl.model);
+    assert.ok(rendered.includes("Cancelada"));
+    assert.ok(!rendered.includes("<script>bad</script>"));
+
+    const css = fs.readFileSync(path.join(STATIC_DIR, "styles.css"), "utf8");
+    assert.match(css, /\.nova-task-card\.status--cancelled\b/, "F17: cancelled task card CSS");
+    assert.match(css, /\.nova-task-status-pill\.status--cancelled\b/, "F17: cancelled status pill CSS");
+
+    ctrl.dispose();
+  } finally {
+    if (sseController) {
+      sseController.close();
+    }
+  }
+});
+
 
 

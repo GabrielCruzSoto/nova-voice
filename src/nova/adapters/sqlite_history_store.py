@@ -13,11 +13,22 @@ from pathlib import Path
 from nova.domain.models import (
     AgentEngineId,
     AgentSessionPointer,
+    AgentTaskRecord,
     AgentTier,
     PersistedChatMessage,
+    TaskStatus,
     WorkspaceSessionPointer,
 )
-from nova.domain.ports import HistoryStorePort
+from nova.domain.ports import HistoryStorePort, TaskStorePort
+
+MAX_TASK_QUERY_LIMIT = 200
+
+_TASK_COLUMNS = (
+    "task_id, correlation_id, workspace_canonical_path, workspace_name, "
+    "provider, model, tier, objective, status, result_summary, last_log, "
+    "error_code, error_message, pending_audit_id, conversation_id, "
+    "created_at, started_at, updated_at, completed_at"
+)
 
 _SCHEMA_DDL = """
 PRAGMA journal_mode = WAL;
@@ -56,6 +67,37 @@ CREATE TABLE IF NOT EXISTS workspace_agent_sessions (
 
 CREATE INDEX IF NOT EXISTS idx_workspace_agent_sessions_ws
     ON workspace_agent_sessions(workspace_canonical_path);
+
+CREATE TABLE IF NOT EXISTS tasks (
+    task_id TEXT PRIMARY KEY,
+    correlation_id TEXT NOT NULL,
+    workspace_canonical_path TEXT NOT NULL,
+    workspace_name TEXT NOT NULL,
+    provider TEXT NOT NULL,
+    model TEXT NOT NULL,
+    tier TEXT NOT NULL DEFAULT 'tier2',
+    objective TEXT NOT NULL,
+    status TEXT NOT NULL,
+    result_summary TEXT,
+    last_log TEXT,
+    error_code TEXT,
+    error_message TEXT,
+    pending_audit_id TEXT,
+    conversation_id TEXT,
+    created_at REAL NOT NULL,
+    started_at REAL,
+    updated_at REAL NOT NULL,
+    completed_at REAL
+);
+
+CREATE INDEX IF NOT EXISTS idx_tasks_status_updated
+    ON tasks(status, updated_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_tasks_workspace_created
+    ON tasks(workspace_canonical_path, created_at DESC);
+
+CREATE INDEX IF NOT EXISTS idx_tasks_created_at
+    ON tasks(created_at DESC);
 """
 
 _MIGRATE_LEGACY_SESSIONS_SQL = """
@@ -83,7 +125,7 @@ def resolve_default_history_db_path(env: Mapping[str, str] | None = None) -> Pat
     return base_dir / "nova" / "history.db"
 
 
-class SqliteHistoryStore(HistoryStorePort):
+class SqliteHistoryStore(HistoryStorePort, TaskStorePort):
     """Thread-safe SQLite adapter with WAL mode and 0600 file permissions."""
 
     def __init__(self, db_path: Path | str | None = None) -> None:
@@ -342,6 +384,207 @@ class SqliteHistoryStore(HistoryStorePort):
                 session_id=row["session_id"],
                 updated_at=row["updated_at"],
             )
+
+    @staticmethod
+    def _row_to_task(row: sqlite3.Row) -> AgentTaskRecord:
+        return AgentTaskRecord(
+            task_id=row["task_id"],
+            correlation_id=row["correlation_id"],
+            workspace_canonical_path=row["workspace_canonical_path"],
+            workspace_name=row["workspace_name"],
+            provider=row["provider"],
+            model=row["model"],
+            tier=row["tier"],
+            objective=row["objective"],
+            status=row["status"],
+            result_summary=row["result_summary"],
+            last_log=row["last_log"],
+            error_code=row["error_code"],
+            error_message=row["error_message"],
+            pending_audit_id=row["pending_audit_id"],
+            conversation_id=row["conversation_id"],
+            created_at=row["created_at"],
+            started_at=row["started_at"],
+            updated_at=row["updated_at"],
+            completed_at=row["completed_at"],
+        )
+
+    async def upsert_task(self, task: AgentTaskRecord) -> None:
+        """Persist or update a managed asynchronous task record (NOVA-020)."""
+        await asyncio.to_thread(self._upsert_task_sync, task)
+
+    def _upsert_task_sync(self, task: AgentTaskRecord) -> None:
+        conn = self._ensure_initialized()
+        with self._lock:
+            conn.execute(
+                """
+                INSERT INTO tasks (
+                    task_id, correlation_id, workspace_canonical_path, workspace_name,
+                    provider, model, tier, objective, status, result_summary, last_log,
+                    error_code, error_message, pending_audit_id, conversation_id,
+                    created_at, started_at, updated_at, completed_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(task_id) DO UPDATE SET
+                    correlation_id = excluded.correlation_id,
+                    workspace_canonical_path = excluded.workspace_canonical_path,
+                    workspace_name = excluded.workspace_name,
+                    provider = excluded.provider,
+                    model = excluded.model,
+                    tier = excluded.tier,
+                    objective = excluded.objective,
+                    status = excluded.status,
+                    result_summary = excluded.result_summary,
+                    last_log = excluded.last_log,
+                    error_code = excluded.error_code,
+                    error_message = excluded.error_message,
+                    pending_audit_id = excluded.pending_audit_id,
+                    conversation_id = excluded.conversation_id,
+                    started_at = excluded.started_at,
+                    updated_at = excluded.updated_at,
+                    completed_at = excluded.completed_at
+                """,
+                (
+                    task.task_id,
+                    task.correlation_id,
+                    task.workspace_canonical_path,
+                    task.workspace_name,
+                    task.provider,
+                    task.model,
+                    task.tier,
+                    task.objective,
+                    task.status,
+                    task.result_summary,
+                    task.last_log,
+                    task.error_code,
+                    task.error_message,
+                    task.pending_audit_id,
+                    task.conversation_id,
+                    task.created_at,
+                    task.started_at,
+                    task.updated_at,
+                    task.completed_at,
+                ),
+            )
+            conn.commit()
+
+    async def get_task(self, task_id: str) -> AgentTaskRecord | None:
+        """Fetch a single persisted task record by task_id (NOVA-020)."""
+        return await asyncio.to_thread(self._get_task_sync, task_id)
+
+    def _get_task_sync(self, task_id: str) -> AgentTaskRecord | None:
+        conn = self._ensure_initialized()
+        with self._lock:
+            row = conn.execute(
+                f"SELECT {_TASK_COLUMNS} FROM tasks WHERE task_id = ?",
+                (task_id,),
+            ).fetchone()
+            if row is None:
+                return None
+            return self._row_to_task(row)
+
+    async def list_tasks(
+        self,
+        *,
+        limit: int = 50,
+        status: TaskStatus | None = None,
+        workspace_path: str | None = None,
+    ) -> list[AgentTaskRecord]:
+        """Return bounded recent tasks ordered newest-first using explicit indexes (NOVA-020)."""
+        return await asyncio.to_thread(
+            self._list_tasks_sync,
+            limit,
+            status,
+            workspace_path,
+        )
+
+    def _list_tasks_sync(
+        self,
+        limit: int,
+        status: TaskStatus | None,
+        workspace_path: str | None,
+    ) -> list[AgentTaskRecord]:
+        bounded_limit = min(max(1, limit), MAX_TASK_QUERY_LIMIT)
+        conn = self._ensure_initialized()
+        with self._lock:
+            if status is not None and workspace_path is not None:
+                rows = conn.execute(
+                    f"""
+                    SELECT {_TASK_COLUMNS}
+                    FROM tasks
+                    WHERE workspace_canonical_path = ? AND status = ?
+                    ORDER BY created_at DESC
+                    LIMIT ?
+                    """,
+                    (workspace_path, status, bounded_limit),
+                ).fetchall()
+            elif workspace_path is not None:
+                rows = conn.execute(
+                    f"""
+                    SELECT {_TASK_COLUMNS}
+                    FROM tasks
+                    WHERE workspace_canonical_path = ?
+                    ORDER BY created_at DESC
+                    LIMIT ?
+                    """,
+                    (workspace_path, bounded_limit),
+                ).fetchall()
+            elif status is not None:
+                rows = conn.execute(
+                    f"""
+                    SELECT {_TASK_COLUMNS}
+                    FROM tasks
+                    WHERE status = ?
+                    ORDER BY updated_at DESC
+                    LIMIT ?
+                    """,
+                    (status, bounded_limit),
+                ).fetchall()
+            else:
+                rows = conn.execute(
+                    f"""
+                    SELECT {_TASK_COLUMNS}
+                    FROM tasks
+                    ORDER BY created_at DESC
+                    LIMIT ?
+                    """,
+                    (bounded_limit,),
+                ).fetchall()
+            return [self._row_to_task(row) for row in rows]
+
+    async def reconcile_interrupted_tasks(
+        self,
+        *,
+        updated_at: float,
+        reason: str = "DAEMON_RESTARTED",
+    ) -> int:
+        """Mark leftover non-terminal tasks as failed on daemon startup (NOVA-020 AC-9)."""
+        return await asyncio.to_thread(self._reconcile_interrupted_tasks_sync, updated_at, reason)
+
+    def _reconcile_interrupted_tasks_sync(self, updated_at: float, reason: str) -> int:
+        conn = self._ensure_initialized()
+        with self._lock:
+            cursor = conn.execute(
+                """
+                UPDATE tasks
+                SET status = 'failed',
+                    error_code = ?,
+                    error_message = ?,
+                    last_log = ?,
+                    pending_audit_id = NULL,
+                    updated_at = ?,
+                    completed_at = COALESCE(completed_at, ?)
+                WHERE status IN ('queued', 'running', 'waiting_approval')
+                """,
+                (
+                    reason,
+                    "Task interrupted by daemon restart.",
+                    "Interrumpida por reinicio del daemon.",
+                    updated_at,
+                    updated_at,
+                ),
+            )
+            conn.commit()
+            return int(cursor.rowcount)
 
     async def close(self) -> None:
         """Flush and release SQLite database connection."""

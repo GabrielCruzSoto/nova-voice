@@ -63,7 +63,8 @@ def main() -> int:
     effective_cwd = _extract_cwd(parsed_stdin, tool_input)
 
     source = os.environ.get("NOVA_GATEKEEPER_SOURCE", "tier2_claude").strip() or "tier2_claude"
-    ipc_request = {
+    task_id = os.environ.get("NOVA_TASK_ID", "").strip() or None
+    ipc_request: dict[str, Any] = {
         "protocol_version": "1.0",
         "token": os.environ.get("NOVA_GATEKEEPER_TOKEN", ""),
         "correlation_id": f"corr-{uuid.uuid4()}",
@@ -72,6 +73,8 @@ def main() -> int:
         "command": command_line,
         "cwd": effective_cwd,
     }
+    if task_id:
+        ipc_request["task_id"] = task_id
 
     try:
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:

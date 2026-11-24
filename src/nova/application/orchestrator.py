@@ -17,10 +17,13 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from nova.application.action_directive import ActionDirectiveStreamFilter
+from nova.application.task_manager import TaskManager
 from nova.application.voice_intent import classify_confirmation_response
 from nova.domain.errors import (
     GatekeeperError,
     NovaDomainError,
+    TaskManagerError,
     redact_sensitive_text,
 )
 from nova.domain.events import (
@@ -33,11 +36,14 @@ from nova.domain.events import (
 )
 from nova.domain.models import (
     MAX_SPEECH_CHUNK_CHARS,
+    TERMINAL_TASK_STATUSES,
     AgentEngineId,
     AgentSessionPointer,
+    AgentTaskRecord,
     CodingTaskRequest,
     PendingVoiceTask,
     ResolveWorkspaceRequest,
+    Tier1ActionDirective,
     WorkspaceContext,
     WorkspaceQueryMode,
     WorkspaceSessionPointer,
@@ -381,6 +387,7 @@ class NovaOrchestrator:
         settings: OrchestratorSettings | None = None,
         security_gatekeeper: SecurityGatekeeperPort | None = None,
         history_store: HistoryStorePort | None = None,
+        task_manager: TaskManager | None = None,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self._workspace_resolver = workspace_resolver
@@ -390,12 +397,18 @@ class NovaOrchestrator:
         self._settings = settings or OrchestratorSettings()
         self._security_gatekeeper = security_gatekeeper
         self._history_store = history_store
+        self._task_manager = task_manager
         self._clock = clock
         self._tier2_conversations: dict[str, str] = {}
         self._pending_voice_task: PendingVoiceTask | None = None
         self._turn_lock = asyncio.Lock()
         self._active_turn_task: asyncio.Task[None] | None = None
         self._barge_in_cancelled: weakref.WeakSet[asyncio.Task[None]] = weakref.WeakSet()
+
+    @property
+    def task_manager(self) -> TaskManager | None:
+        """Return attached asynchronous TaskManager, if configured (NOVA-020)."""
+        return self._task_manager
 
     def _prune_expired_voice_task(self) -> PendingVoiceTask | None:
         task = self._pending_voice_task
@@ -428,9 +441,12 @@ class NovaOrchestrator:
     def update_models(self, *, tier2_model: str | None = None) -> None:
         """Hot-update default Tier 2 model for future delegations."""
         if tier2_model is not None and tier2_model.strip():
+            cleaned = tier2_model.strip()
             self._settings = self._settings.model_copy(
-                update={"default_tier2_model": tier2_model.strip()}
+                update={"default_tier2_model": cleaned}
             )
+            if self._task_manager is not None:
+                self._task_manager.update_defaults(default_model=cleaned)
 
     def update_engines(
         self,
@@ -455,6 +471,11 @@ class NovaOrchestrator:
             updates["default_tier2_model"] = tier2_model.strip()
         if updates:
             self._settings = self._settings.model_copy(update=updates)
+        if self._task_manager is not None:
+            self._task_manager.update_defaults(
+                default_provider=tier2_engine,
+                default_model=tier2_model,
+            )
 
     def _extra_secrets(self) -> tuple[str, ...]:
         if self._security_gatekeeper is None:
@@ -686,7 +707,15 @@ class NovaOrchestrator:
                     redacted_draft = self._redact(decision.cleaned_text).strip()
                     if not redacted_draft:
                         return
-                    if active_ws is None and classify_complexity(redacted_draft) == "high":
+                    needs_ws_block = (
+                        active_ws is None
+                        and (
+                            _DELEGATE_MARKER_RE.search(redacted_draft) is not None
+                            if self._task_manager is not None
+                            else classify_complexity(redacted_draft) == "high"
+                        )
+                    )
+                    if needs_ws_block:
                         self._log(
                             "utterance_blocked_no_workspace",
                             correlation_id=corr_id,
@@ -865,12 +894,16 @@ class NovaOrchestrator:
                 )
 
             if active_ws is None:
-                tier = classify_complexity(effective_utterance)
-                if tier == "high":
+                block_no_ws = (
+                    _DELEGATE_MARKER_RE.search(effective_utterance) is not None
+                    if self._task_manager is not None
+                    else classify_complexity(effective_utterance) == "high"
+                )
+                if block_no_ws:
                     self._log(
                         "utterance_blocked_no_workspace",
                         correlation_id=corr_id,
-                        tier=tier,
+                        tier="high",
                     )
                     await self._event_bus.publish(
                         VoiceMilestoneEvent(
@@ -979,6 +1012,53 @@ class NovaOrchestrator:
         *,
         speak_full_response: bool = False,
     ) -> None:
+        if self._task_manager is not None:
+            if _DELEGATE_MARKER_RE.search(utterance) is not None:
+                cleaned_prompt = _DELEGATE_MARKER_RE.sub("", utterance).strip() or utterance.strip()
+                self._log(
+                    "utterance_routed",
+                    correlation_id=corr_id,
+                    tier="high_async",
+                    workspace_name=active_ws.name,
+                )
+                try:
+                    task = await self._task_manager.dispatch_task(
+                        workspace_canonical_path=active_ws.canonical_path,
+                        workspace_name=active_ws.name,
+                        objective=cleaned_prompt,
+                        provider=self._settings.tier2_engine,
+                        model=self._settings.default_tier2_model,
+                        correlation_id=corr_id,
+                    )
+                    ack = (
+                        f"Listo, mandé la tarea {task.task_id} a {task.provider} "
+                        f"en {task.workspace_name}. Te aviso cuando termine."
+                    )
+                    await self._emit_orchestrator_reply(
+                        ack,
+                        correlation_id=corr_id,
+                        speak_full_response=speak_full_response,
+                    )
+                except NovaDomainError as exc:
+                    await self._publish_domain_failure(exc, corr_id)
+                return
+
+            self._log(
+                "utterance_routed",
+                correlation_id=corr_id,
+                tier="tier1_structured",
+                workspace_name=active_ws.name,
+            )
+            try:
+                await self._run_tier1(
+                    utterance,
+                    corr_id,
+                    speak_full_response=speak_full_response,
+                )
+            except NovaDomainError as exc:
+                await self._publish_domain_failure(exc, corr_id)
+            return
+
         tier = classify_complexity(utterance)
         self._log(
             "utterance_routed",
@@ -1001,30 +1081,84 @@ class NovaOrchestrator:
                     speak_full_response=speak_full_response,
                 )
         except NovaDomainError as exc:
-            redacted_err = self._redact(exc.sanitized_message)
-            self._log(
-                "runner_failure",
+            await self._publish_domain_failure(exc, corr_id)
+
+    async def _publish_domain_failure(self, exc: NovaDomainError, corr_id: str) -> None:
+        redacted_err = self._redact(exc.sanitized_message)
+        self._log(
+            "runner_failure",
+            correlation_id=corr_id,
+            error_code=exc.code,
+            message=redacted_err,
+        )
+        await self._event_bus.publish(
+            RunnerFailureEvent(
                 correlation_id=corr_id,
                 error_code=exc.code,
-                message=redacted_err,
+                sanitized_message=redacted_err,
+                recoverable=True,
             )
-            await self._event_bus.publish(
-                RunnerFailureEvent(
-                    correlation_id=corr_id,
-                    error_code=exc.code,
-                    sanitized_message=redacted_err,
-                    recoverable=True,
+        )
+        await self._event_bus.publish(
+            VoiceMilestoneEvent(
+                correlation_id=corr_id,
+                summary_text=(
+                    "Ocurrio un problema al ejecutar la tarea. Revisa el detalle en el chat."
+                ),
+                priority="interrupt",
+            )
+        )
+
+    async def _emit_orchestrator_reply(
+        self,
+        message: str,
+        *,
+        correlation_id: str,
+        speak_full_response: bool,
+        start_chunk_index: int = 0,
+    ) -> int:
+        redacted = self._redact(message)
+        await self._event_bus.publish(
+            ChatStreamEvent(
+                correlation_id=correlation_id,
+                delta=redacted,
+                source="tier1_pi",
+                step_type="agent_response",
+            )
+        )
+        if speak_full_response:
+            chunks = VoiceSentenceStreamSplitter.split_text(
+                redacted,
+                extra_secrets=self._extra_secrets(),
+            )
+            if not chunks:
+                chunks = ["Operación completada."]
+            last_idx = len(chunks) - 1
+            chunk_idx = start_chunk_index
+            for idx, chunk in enumerate(chunks):
+                await self._event_bus.publish(
+                    VoiceSpeechChunkEvent(
+                        correlation_id=correlation_id,
+                        text=chunk,
+                        chunk_index=chunk_idx,
+                        is_final=(idx == last_idx),
+                        priority="normal",
+                    )
                 )
+                chunk_idx += 1
+            return chunk_idx
+        await self._event_bus.publish(
+            VoiceMilestoneEvent(
+                correlation_id=correlation_id,
+                summary_text=sanitize_for_voice(
+                    redacted,
+                    fallback="Listo.",
+                    extra_secrets=self._extra_secrets(),
+                ),
+                priority="normal",
             )
-            await self._event_bus.publish(
-                VoiceMilestoneEvent(
-                    correlation_id=corr_id,
-                    summary_text=(
-                        "Ocurrio un problema al ejecutar la tarea. Revisa el detalle en el chat."
-                    ),
-                    priority="interrupt",
-                )
-            )
+        )
+        return start_chunk_index
 
     async def barge_in(self) -> None:
         """Interrupt active speech/agent turn immediately on user voice activity."""
@@ -1066,36 +1200,56 @@ class NovaOrchestrator:
         speak_full_response: bool = False,
     ) -> None:
         collected: list[str] = []
+        directive_filter = (
+            ActionDirectiveStreamFilter(extra_secrets=self._extra_secrets())
+            if self._task_manager is not None
+            else None
+        )
         splitter = (
             VoiceSentenceStreamSplitter(extra_secrets=self._extra_secrets())
             if speak_full_response
             else None
         )
         chunk_index = 0
+
+        async def _emit_visible(text: str) -> None:
+            nonlocal chunk_index
+            if not text:
+                return
+            collected.append(text)
+            await self._event_bus.publish(
+                ChatStreamEvent(
+                    correlation_id=correlation_id,
+                    delta=text,
+                    source="tier1_pi",
+                    step_type="agent_response",
+                )
+            )
+            if splitter is not None:
+                for ready_chunk in splitter.feed(text):
+                    await self._event_bus.publish(
+                        VoiceSpeechChunkEvent(
+                            correlation_id=correlation_id,
+                            text=ready_chunk,
+                            chunk_index=chunk_index,
+                            is_final=False,
+                            priority="normal",
+                        )
+                    )
+                    chunk_index += 1
+
         async with _closing_async_iter(self._tier1_client.stream_prompt(utterance)) as stream:
             async for delta in stream:
                 redacted_delta = self._redact(delta)
-                collected.append(redacted_delta)
-                await self._event_bus.publish(
-                    ChatStreamEvent(
-                        correlation_id=correlation_id,
-                        delta=redacted_delta,
-                        source="tier1_pi",
-                        step_type="agent_response",
-                    )
+                visible = (
+                    directive_filter.feed(redacted_delta)
+                    if directive_filter is not None
+                    else redacted_delta
                 )
-                if splitter is not None:
-                    for ready_chunk in splitter.feed(redacted_delta):
-                        await self._event_bus.publish(
-                            VoiceSpeechChunkEvent(
-                                correlation_id=correlation_id,
-                                text=ready_chunk,
-                                chunk_index=chunk_index,
-                                is_final=False,
-                                priority="normal",
-                            )
-                        )
-                        chunk_index += 1
+                await _emit_visible(visible)
+
+        if directive_filter is not None:
+            await _emit_visible(directive_filter.flush())
 
         joined = "".join(collected)
         active_ws = self._workspace_resolver.active_context
@@ -1134,6 +1288,45 @@ class NovaOrchestrator:
                         )
                     )
 
+        directives = directive_filter.directives if directive_filter is not None else ()
+        if directives and self._task_manager is not None:
+            if splitter is not None:
+                for chunk in splitter.flush():
+                    await self._event_bus.publish(
+                        VoiceSpeechChunkEvent(
+                            correlation_id=correlation_id,
+                            text=chunk,
+                            chunk_index=chunk_index,
+                            is_final=False,
+                            priority="normal",
+                        )
+                    )
+                    chunk_index += 1
+            summaries = await self._execute_tier1_directives(
+                directives,
+                active_ws=active_ws,
+                correlation_id=correlation_id,
+            )
+            combined_reply = " ".join(s for s in summaries if s).strip()
+            if combined_reply:
+                await self._emit_orchestrator_reply(
+                    combined_reply,
+                    correlation_id=correlation_id,
+                    speak_full_response=speak_full_response,
+                    start_chunk_index=chunk_index,
+                )
+            elif splitter is not None:
+                await self._event_bus.publish(
+                    VoiceSpeechChunkEvent(
+                        correlation_id=correlation_id,
+                        text="Listo.",
+                        chunk_index=chunk_index,
+                        is_final=True,
+                        priority="normal",
+                    )
+                )
+            return
+
         if splitter is not None:
             tail = splitter.flush()
             if not tail:
@@ -1165,6 +1358,170 @@ class NovaOrchestrator:
                 ),
                 priority="normal",
             )
+        )
+
+    @staticmethod
+    def _is_home_workspace_hint(hint: str) -> bool:
+        cleaned = hint.strip()
+        if cleaned in ("~", "~/", "$HOME", "${HOME}"):
+            return True
+        try:
+            home_dir = Path.home().resolve()
+            expanded = Path(cleaned).expanduser()
+            if expanded.is_absolute() and expanded.resolve() == home_dir:
+                return True
+        except OSError:
+            return False
+        return False
+
+    async def _resolve_directive_workspace(
+        self,
+        workspace_hint: str | None,
+        active_ws: WorkspaceContext | None,
+    ) -> tuple[str, str] | None:
+        hint = (workspace_hint or "").strip()
+        if hint:
+            if await asyncio.to_thread(self._is_home_workspace_hint, hint):
+                raise TaskManagerError(
+                    code="WORKSPACE_HOME_FORBIDDEN",
+                    message="Home directory cannot be used as a task workspace.",
+                )
+            hint_lower = hint.lower()
+            list_entries = getattr(self._workspace_resolver, "list_workspace_entries", None)
+            if callable(list_entries):
+                entries = await list_entries()
+                for entry in entries:
+                    if hint_lower in (entry.name.lower(), entry.canonical_path.lower()):
+                        return entry.canonical_path, entry.name
+            list_avail = getattr(self._workspace_resolver, "list_available_workspaces", None)
+            if callable(list_avail):
+                pairs = await list_avail()
+                for name, canonical in pairs:
+                    if hint_lower in (name.lower(), canonical.lower()):
+                        return canonical, name
+            if active_ws is not None and hint_lower in (
+                active_ws.name.lower(),
+                active_ws.canonical_path.lower(),
+            ):
+                return active_ws.canonical_path, active_ws.name
+            raise TaskManagerError(
+                code="WORKSPACE_NOT_FOUND",
+                message=f"Workspace '{self._redact(hint)}' was not found in allowed workspaces.",
+            )
+        if active_ws is not None:
+            return active_ws.canonical_path, active_ws.name
+        return None
+
+    async def _execute_tier1_directives(
+        self,
+        directives: tuple[Tier1ActionDirective, ...],
+        *,
+        active_ws: WorkspaceContext | None,
+        correlation_id: str,
+    ) -> list[str]:
+        assert self._task_manager is not None
+        summaries: list[str] = []
+        for directive in directives:
+            try:
+                if directive.action == "dispatch_task":
+                    target_ws = await self._resolve_directive_workspace(
+                        directive.workspace_hint,
+                        active_ws,
+                    )
+                    if target_ws is None:
+                        self._log(
+                            "utterance_blocked_no_workspace",
+                            correlation_id=correlation_id,
+                            tier="dispatch_task",
+                        )
+                        summaries.append(
+                            "Para despachar tareas de código, primero selecciona "
+                            "un proyecto en pantalla."
+                        )
+                        continue
+                    ws_path, ws_name = target_ws
+                    target_provider = directive.provider_hint or self._settings.tier2_engine
+                    target_model = (
+                        directive.model_hint
+                        if directive.model_hint
+                        else (
+                            self._settings.default_tier2_model
+                            if target_provider == self._settings.tier2_engine
+                            else None
+                        )
+                    )
+                    task = await self._task_manager.dispatch_task(
+                        workspace_canonical_path=ws_path,
+                        workspace_name=ws_name,
+                        objective=directive.objective or "",
+                        provider=target_provider,
+                        model=target_model,
+                        correlation_id=correlation_id,
+                    )
+                    summaries.append(
+                        f"Tarea {task.task_id} enviada a {task.provider} en {task.workspace_name}. "
+                        "Te aviso cuando termine."
+                    )
+                elif directive.action == "list_tasks":
+                    tasks = await self._task_manager.list_tasks(limit=10)
+                    if directive.status_filter == "active":
+                        filtered = [t for t in tasks if t.status not in TERMINAL_TASK_STATUSES]
+                    elif directive.status_filter == "all":
+                        filtered = tasks
+                    else:
+                        filtered = [t for t in tasks if t.status == directive.status_filter]
+                    summaries.append(self._format_task_list_summary(filtered))
+                elif directive.action == "get_task_status":
+                    if directive.task_id:
+                        rec = await self._task_manager.get_task(directive.task_id)
+                        summaries.append(self._format_single_task_status(rec))
+                    else:
+                        recent = await self._task_manager.list_tasks(limit=5)
+                        active = [t for t in recent if t.status not in TERMINAL_TASK_STATUSES]
+                        chosen = active[0] if active else (recent[0] if recent else None)
+                        if chosen is None:
+                            summaries.append("No hay tareas registradas todavía.")
+                        else:
+                            summaries.append(self._format_single_task_status(chosen))
+                elif directive.action == "cancel_task":
+                    target_id = directive.task_id
+                    if not target_id:
+                        recent = await self._task_manager.list_tasks(limit=10)
+                        active = [t for t in recent if t.status not in TERMINAL_TASK_STATUSES]
+                        if not active:
+                            summaries.append("No hay ninguna tarea activa para cancelar.")
+                            continue
+                        if len(active) > 1:
+                            ids = ", ".join(t.task_id for t in active[:4])
+                            summaries.append(
+                                f"Hay varias tareas activas ({ids}). Indícame cuál cancelar."
+                            )
+                            continue
+                        target_id = active[0].task_id
+                    cancelled = await self._task_manager.cancel_task(target_id)
+                    summaries.append(
+                        f"Tarea {cancelled.task_id} en estado {cancelled.status}."
+                    )
+            except TaskManagerError as exc:
+                summaries.append(f"No pude completar la acción: {exc.sanitized_message}")
+        return summaries
+
+    @staticmethod
+    def _format_task_list_summary(tasks: list[AgentTaskRecord]) -> str:
+        if not tasks:
+            return "No hay tareas activas en este momento."
+        parts = [
+            f"{t.task_id} ({t.provider} en {t.workspace_name}: {t.status})"
+            for t in tasks[:5]
+        ]
+        return f"Tareas actuales ({len(tasks)}): " + "; ".join(parts) + "."
+
+    @staticmethod
+    def _format_single_task_status(task: AgentTaskRecord) -> str:
+        detail = f" Último avance: {task.last_log}" if task.last_log else ""
+        return (
+            f"La tarea {task.task_id} ({task.provider} en {task.workspace_name}) "
+            f"está {task.status}.{detail}"
         )
 
     async def _run_tier2(

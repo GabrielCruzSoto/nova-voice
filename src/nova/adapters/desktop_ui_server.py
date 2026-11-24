@@ -19,7 +19,7 @@ from dataclasses import asdict, dataclass
 from http.cookies import SimpleCookie
 from pathlib import Path
 from typing import Any, Protocol
-from urllib.parse import urlsplit
+from urllib.parse import parse_qs, urlsplit
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator
 
@@ -27,11 +27,20 @@ from nova.adapters.workspace_resolver import LocalWorkspaceResolver
 from nova.application.live_diagnostics import LiveDiagnosticsService
 from nova.application.models_provisioning import VoiceModelsProvisioningService
 from nova.application.settings_service import SettingsService
+from nova.application.task_manager import (
+    _SAFE_MODEL_TOKEN_RE,
+    TaskManager,
+    _validate_and_resolve_workspace,
+)
 from nova.application.ui_state_hub import UiStateHub
 from nova.domain.errors import (
     ApprovalNotFoundError,
     DesktopUiError,
     NovaDomainError,
+    TaskManagerError,
+    TaskNotFoundError,
+    TaskQueueFullError,
+    TaskStateError,
     WorkspaceResolutionError,
     redact_sensitive_text,
 )
@@ -41,11 +50,13 @@ from nova.domain.events import (
     RunnerFailureEvent,
 )
 from nova.domain.models import (
+    MAX_TASK_OBJECTIVE_CHARS,
     AgentCatalogSnapshot,
     AgentEngineId,
     AgentTier,
     CallSession,
     InitializeWorkspaceRequest,
+    TaskStatus,
     WorkspaceContext,
     WorkspaceQueryMode,
 )
@@ -66,6 +77,12 @@ _SAFE_CORR_RE = re.compile(r"^[A-Za-z0-9._-]{1,80}$")
 _SAFE_AUDIT_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,80}$")
 _SAFE_ASSET_RE = re.compile(r"^[A-Za-z0-9._-]{1,64}\.(js|css|svg)$")
 _APPROVAL_PATH_RE = re.compile(r"^/api/approvals/([A-Za-z0-9_-]{1,80})/resolve$")
+_TASK_ID_PATH_RE = re.compile(r"^/api/tasks/([A-Za-z0-9_-]{1,80})$")
+_TASK_CANCEL_PATH_RE = re.compile(r"^/api/tasks/([A-Za-z0-9_-]{1,80})/cancel$")
+_VALID_TASK_STATUSES: frozenset[str] = frozenset(
+    {"queued", "running", "waiting_approval", "completed", "failed", "cancelled"}
+)
+_VALID_AGENT_PROVIDERS: frozenset[str] = frozenset({"pi", "agy", "claude", "opencode"})
 
 _HTTP_STATUS_TEXT: dict[int, str] = {
     200: "OK",
@@ -177,6 +194,7 @@ class DesktopUiServer:
         credential_store: CredentialStorePort | None = None,
         health_recheck_callback: Callable[[], Awaitable[tuple[Any, bool]]] | None = None,
         models_provisioning_service: VoiceModelsProvisioningService | None = None,
+        task_manager: TaskManager | None = None,
         shutdown_callback: Callable[[str], None] | None = None,
         static_dir: Path | None = None,
         settings: DesktopUiServerSettings | None = None,
@@ -196,6 +214,7 @@ class DesktopUiServer:
         self._credential_store = credential_store
         self._health_recheck_callback = health_recheck_callback
         self._models_provisioning_service = models_provisioning_service
+        self._task_manager = task_manager or getattr(orchestrator, "task_manager", None)
         self._shutdown_callback = shutdown_callback
         self._static_dir = static_dir or _default_static_dir()
         self._settings = settings or DesktopUiServerSettings()
@@ -513,6 +532,7 @@ class DesktopUiServer:
                 writer=writer,
                 method=method,
                 path=path,
+                query=parsed_url.query,
                 headers=headers,
                 body_bytes=body_bytes,
                 corr_id=corr_id,
@@ -543,6 +563,7 @@ class DesktopUiServer:
         writer: asyncio.StreamWriter,
         method: str,
         path: str,
+        query: str = "",
         headers: dict[str, str],
         body_bytes: bytes,
         corr_id: str,
@@ -712,6 +733,36 @@ class DesktopUiServer:
             status_view = self._models_provisioning_service.get_status()
             await self._write_json(writer, 200, status_view.model_dump(), corr_id)
             return
+
+        if method == "GET" and path == "/api/tasks":
+            sess = self._validate_session_cookie(headers.get("cookie"))
+            if sess is None:
+                await self._write_error(
+                    writer,
+                    403,
+                    "UI_FORBIDDEN_ORIGIN_OR_CSRF",
+                    "Missing or invalid UI session cookie.",
+                    corr_id,
+                )
+                return
+            await self._handle_get_tasks(writer, query, corr_id)
+            return
+
+        if method == "GET":
+            task_match = _TASK_ID_PATH_RE.fullmatch(path)
+            if task_match is not None:
+                sess = self._validate_session_cookie(headers.get("cookie"))
+                if sess is None:
+                    await self._write_error(
+                        writer,
+                        403,
+                        "UI_FORBIDDEN_ORIGIN_OR_CSRF",
+                        "Missing or invalid UI session cookie.",
+                        corr_id,
+                    )
+                    return
+                await self._handle_get_task_by_id(writer, task_match.group(1), corr_id)
+                return
 
         if method == "GET" and path == "/api/events":
             sess = self._validate_session_cookie(headers.get("cookie"))
@@ -1364,6 +1415,15 @@ class DesktopUiServer:
             await self._select_workspace_and_respond(writer, str(chosen), corr_id)
             return
 
+        if path == "/api/tasks":
+            await self._handle_post_task(writer, payload, corr_id)
+            return
+
+        task_cancel_match = _TASK_CANCEL_PATH_RE.fullmatch(path)
+        if task_cancel_match is not None:
+            await self._handle_cancel_task(writer, task_cancel_match.group(1), corr_id)
+            return
+
         approval_match = _APPROVAL_PATH_RE.fullmatch(path)
         if approval_match is not None:
             audit_id = approval_match.group(1)
@@ -1408,6 +1468,291 @@ class DesktopUiServer:
             404,
             "UI_ROUTE_NOT_FOUND",
             f"Unknown POST route: {path}",
+            corr_id,
+        )
+
+    async def _handle_get_tasks(
+        self,
+        writer: asyncio.StreamWriter,
+        query: str,
+        corr_id: str,
+    ) -> None:
+        if self._task_manager is None:
+            await self._write_error(
+                writer,
+                503,
+                "TASK_MANAGER_UNAVAILABLE",
+                "TaskManager is not attached to DesktopUiServer.",
+                corr_id,
+            )
+            return
+        params = parse_qs(query, keep_blank_values=False)
+        raw_status = params.get("status", [None])[0]
+        status_filter: TaskStatus | None = None
+        if raw_status is not None:
+            if raw_status not in _VALID_TASK_STATUSES:
+                await self._write_error(
+                    writer,
+                    400,
+                    "UI_INVALID_QUERY",
+                    f"Unsupported task status filter: '{raw_status}'.",
+                    corr_id,
+                )
+                return
+            status_filter = raw_status  # type: ignore[assignment]
+
+        raw_limit = params.get("limit", ["50"])[0]
+        try:
+            limit_val = int(raw_limit)
+        except ValueError:
+            await self._write_error(
+                writer,
+                400,
+                "UI_INVALID_QUERY",
+                "Query parameter 'limit' must be an integer between 1 and 100.",
+                corr_id,
+            )
+            return
+        if limit_val < 1 or limit_val > 100:
+            await self._write_error(
+                writer,
+                400,
+                "UI_INVALID_QUERY",
+                "Query parameter 'limit' must be between 1 and 100.",
+                corr_id,
+            )
+            return
+
+        ws_filter = params.get("workspace", [None])[0]
+        tasks = await self._task_manager.list_tasks(
+            limit=limit_val,
+            status=status_filter,
+            workspace_path=ws_filter,
+        )
+        projected = [self._hub.project_task(t).model_dump() for t in tasks]
+        overview = self._hub.build_agents_overview().model_dump()
+        await self._write_json(
+            writer,
+            200,
+            {"tasks": projected, "agents_overview": overview},
+            corr_id,
+        )
+
+    async def _handle_get_task_by_id(
+        self,
+        writer: asyncio.StreamWriter,
+        task_id: str,
+        corr_id: str,
+    ) -> None:
+        if self._task_manager is None:
+            await self._write_error(
+                writer,
+                503,
+                "TASK_MANAGER_UNAVAILABLE",
+                "TaskManager is not attached to DesktopUiServer.",
+                corr_id,
+            )
+            return
+        try:
+            rec = await self._task_manager.get_task(task_id)
+        except TaskNotFoundError as exc:
+            await self._write_error(writer, 404, exc.code, exc.sanitized_message, corr_id)
+            return
+        await self._write_json(
+            writer,
+            200,
+            {"task": self._hub.project_task(rec).model_dump()},
+            corr_id,
+        )
+
+    async def _handle_post_task(
+        self,
+        writer: asyncio.StreamWriter,
+        payload: dict[str, Any],
+        corr_id: str,
+    ) -> None:
+        if self._task_manager is None:
+            await self._write_error(
+                writer,
+                503,
+                "TASK_MANAGER_UNAVAILABLE",
+                "TaskManager is not attached to DesktopUiServer.",
+                corr_id,
+            )
+            return
+        raw_obj = payload.get("objective")
+        if not isinstance(raw_obj, str) or not raw_obj.strip():
+            await self._write_error(
+                writer,
+                400,
+                "TASK_INVALID_REQUEST",
+                "Field 'objective' must be a non-empty string.",
+                corr_id,
+            )
+            return
+        if len(raw_obj.strip()) > MAX_TASK_OBJECTIVE_CHARS:
+            await self._write_error(
+                writer,
+                400,
+                "TASK_INVALID_REQUEST",
+                f"Field 'objective' must not exceed {MAX_TASK_OBJECTIVE_CHARS} characters.",
+                corr_id,
+            )
+            return
+
+        raw_provider = payload.get("provider")
+        provider: AgentEngineId | None = None
+        if raw_provider is not None:
+            if not isinstance(raw_provider, str) or raw_provider not in _VALID_AGENT_PROVIDERS:
+                await self._write_error(
+                    writer,
+                    400,
+                    "TASK_INVALID_REQUEST",
+                    "Field 'provider' must be one of pi, agy, claude, opencode.",
+                    corr_id,
+                )
+                return
+            provider = raw_provider  # type: ignore[assignment]
+
+        raw_model = payload.get("model")
+        model: str | None = None
+        if raw_model is not None:
+            if not isinstance(raw_model, str):
+                await self._write_error(
+                    writer,
+                    400,
+                    "TASK_INVALID_REQUEST",
+                    "Field 'model' must be a string.",
+                    corr_id,
+                )
+                return
+            cleaned_model = raw_model.strip()
+            if cleaned_model and not _SAFE_MODEL_TOKEN_RE.fullmatch(cleaned_model):
+                await self._write_error(
+                    writer,
+                    400,
+                    "TASK_INVALID_REQUEST",
+                    (
+                        "Field 'model' must be <= 200 characters without whitespace, "
+                        "control characters, or leading '-'."
+                    ),
+                    corr_id,
+                )
+                return
+            model = cleaned_model or None
+
+        raw_ws = payload.get("workspace_path")
+        ws_path: str | None = None
+        ws_name: str | None = None
+        if raw_ws is not None:
+            if not isinstance(raw_ws, str) or not raw_ws.strip():
+                await self._write_error(
+                    writer,
+                    400,
+                    "TASK_INVALID_REQUEST",
+                    "Field 'workspace_path' must be a non-empty string when provided.",
+                    corr_id,
+                )
+                return
+            allowed_roots: tuple[str, ...] = ()
+            if self._workspace_resolver is not None:
+                raw_roots = getattr(self._workspace_resolver, "allowed_roots", ())
+                if isinstance(raw_roots, tuple):
+                    allowed_roots = raw_roots
+            resolved_ws, ws_err_code, ws_err_msg = await asyncio.to_thread(
+                _validate_and_resolve_workspace,
+                raw_ws.strip(),
+                allowed_roots,
+            )
+            if ws_err_code is not None:
+                ws_status = 403 if ws_err_code == "WORKSPACE_OUTSIDE_ALLOWED_ROOTS" else 400
+                await self._write_error(
+                    writer,
+                    ws_status,
+                    ws_err_code,
+                    ws_err_msg or "Invalid task workspace path.",
+                    corr_id,
+                )
+                return
+            ws_path = resolved_ws
+            ws_name = Path(resolved_ws).name or resolved_ws
+        elif self._workspace_resolver is not None and self._workspace_resolver.active_context:
+            active = self._workspace_resolver.active_context
+            ws_path = active.canonical_path
+            ws_name = active.name
+        elif self._hub.active_workspace is not None:
+            ws_path = self._hub.active_workspace.canonical_path
+            ws_name = self._hub.active_workspace.display_name
+
+        if not ws_path:
+            await self._write_error(
+                writer,
+                400,
+                "WORKSPACE_REQUIRED",
+                "Select an active workspace or pass 'workspace_path' to create a task.",
+                corr_id,
+            )
+            return
+
+        try:
+            created = await self._task_manager.dispatch_task(
+                workspace_canonical_path=ws_path,
+                workspace_name=ws_name or Path(ws_path).name,
+                objective=raw_obj.strip(),
+                provider=provider,
+                model=model,
+                correlation_id=corr_id,
+            )
+        except TaskQueueFullError as exc:
+            await self._write_error(writer, 429, exc.code, exc.sanitized_message, corr_id)
+            return
+        except TaskStateError as exc:
+            await self._write_error(writer, 409, exc.code, exc.sanitized_message, corr_id)
+            return
+        except TaskManagerError as exc:
+            if exc.code == "TASK_MANAGER_UNAVAILABLE":
+                status = 503
+            elif exc.code == "WORKSPACE_OUTSIDE_ALLOWED_ROOTS":
+                status = 403
+            else:
+                status = 400
+            await self._write_error(writer, status, exc.code, exc.sanitized_message, corr_id)
+            return
+
+        await self._write_json(
+            writer,
+            201,
+            {"task": self._hub.project_task(created).model_dump()},
+            corr_id,
+        )
+
+    async def _handle_cancel_task(
+        self,
+        writer: asyncio.StreamWriter,
+        task_id: str,
+        corr_id: str,
+    ) -> None:
+        if self._task_manager is None:
+            await self._write_error(
+                writer,
+                503,
+                "TASK_MANAGER_UNAVAILABLE",
+                "TaskManager is not attached to DesktopUiServer.",
+                corr_id,
+            )
+            return
+        try:
+            cancelled = await self._task_manager.cancel_task(task_id)
+        except TaskNotFoundError as exc:
+            await self._write_error(writer, 404, exc.code, exc.sanitized_message, corr_id)
+            return
+        except TaskManagerError as exc:
+            await self._write_error(writer, 400, exc.code, exc.sanitized_message, corr_id)
+            return
+        await self._write_json(
+            writer,
+            200,
+            {"task": self._hub.project_task(cancelled).model_dump()},
             corr_id,
         )
 

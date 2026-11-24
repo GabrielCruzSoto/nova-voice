@@ -21,6 +21,7 @@ from nova.adapters.pi_rpc_client import (
     PiRpcClient,
     PiRpcConfig,
 )
+from nova.domain.errors import CodingRunnerError, PiRpcError
 from nova.domain.models import (
     DEFAULT_PI_MODEL,
     ActiveTierSelection,
@@ -156,10 +157,12 @@ class AntigravityTier1Adapter:
         *,
         model: str = "gemini-4-argon-high",
         workspace_path: str | None = None,
+        append_system_prompt: str | None = None,
     ) -> None:
         self._runner = runner
         self._model = model
         self._workspace_path = workspace_path or os.getcwd()
+        self._append_system_prompt = append_system_prompt
         self._active_session_id: str | None = None
 
     @property
@@ -182,10 +185,21 @@ class AntigravityTier1Adapter:
         return None
 
     async def stream_prompt(self, message: str) -> AsyncIterator[str]:
+        effective_prompt = message
+        if (
+            self._active_session_id is None
+            and self._append_system_prompt
+            and self._append_system_prompt.strip()
+        ):
+            sys_prompt = self._append_system_prompt.strip()
+            effective_prompt = (
+                f"[Instrucciones del sistema]\n{sys_prompt}\n[/Instrucciones del sistema]\n\n"
+                f"{message}"
+            )
         req = CodingTaskRequest(
             correlation_id="corr-tier1-agy",
             workspace_path=self._workspace_path,
-            prompt=message,
+            prompt=effective_prompt,
             model=self._model,
             conversation_id=self._active_session_id,
         )
@@ -197,35 +211,42 @@ class AntigravityTier1Adapter:
 
 
 class PiCodingRunnerAdapter:
-    """Thin CodingRunnerPort wrapper over PiRpcClient for Single-Engine mode."""
+    """Thin CodingRunnerPort wrapper over PiRpcClient for Single-Engine and TaskManager modes."""
 
-    def __init__(self, pi_client: PiRpcClient) -> None:
+    def __init__(self, pi_client: PiRpcClient, *, close_on_exit: bool = False) -> None:
         self._pi_client = pi_client
+        self._close_on_exit = close_on_exit
 
     async def execute(self, request: CodingTaskRequest) -> AsyncIterator[RunnerProgressEvent]:
-        await self._pi_client.switch_workspace(
-            request.workspace_path,
-            workspace_active=True,
-            session_id=request.conversation_id,
-        )
-        conv_id = request.conversation_id or "pi-tier2"
-        yield RunnerProgressEvent(kind="init", conversation_id=conv_id, step_type="init")
-        parts: list[str] = []
-        async for delta in self._pi_client.stream_prompt(request.prompt):
-            parts.append(delta)
-            yield RunnerProgressEvent(
-                kind="delta",
-                conversation_id=conv_id,
-                step_type="agent_response",
-                text_delta=delta,
+        try:
+            await self._pi_client.switch_workspace(
+                request.workspace_path,
+                workspace_active=True,
+                session_id=request.conversation_id,
             )
-        final_sid = (await self._pi_client.get_session_id()) or conv_id
-        yield RunnerProgressEvent(
-            kind="completed",
-            conversation_id=final_sid,
-            step_type="result",
-            final_response="".join(parts),
-        )
+            conv_id = request.conversation_id or "pi-tier2"
+            yield RunnerProgressEvent(kind="init", conversation_id=conv_id, step_type="init")
+            parts: list[str] = []
+            async for delta in self._pi_client.stream_prompt(request.prompt):
+                parts.append(delta)
+                yield RunnerProgressEvent(
+                    kind="delta",
+                    conversation_id=conv_id,
+                    step_type="agent_response",
+                    text_delta=delta,
+                )
+            final_sid = (await self._pi_client.get_session_id()) or conv_id
+            yield RunnerProgressEvent(
+                kind="completed",
+                conversation_id=final_sid,
+                step_type="result",
+                final_response="".join(parts),
+            )
+        except PiRpcError as exc:
+            raise CodingRunnerError(code=exc.code, message=exc.sanitized_message) from exc
+        finally:
+            if self._close_on_exit:
+                await self._pi_client.close()
 
 
 class AgentAdapterRegistry:
@@ -389,6 +410,7 @@ class AgentAdapterRegistry:
                     tier="tier1",
                     gatekeeper_ipc_env=gatekeeper_ipc_env,
                     provider_env=provider_env or None,
+                    append_system_prompt=NOVA_VOICE_SYSTEM_PROMPT,
                 )
             )
         if engine == "agy":
@@ -400,7 +422,12 @@ class AgentAdapterRegistry:
                     gatekeeper_ipc_env=gatekeeper_ipc_env,
                 )
             )
-            return AntigravityTier1Adapter(agy, model=model_name, workspace_path=workspace_path)
+            return AntigravityTier1Adapter(
+                agy,
+                model=model_name,
+                workspace_path=workspace_path,
+                append_system_prompt=NOVA_VOICE_SYSTEM_PROMPT,
+            )
 
         # Default: Pi RPC
         merged_ipc = {**(gatekeeper_ipc_env or {}), **provider_env} or None
@@ -475,4 +502,107 @@ class AgentAdapterRegistry:
                 allowed_models=frozenset(set(ALLOWED_TIER2_MODELS) | {model_name}),
                 gatekeeper_ipc_env=gatekeeper_ipc_env,
             )
+        )
+
+    def build_tier2_runner_for_task(
+        self,
+        engine: AgentEngineId,
+        *,
+        models: ModelsSettingsSection,
+        workspace_path: str,
+        task_id: str,
+        gatekeeper_ipc_env: dict[str, str] | None = None,
+        stdout_heartbeat_timeout_seconds: float = 90.0,
+        timeout_seconds: float = 600.0,
+        model_override: str | None = None,
+        heartbeat_pause_predicate: Callable[[], bool] | None = None,
+    ) -> CodingRunnerPort:
+        """Instantiate an isolated per-task Tier 2 CodingRunnerPort bound to NOVA_TASK_ID."""
+        installed_map = self.detect_engines()
+        exe = installed_map.get(engine) or self._executable_overrides.get(engine, engine)
+        provider_env = (
+            self._credential_store.build_provider_env()
+            if self._credential_store is not None
+            else {}
+        )
+        task_gk_env = (
+            {**gatekeeper_ipc_env, "NOVA_TASK_ID": task_id}
+            if gatekeeper_ipc_env is not None
+            else None
+        )
+        _, default_t2_engine = resolve_tier_engines(models, installed_map)
+        configured_t2_model = models.tier2_model if default_t2_engine == engine else ""
+        effective_model = (model_override or "").strip()
+
+        if engine == "claude":
+            return ClaudeCodeAdapter(
+                ClaudeCodeConfig(
+                    executable=exe,
+                    model=(
+                        effective_model
+                        or configured_t2_model
+                        or ENGINE_DEFAULT_MODELS["claude"][1]
+                    ),
+                    workspace_path=workspace_path,
+                    tier="tier2",
+                    timeout_seconds=timeout_seconds,
+                    stdout_heartbeat_timeout_seconds=stdout_heartbeat_timeout_seconds,
+                    gatekeeper_ipc_env=task_gk_env,
+                    provider_env=provider_env or None,
+                ),
+                heartbeat_pause_predicate=heartbeat_pause_predicate,
+            )
+        if engine == "opencode":
+            return OpenCodeAdapter(
+                OpenCodeConfig(
+                    executable=exe,
+                    provider=models.tier2_provider,
+                    model=(
+                        effective_model
+                        or configured_t2_model
+                        or ENGINE_DEFAULT_MODELS["opencode"][1]
+                    ),
+                    workspace_path=workspace_path,
+                    tier="tier2",
+                    timeout_seconds=timeout_seconds,
+                    stdout_heartbeat_timeout_seconds=stdout_heartbeat_timeout_seconds,
+                    gatekeeper_ipc_env=task_gk_env,
+                    provider_env=provider_env or None,
+                ),
+                heartbeat_pause_predicate=heartbeat_pause_predicate,
+            )
+        if engine == "pi":
+            merged_ipc = {**(task_gk_env or {}), **provider_env} or None
+            pi_client = PiRpcClient(
+                PiRpcConfig(
+                    executable=exe,
+                    provider=models.tier2_provider or models.pi_provider,
+                    model=(
+                        effective_model
+                        or configured_t2_model
+                        or models.pi_model
+                        or ENGINE_DEFAULT_MODELS["pi"][1]
+                    ),
+                    workspace_path=workspace_path,
+                    workspace_active=True,
+                    run_timeout_seconds=timeout_seconds,
+                    stdout_heartbeat_timeout_seconds=stdout_heartbeat_timeout_seconds,
+                    gatekeeper_ipc_env=merged_ipc,
+                ),
+                heartbeat_pause_predicate=heartbeat_pause_predicate,
+            )
+            return PiCodingRunnerAdapter(pi_client, close_on_exit=True)
+
+        model_name = (
+            effective_model or configured_t2_model or ENGINE_DEFAULT_MODELS["agy"][1]
+        )
+        return AntigravityCLIAdapter(
+            AntigravityRunnerConfig(
+                executable=exe,
+                allowed_models=frozenset(set(ALLOWED_TIER2_MODELS) | {model_name}),
+                timeout_seconds=timeout_seconds,
+                stdout_heartbeat_timeout_seconds=stdout_heartbeat_timeout_seconds,
+                gatekeeper_ipc_env=task_gk_env,
+            ),
+            heartbeat_pause_predicate=heartbeat_pause_predicate,
         )

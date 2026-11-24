@@ -199,6 +199,11 @@ class LocalWorkspaceResolver:
         self._active_context: WorkspaceContext | None = None
 
     @property
+    def allowed_roots(self) -> tuple[str, ...]:
+        """Expose configured allowed root directories (read-only)."""
+        return tuple(str(root) for root in self._allowed_roots_raw)
+
+    @property
     def active_context(self) -> WorkspaceContext | None:
         """Return currently selected workspace context, if any."""
         with self._lock:

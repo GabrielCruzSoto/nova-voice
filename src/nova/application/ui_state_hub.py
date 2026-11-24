@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import random
 import time
 import uuid
 from collections import OrderedDict, deque
@@ -25,6 +26,9 @@ from nova.domain.events import (
     OrchestratorEventBus,
     RunnerFailureEvent,
     SettingsUpdatedEvent,
+    TaskCreatedEvent,
+    TaskProgressEvent,
+    TaskStateChangedEvent,
     UiPanelToggleRequestedEvent,
     VoiceMilestoneEvent,
     VoiceSpeechChunkEvent,
@@ -33,11 +37,14 @@ from nova.domain.events import (
     WorkspaceClearedEvent,
 )
 from nova.domain.models import (
+    AgentEngineId,
+    AgentTaskRecord,
     AuditRiskLevel,
     CallSession,
     CallSessionState,
     CommandSource,
     PersistedChatMessage,
+    TaskStatus,
     WorkspaceCatalogEntry,
     WorkspaceContext,
     WorkspaceProject,
@@ -45,7 +52,7 @@ from nova.domain.models import (
     WorkspaceTopology,
     utc_now_iso,
 )
-from nova.domain.ports import HistoryStorePort
+from nova.domain.ports import HistoryStorePort, TaskStorePort
 
 MAX_SINGLE_MESSAGE_CHARS = 65_536
 
@@ -64,6 +71,9 @@ UiEventType = Literal[
     "settings_updated",
     "panel_toggle_requested",
     "health_updated",
+    "task_created",
+    "task_state_changed",
+    "task_progress",
 ]
 UiMessageRole = Literal["user", "assistant", "system", "security"]
 UiMessageModality = Literal[
@@ -171,6 +181,91 @@ class UiChatMessage(BaseModel):
     streaming: bool = False
 
 
+UiTaskStatus = Literal[
+    "running",
+    "queued",
+    "completed",
+    "gatekeeper_blocked",
+    "failed",
+    "cancelled",
+]
+
+_ENGINE_DISPLAY_NAMES: dict[AgentEngineId, str] = {
+    "claude": "Claude Code",
+    "opencode": "OpenCode",
+    "agy": "Antigravity",
+    "pi": "Pi CLI",
+}
+
+
+def _map_task_status_to_ui(status: TaskStatus) -> UiTaskStatus:
+    if status == "waiting_approval":
+        return "gatekeeper_blocked"
+    return status
+
+
+def _format_task_duration(started_at: float | None, completed_at: float | None) -> str | None:
+    if started_at is None:
+        return None
+    end_ts = completed_at if completed_at is not None else time.time()
+    elapsed = max(0, int(end_ts - started_at))
+    if elapsed < 60:
+        return f"{elapsed}s"
+    mins, secs = divmod(elapsed, 60)
+    return f"{mins}m {secs:02d}s"
+
+
+class UiTaskItem(BaseModel):
+    """Wire DTO for a managed asynchronous agent task in snapshot, REST, and SSE (NOVA-020)."""
+
+    model_config = ConfigDict(frozen=True, extra="ignore")
+
+    id: str = Field(min_length=1)
+    task_id: str = Field(min_length=1)
+    correlation_id: str = Field(min_length=1)
+    title: str = Field(min_length=1)
+    description: str | None = None
+    workspace: str = Field(min_length=1)
+    workspace_name: str = Field(min_length=1)
+    tier: Literal["tier1_pi", "tier2_agy"] = "tier2_agy"
+    provider: AgentEngineId = "agy"
+    model: str = ""
+    agentName: str = Field(min_length=1)  # noqa: N815
+    status: UiTaskStatus
+    backend_status: TaskStatus
+    duration: str | None = None
+    lastLog: str | None = None  # noqa: N815
+    result_summary: str | None = None
+    error_code: str | None = None
+    error_message: str | None = None
+    pending_audit_id: str | None = None
+    created_at: float = Field(ge=0.0)
+    updated_at: float = Field(ge=0.0)
+    completed_at: float | None = None
+
+
+class UiAgentPoolSlotView(BaseModel):
+    """Wire DTO for one pool slot card in the UI Agents overview (NOVA-020)."""
+
+    model_config = ConfigDict(frozen=True, extra="ignore")
+
+    name: str = Field(min_length=1)
+    tier: Literal["tier1_pi", "tier2_agy"]
+    activeSlots: int = Field(ge=0)  # noqa: N815
+    maxSlots: int = Field(ge=1)  # noqa: N815
+    status: Literal["active", "idle"]
+
+
+class UiAgentsOverviewView(BaseModel):
+    """Wire DTO matching frontend UiAgentsOverview (NOVA-020 OP-6)."""
+
+    model_config = ConfigDict(frozen=True, extra="ignore")
+
+    daemonStatus: Literal["connected", "disconnected"] = "connected"  # noqa: N815
+    poolSlots: list[UiAgentPoolSlotView] = Field(default_factory=list)  # noqa: N815
+    tasks: list[UiTaskItem] = Field(default_factory=list)
+
+
 class UiStateSnapshot(BaseModel):
     """Complete bootstrap and resync payload for GET /api/state and SSE snapshot (OP-1)."""
 
@@ -187,6 +282,8 @@ class UiStateSnapshot(BaseModel):
     available_workspaces: list[UiWorkspaceOption]
     pending_approvals: list[UiApprovalItem]
     messages: list[UiChatMessage]
+    tasks: list[UiTaskItem] = Field(default_factory=list)
+    agents_overview: UiAgentsOverviewView | None = None
 
 
 class UiEventEnvelope(BaseModel):
@@ -249,6 +346,9 @@ class UiHubSettings(BaseModel):
 
     max_messages: int = Field(default=200, ge=1, le=1000)
     max_pending_approvals: int = Field(default=64, ge=1, le=256)
+    max_tasks: int = Field(default=100, ge=10, le=500)
+    terminal_task_ttl_seconds: float = Field(default=3600.0, gt=0.0, le=86400.0)
+    max_concurrent_tier2_slots: int = Field(default=4, ge=1, le=16)
     max_sse_queue: int = Field(default=128, ge=2, le=512)
     max_sse_subscribers: int = Field(default=8, ge=1, le=64)
 
@@ -273,12 +373,14 @@ class UiStateHub:
         initial_workspace: WorkspaceContext | None = None,
         initial_call_session: CallSession | None = None,
         history_store: HistoryStorePort | None = None,
+        task_store: TaskStorePort | None = None,
         voice_enabled: bool = False,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self._event_bus = event_bus
         self._settings = settings or UiHubSettings()
         self._history_store = history_store
+        self._task_store = task_store
         self._extra_secrets_provider = extra_secrets_provider
         self._available_workspaces_provider = available_workspaces_provider
         self._workspace_entries_provider = workspace_entries_provider
@@ -317,9 +419,16 @@ class UiStateHub:
         self._message_index: dict[str, _MutableChatRecord] = {}
         self._active_streams: dict[tuple[str, str, str], str] = {}
         self._pending_approvals: OrderedDict[str, tuple[UiApprovalItem, float]] = OrderedDict()
+        self._tasks: OrderedDict[str, UiTaskItem] = OrderedDict()
+        self._task_expires_at: dict[str, float] = {}
         self._subscribers: dict[str, SseSubscription] = {}
         self._seq = 0
         self._started = False
+
+    @property
+    def active_workspace(self) -> UiWorkspaceView | None:
+        """Return currently projected active workspace view, if any."""
+        return self._active_workspace
 
     @property
     def indexed_message_count(self) -> int:
@@ -342,40 +451,159 @@ class UiStateHub:
             self._event_bus.subscribe(self._on_event)
 
     async def hydrate_history(self) -> None:
-        """Preload bounded historical chat messages from persistent SQLite store (NOVA-015)."""
-        if self._history_store is None:
-            return
-        ws_path = self._active_workspace.canonical_path if self._active_workspace else None
-        persisted = await self._history_store.get_recent_messages(
-            limit=self._settings.max_messages,
-            workspace_path=ws_path,
+        """Preload bounded historical chat messages and tasks from persistent SQLite store."""
+        if self._history_store is not None:
+            ws_path = self._active_workspace.canonical_path if self._active_workspace else None
+            persisted = await self._history_store.get_recent_messages(
+                limit=self._settings.max_messages,
+                workspace_path=ws_path,
+            )
+            for p in persisted:
+                if p.message_id not in self._message_index:
+                    role: UiMessageRole = "user" if p.source in ("user", "voice") else "assistant"
+                    if p.source == "error":
+                        role = "system"
+                    modality: UiMessageModality = "text"
+                    if p.source == "voice":
+                        modality = "voice"
+                    elif p.source in ("tier1_pi", "tier1_agent"):
+                        modality = "tier1_agent" if p.source == "tier1_agent" else "tier1_pi"
+                    elif p.source == "tier2_runner":
+                        modality = "tier2_runner"
+                    elif p.source == "error":
+                        modality = "error"
+                    ts = datetime.fromtimestamp(p.created_at, UTC).isoformat()
+                    record = _MutableChatRecord(
+                        message_id=p.message_id,
+                        correlation_id=p.correlation_id,
+                        role=role,
+                        modality=modality,
+                        step_type=p.step_type,
+                        content=p.content,
+                        timestamp=ts,
+                        streaming=False,
+                    )
+                    self._append_record(record)
+        if self._task_store is not None:
+            persisted_tasks = await self._task_store.list_tasks(limit=self._settings.max_tasks)
+            for task_rec in reversed(persisted_tasks):
+                self._upsert_task_view(self.project_task(task_rec))
+
+    def project_task(self, task: AgentTaskRecord) -> UiTaskItem:
+        """Convert domain AgentTaskRecord into redacted UI wire DTO."""
+        safe_obj = self._redact(task.objective)
+        title = safe_obj if len(safe_obj) <= 96 else f"{safe_obj[:93]}..."
+        ui_tier: Literal["tier1_pi", "tier2_agy"] = (
+            "tier1_pi" if task.tier == "tier1" else "tier2_agy"
         )
-        for p in persisted:
-            if p.message_id not in self._message_index:
-                role: UiMessageRole = "user" if p.source in ("user", "voice") else "assistant"
-                if p.source == "error":
-                    role = "system"
-                modality: UiMessageModality = "text"
-                if p.source == "voice":
-                    modality = "voice"
-                elif p.source in ("tier1_pi", "tier1_agent"):
-                    modality = "tier1_agent" if p.source == "tier1_agent" else "tier1_pi"
-                elif p.source == "tier2_runner":
-                    modality = "tier2_runner"
-                elif p.source == "error":
-                    modality = "error"
-                ts = datetime.fromtimestamp(p.created_at, UTC).isoformat()
-                record = _MutableChatRecord(
-                    message_id=p.message_id,
-                    correlation_id=p.correlation_id,
-                    role=role,
-                    modality=modality,
-                    step_type=p.step_type,
-                    content=p.content,
-                    timestamp=ts,
-                    streaming=False,
-                )
-                self._append_record(record)
+        agent_name = _ENGINE_DISPLAY_NAMES.get(task.provider, task.provider)
+        return UiTaskItem(
+            id=task.task_id,
+            task_id=task.task_id,
+            correlation_id=task.correlation_id,
+            title=title,
+            description=safe_obj,
+            workspace=self._redact(task.workspace_canonical_path),
+            workspace_name=self._redact(task.workspace_name),
+            tier=ui_tier,
+            provider=task.provider,
+            model=task.model,
+            agentName=agent_name,
+            status=_map_task_status_to_ui(task.status),
+            backend_status=task.status,
+            duration=_format_task_duration(task.started_at, task.completed_at),
+            lastLog=self._redact(task.last_log) if task.last_log else None,
+            result_summary=self._redact(task.result_summary) if task.result_summary else None,
+            error_code=task.error_code,
+            error_message=self._redact(task.error_message) if task.error_message else None,
+            pending_audit_id=task.pending_audit_id,
+            created_at=task.created_at,
+            updated_at=task.updated_at,
+            completed_at=task.completed_at,
+        )
+
+    def prune_expired_tasks(self) -> None:
+        """Evict expired terminal tasks from RAM using finite TTL with jitter (contract.md §6)."""
+        now = self._clock()
+        expired_ids = [
+            tid
+            for tid, exp in self._task_expires_at.items()
+            if (
+                exp <= now
+                and tid in self._tasks
+                and self._tasks[tid].status in ("completed", "failed", "cancelled")
+            )
+        ]
+        for tid in expired_ids:
+            self._tasks.pop(tid, None)
+            self._task_expires_at.pop(tid, None)
+
+    def _upsert_task_view(self, item: UiTaskItem) -> None:
+        self._tasks[item.id] = item
+        self._tasks.move_to_end(item.id)
+        if item.status in ("completed", "failed", "cancelled"):
+            jitter = random.uniform(0.95, 1.05)
+            self._task_expires_at[item.id] = (
+                self._clock() + self._settings.terminal_task_ttl_seconds * jitter
+            )
+        else:
+            self._task_expires_at.pop(item.id, None)
+        self.prune_expired_tasks()
+        while len(self._tasks) > self._settings.max_tasks:
+            evict_id = next(
+                (
+                    tid
+                    for tid, existing in self._tasks.items()
+                    if existing.status in ("completed", "failed", "cancelled")
+                ),
+                None,
+            )
+            if evict_id is None:
+                evicted_key, _ = self._tasks.popitem(last=False)
+                self._task_expires_at.pop(evicted_key, None)
+            else:
+                self._tasks.pop(evict_id, None)
+                self._task_expires_at.pop(evict_id, None)
+
+    def build_agents_overview(self) -> UiAgentsOverviewView:
+        """Build live UiAgentsOverviewView ordered newest-first for snapshot, REST, and SSE."""
+        self.prune_expired_tasks()
+        ordered = sorted(
+            self._tasks.values(),
+            key=lambda item: (item.created_at, item.updated_at),
+            reverse=True,
+        )
+        t1_active = sum(
+            1
+            for t in ordered
+            if t.tier == "tier1_pi" and t.status in ("running", "gatekeeper_blocked")
+        )
+        t2_active = sum(
+            1
+            for t in ordered
+            if t.tier == "tier2_agy" and t.status in ("running", "gatekeeper_blocked")
+        )
+        slots = [
+            UiAgentPoolSlotView(
+                name="Tier 1: Conversacional",
+                tier="tier1_pi",
+                activeSlots=t1_active,
+                maxSlots=1,
+                status="active" if t1_active > 0 else "idle",
+            ),
+            UiAgentPoolSlotView(
+                name="Tier 2: Workers Asíncronos",
+                tier="tier2_agy",
+                activeSlots=t2_active,
+                maxSlots=self._settings.max_concurrent_tier2_slots,
+                status="active" if t2_active > 0 else "idle",
+            ),
+        ]
+        return UiAgentsOverviewView(
+            daemonStatus="connected",
+            poolSlots=slots,
+            tasks=ordered,
+        )
 
     def _persist_record_bg(self, record: _MutableChatRecord) -> None:
         if self._history_store is None:
@@ -590,6 +818,7 @@ class UiStateHub:
             else []
         )
 
+        overview = self.build_agents_overview()
         return UiStateSnapshot(
             csrf_token=csrf_token,
             voice_enabled=self._voice_enabled,
@@ -601,6 +830,8 @@ class UiStateHub:
             available_workspaces=options,
             pending_approvals=[item for item, _ in self._pending_approvals.values()],
             messages=[rec.to_dto() for rec in self._messages],
+            tasks=overview.tasks,
+            agents_overview=overview,
         )
 
     async def _on_event(self, event: OrchestratorEvent) -> None:
@@ -854,6 +1085,67 @@ class UiStateHub:
                     "approved": event.approved,
                     "verdict": event.verdict,
                     "resolved_by": event.resolved_by,
+                },
+            )
+            return
+
+        if isinstance(event, TaskCreatedEvent):
+            task_item = self.project_task(event.task)
+            self._upsert_task_view(task_item)
+            overview = self.build_agents_overview()
+            self._emit_envelope(
+                seq=seq,
+                event_type="task_created",
+                correlation_id=event.correlation_id,
+                timestamp=event.timestamp,
+                payload={
+                    "task": task_item.model_dump(),
+                    "agents_overview": overview.model_dump(),
+                },
+            )
+            return
+
+        if isinstance(event, TaskStateChangedEvent):
+            task_item = self.project_task(event.task)
+            self._upsert_task_view(task_item)
+            overview = self.build_agents_overview()
+            self._emit_envelope(
+                seq=seq,
+                event_type="task_state_changed",
+                correlation_id=event.correlation_id,
+                timestamp=event.timestamp,
+                payload={
+                    "task_id": event.task_id,
+                    "previous_status": event.previous_status,
+                    "status": event.status,
+                    "reason": self._redact(event.reason),
+                    "task": task_item.model_dump(),
+                    "agents_overview": overview.model_dump(),
+                },
+            )
+            return
+
+        if isinstance(event, TaskProgressEvent):
+            existing_task = self._tasks.get(event.task_id)
+            safe_log = self._redact(event.last_log)
+            if existing_task is not None:
+                updated_item = existing_task.model_copy(
+                    update={"lastLog": safe_log, "updated_at": time.time()}
+                )
+                self._upsert_task_view(updated_item)
+                task_payload: dict[str, Any] | None = updated_item.model_dump()
+            else:
+                task_payload = None
+            self._emit_envelope(
+                seq=seq,
+                event_type="task_progress",
+                correlation_id=event.correlation_id,
+                timestamp=event.timestamp,
+                payload={
+                    "task_id": event.task_id,
+                    "step_type": event.step_type,
+                    "last_log": safe_log,
+                    "task": task_payload,
                 },
             )
             return

@@ -7,13 +7,14 @@ import contextlib
 import json
 import os
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from pathlib import Path
 from types import TracebackType
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from nova.adapters._process_group import await_with_heartbeat, terminate_process_group
 from nova.domain.errors import PiRpcError
 from nova.domain.models import DEFAULT_PI_MODEL
 
@@ -31,7 +32,14 @@ NOVA_VOICE_SYSTEM_PROMPT = (
     "Nunca emitas etiquetas XML falsas como <cd>, <search> o <bash> en texto plano; utiliza "
     "unicamente las herramientas habilitadas o indica con claridad si no tienes acceso. "
     "Al referirte a archivos o arquitectura, explica su funcion con lenguaje hablado natural en "
-    "lugar de recitar rutas absolutas o sintaxis cruda."
+    "lugar de recitar rutas absolutas o sintaxis cruda. "
+    "Cuando el usuario pida ejecutar una tarea larga de codigo, refactorizacion, auditoria o "
+    "pruebas en segundo plano, o consultar/cancelar tareas activas, incluye al final una directiva "
+    "estructurada en una linea con el formato exacto "
+    '[[NOVA_ACTION:{"action":"dispatch_task","objective":"...","workspace_hint":null,'
+    '"provider_hint":null}]] '
+    '(o action "list_tasks", "get_task_status", "cancel_task" con "task_id" opcional) y confirma '
+    "brevemente en lenguaje natural sin mencionar la sintaxis NOVA_ACTION."
 )
 
 
@@ -52,6 +60,7 @@ class PiRpcConfig(BaseModel):
     append_system_prompt: str | None = NOVA_VOICE_SYSTEM_PROMPT
     ack_timeout_seconds: float = Field(default=5.0, gt=0.0)
     run_timeout_seconds: float = Field(default=180.0, gt=0.0)
+    stdout_heartbeat_timeout_seconds: float | None = Field(default=None, gt=0.0)
     max_line_bytes: int = Field(default=DEFAULT_MAX_LINE_BYTES, gt=0)
     gatekeeper_ipc_env: dict[str, str] | None = None
     enable_gatekeeper_extension: bool = True
@@ -73,8 +82,14 @@ class _PiRpcResponse(BaseModel):
 class PiRpcClient:
     """Manages a persistent `pi --mode rpc` subprocess with strict LF JSONL framing."""
 
-    def __init__(self, config: PiRpcConfig) -> None:
+    def __init__(
+        self,
+        config: PiRpcConfig,
+        *,
+        heartbeat_pause_predicate: Callable[[], bool] | None = None,
+    ) -> None:
         self._config = config
+        self._heartbeat_pause_predicate = heartbeat_pause_predicate
         self._process: asyncio.subprocess.Process | None = None
         self._reader_task: asyncio.Task[None] | None = None
         self._stderr_task: asyncio.Task[None] | None = None
@@ -155,6 +170,7 @@ class PiRpcClient:
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
                 limit=self._config.max_line_bytes,
+                start_new_session=True,
             )
         except OSError as exc:
             raise PiRpcError(
@@ -252,14 +268,28 @@ class PiRpcClient:
                         code="PI_RPC_SUBPROCESS_UNAVAILABLE",
                         message="Timed out waiting for Pi RPC agent_settled event.",
                     )
-                try:
-                    record = await asyncio.wait_for(queue.get(), timeout=remaining)
-                except TimeoutError as exc:
+                hb = self._config.stdout_heartbeat_timeout_seconds
+                record, wait_status = await await_with_heartbeat(
+                    queue.get(),
+                    deadline=deadline,
+                    heartbeat_seconds=hb,
+                    pause_predicate=self._heartbeat_pause_predicate,
+                )
+                if wait_status != "ok":
                     await self.close()
+                    if wait_status == "heartbeat":
+                        hb_val = hb or 0.0
+                        raise PiRpcError(
+                            code="RUNNER_STDOUT_HEARTBEAT_TIMEOUT",
+                            message=(
+                                f"Pi RPC produced no stdout activity for {hb_val:.1f}s "
+                                "(stdout heartbeat timeout)."
+                            ),
+                        )
                     raise PiRpcError(
                         code="PI_RPC_SUBPROCESS_UNAVAILABLE",
                         message="Timed out waiting for Pi RPC agent_settled event.",
-                    ) from exc
+                    )
 
                 if record is None:
                     await self.close()
@@ -466,18 +496,4 @@ class PiRpcClient:
 
     @staticmethod
     async def _terminate_process(proc: asyncio.subprocess.Process) -> None:
-        if proc.returncode is None:
-            with contextlib.suppress(ProcessLookupError):
-                proc.terminate()
-            try:
-                await asyncio.wait_for(proc.wait(), timeout=2.0)
-            except TimeoutError:
-                with contextlib.suppress(ProcessLookupError):
-                    proc.kill()
-                with contextlib.suppress(Exception):
-                    await asyncio.wait_for(proc.wait(), timeout=1.0)
-        transport = getattr(proc, "_transport", None)
-        if transport is not None:
-            with contextlib.suppress(Exception):
-                transport.close()
-        await asyncio.sleep(0)
+        await terminate_process_group(proc, grace_seconds=2.0)
