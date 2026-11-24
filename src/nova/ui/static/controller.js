@@ -1297,6 +1297,20 @@ export class DesktopAppController {
             });
             return;
         }
+        if (env.event_type === "voice_speech_chunk") {
+            const chunkText = String(p["text"] ?? "");
+            const isFinal = Boolean(p["is_final"]);
+            const nextMessages = isFinal
+                ? this.#model.messages.map((m) => m.correlation_id === env.correlation_id && m.streaming
+                    ? { ...m, streaming: false }
+                    : m)
+                : this.#model.messages;
+            this.#updateModel({
+                messages: nextMessages,
+                lastMilestone: chunkText || this.#model.lastMilestone,
+            });
+            return;
+        }
         if (env.event_type === "voice_transcription") {
             const msg = p;
             this.#appendMessage(msg);
@@ -1350,12 +1364,12 @@ export class DesktopAppController {
             this.#sleepTimer = null;
         }
         const state = this.#model.callSession.state;
-        if (state !== "standby" && state !== "closed") {
+        if (state === "listening") {
             this.#sleepTimer = setTimeout(() => {
                 if (this.#disposed) {
                     return;
                 }
-                if (this.#model.callSession.state !== "standby" && this.#model.callSession.state !== "closed") {
+                if (this.#model.callSession.state === "listening") {
                     void this.triggerCallAction("end");
                 }
             }, 12000);

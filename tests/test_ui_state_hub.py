@@ -17,6 +17,7 @@ from nova.domain.events import (
     OrchestratorEventBus,
     RunnerFailureEvent,
     VoiceMilestoneEvent,
+    VoiceSpeechChunkEvent,
     VoiceTranscriptionEvent,
     WorkspaceChangedEvent,
 )
@@ -288,4 +289,59 @@ async def test_ui_state_hub_hydrates_and_persists_messages_in_sqlite(tmp_path: P
     finally:
         hub.close()
         await store.close()
+
+
+async def test_nova018_ui_state_hub_broadcasts_voice_speech_chunk_and_closes_on_final() -> None:
+    canary = "-".join(("SPEECH", "SEC", "9911"))
+    bus = OrchestratorEventBus()
+    hub = UiStateHub(event_bus=bus, extra_secrets_provider=lambda: (canary,))
+    hub.start()
+    sub = hub.subscribe_sse()
+    try:
+        await bus.publish(
+            ChatStreamEvent(
+                correlation_id="corr-sp",
+                delta="Explicación larga en curso.",
+                source="tier1_pi",
+                step_type="agent_response",
+            )
+        )
+        _ = await sub.queue.get()  # chat_stream
+
+        await bus.publish(
+            VoiceSpeechChunkEvent(
+                correlation_id="corr-sp",
+                text=f"Primera oración con secreto {canary}.",
+                chunk_index=0,
+                is_final=False,
+            )
+        )
+        item0 = await sub.queue.get()
+        assert item0.envelope is not None
+        assert item0.envelope.event_type == "voice_speech_chunk"
+        assert canary not in item0.envelope.payload["text"]
+        assert item0.envelope.payload["is_final"] is False
+
+        snap_mid = await hub.build_snapshot(csrf_token="csrf")
+        assert snap_mid.messages[0].streaming is True
+
+        await bus.publish(
+            VoiceSpeechChunkEvent(
+                correlation_id="corr-sp",
+                text="Segunda oración final.",
+                chunk_index=1,
+                is_final=True,
+            )
+        )
+        item1 = await sub.queue.get()
+        assert item1.envelope is not None
+        assert item1.envelope.event_type == "voice_speech_chunk"
+        assert item1.envelope.payload["chunk_index"] == 1
+        assert item1.envelope.payload["is_final"] is True
+
+        snap_end = await hub.build_snapshot(csrf_token="csrf")
+        assert snap_end.messages[0].streaming is False
+    finally:
+        hub.unsubscribe_sse(sub)
+        hub.close()
 

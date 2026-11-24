@@ -18,18 +18,24 @@ from nova.domain.events import (
     CallStateChangedEvent,
     OrchestratorEvent,
     OrchestratorEventBus,
+    VoiceMilestoneEvent,
+    VoiceSpeechChunkEvent,
     VoiceTranscriptionEvent,
 )
 from nova.domain.models import (
+    MAX_SPEECH_CHUNK_CHARS,
     AudioFrame,
     CallSession,
     CodingTaskRequest,
     CommandAuditInput,
     CommandAuditResult,
     CommandInterceptRequest,
+    NovaPersistedSettings,
+    PendingVoiceTask,
     RunnerProgressEvent,
     SynthesizedAudio,
     TranscriptionResult,
+    VoiceSettingsSection,
     WakeWordDetection,
 )
 from nova.domain.ports import (
@@ -297,3 +303,70 @@ def test_workspace_resolver_cache_is_thread_safe_under_concurrent_scans(tmp_path
 
     assert len(results) == 32
     assert results[0] == "servicio-0"
+
+
+def test_nova018_speech_chunk_event_and_pending_voice_task_boundaries() -> None:
+    long_sentence = (
+        "Este proyecto implementa Nova, un asistente local de ingenieria por voz que "
+        "combina audio completamente local sobre PipeWire con dos niveles de agentes "
+        "y controles estrictos de seguridad para ejecutar tareas sin interferencias."
+    )
+    assert len(long_sentence.split()) > 25
+
+    chunk = VoiceSpeechChunkEvent(
+        correlation_id="corr-speech-01",
+        text=f"  {long_sentence}  ",
+        chunk_index=0,
+        is_final=True,
+    )
+    assert chunk.text == long_sentence
+    assert chunk.chunk_index == 0
+    assert chunk.is_final is True
+
+    with pytest.raises(ValidationError):
+        VoiceSpeechChunkEvent(correlation_id="corr-speech-02", text="   ", chunk_index=0)
+
+    with pytest.raises(ValidationError):
+        VoiceSpeechChunkEvent(
+            correlation_id="corr-speech-03",
+            text="a" * (MAX_SPEECH_CHUNK_CHARS + 1),
+            chunk_index=0,
+        )
+
+    with pytest.raises(ValidationError):
+        VoiceSpeechChunkEvent(correlation_id="corr-speech-04", text="hola", chunk_index=-1)
+
+    # VoiceMilestoneEvent N/N-1 budget remains <= 25 words
+    with pytest.raises(ValidationError):
+        VoiceMilestoneEvent(correlation_id="corr-ms-over", summary_text=long_sentence)
+
+    task = PendingVoiceTask(
+        task_id="vtask-1",
+        correlation_id="corr-speech-01",
+        utterance="Explica el proyecto",
+        understood_summary="En nova-workspace: Explica el proyecto",
+        workspace_canonical_path="/home/dev/Proyectos/nova-workspace",
+        workspace_name="nova-workspace",
+        revision=1,
+        created_at_monotonic=10.0,
+        expires_at_monotonic=310.0,
+    )
+    assert task.revision == 1
+
+
+def test_nova018_voice_settings_nn1_defaults() -> None:
+    defaults = VoiceSettingsSection()
+    assert defaults.half_duplex_turn_mode is True
+    assert defaults.require_voice_confirmation is True
+
+    legacy = NovaPersistedSettings.model_validate(
+        {
+            "schema_version": "1.0",
+            "voice": {
+                "enable_voice": True,
+                "tts_engine": "piper",
+            },
+        }
+    )
+    assert legacy.voice.half_duplex_turn_mode is True
+    assert legacy.voice.require_voice_confirmation is True

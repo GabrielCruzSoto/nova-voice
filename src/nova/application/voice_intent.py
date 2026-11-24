@@ -55,6 +55,61 @@ _END_CALL_PHRASES: frozenset[str] = frozenset(
     }
 )
 
+_TASK_CONFIRM_PHRASES: frozenset[str] = frozenset(
+    {
+        "si",
+        "correcto",
+        "confirmar",
+        "confirmado",
+        "confirmo",
+        "adelante",
+        "dale",
+        "ejecutalo",
+        "ejecutar",
+        "hazlo",
+        "hacelo",
+        "procede",
+        "proceder",
+        "exacto",
+        "eso",
+        "eso mismo",
+        "si eso",
+        "si eso es",
+        "si eso mismo",
+        "si ejecutalo",
+        "si adelante",
+        "si dale",
+        "si confirmar",
+        "si confirmo",
+        "si correcto",
+        "si por favor",
+        "si hazlo",
+        "si hacelo",
+        "si procede",
+        "si eso es lo que quiero",
+        "si eso es lo que entiendo",
+    }
+)
+
+_TASK_CANCEL_PHRASES: frozenset[str] = frozenset(
+    {
+        "no",
+        "cancelar",
+        "cancela",
+        "cancelado",
+        "cancelalo",
+        "descartar",
+        "descarta",
+        "dejalo",
+        "olvidalo",
+        "detener",
+        "no cancelar",
+        "no gracias",
+        "mejor no",
+        "no lo hagas",
+    }
+)
+
 _PUNCT_STRIP_RE = re.compile(r"[^\w\s-]+", re.UNICODE)
 _WAKE_PREFIX_NORM_RE = re.compile(r"^(?:oye\s+nova|hey\s+nova)\b\s*")
 _WAKE_PREFIX_RAW_RE = re.compile(
@@ -85,6 +140,36 @@ class VoiceControlIntent(BaseModel):
     kind: VoiceControlIntentKind
     workspace_query: str | None = None
     utterance_text: str | None = None
+
+
+class VoiceConfirmationResult(BaseModel):
+    """Classified outcome for a spoken turn responding to a PendingVoiceTask (NOVA-018 OP-2)."""
+
+    model_config = ConfigDict(frozen=True, extra="ignore")
+
+    action: Literal["confirm", "cancel", "correct", "ignore_empty"]
+    cleaned_text: str = ""
+
+
+def classify_confirmation_response(transcript: str) -> VoiceConfirmationResult:
+    """Classify a spoken confirmation, cancellation, or correction deterministically."""
+    normalized = normalize_spoken_phrase(transcript)
+    if not normalized:
+        return VoiceConfirmationResult(action="ignore_empty")
+
+    stripped_norm = _WAKE_PREFIX_NORM_RE.sub("", normalized).strip()
+    if not stripped_norm:
+        return VoiceConfirmationResult(action="ignore_empty")
+
+    if stripped_norm in _TASK_CONFIRM_PHRASES:
+        return VoiceConfirmationResult(action="confirm", cleaned_text=stripped_norm)
+    if stripped_norm in _TASK_CANCEL_PHRASES:
+        return VoiceConfirmationResult(action="cancel", cleaned_text=stripped_norm)
+
+    cleaned = _WAKE_PREFIX_RAW_RE.sub("", transcript).strip()
+    if not cleaned:
+        return VoiceConfirmationResult(action="ignore_empty")
+    return VoiceConfirmationResult(action="correct", cleaned_text=cleaned)
 
 
 def classify_voice_control_intent(

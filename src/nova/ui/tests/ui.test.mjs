@@ -3148,5 +3148,168 @@ test("NOVA-016: Onboarding wizard displays OS remedies, provisions voice models,
   ctrl.dispose();
 });
 
+test("NOVA-018 AC-9: sleep timer runs only in listening (never thinking/executing/speaking) and SSE voice_speech_chunk updates streaming", async () => {
+  const scheduled = [];
+  const origSetTimeout = globalThis.setTimeout;
+  const origClearTimeout = globalThis.clearTimeout;
+  const clearedIds = new Set();
+  let nextId = 1;
+
+  globalThis.setTimeout = (fn, ms) => {
+    const id = nextId++;
+    scheduled.push({ id, fn, ms, active: true });
+    return id;
+  };
+  globalThis.clearTimeout = (id) => {
+    clearedIds.add(id);
+    for (const item of scheduled) {
+      if (item.id === id) {
+        item.active = false;
+      }
+    }
+  };
+
+  let sseController = null;
+  const encoder = new TextEncoder();
+  const postCalls = [];
+
+  const fakeFetch = async (url, init = {}) => {
+    const method = init.method ?? "GET";
+    if (method === "POST") {
+      postCalls.push(url);
+      return new Response(JSON.stringify({ ok: true, call_state: "standby" }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+    if (url === "/api/state") {
+      return new Response(
+        JSON.stringify({
+          schema_version: "1.3.0",
+          csrf_token: "csrf-nova018",
+          voice_enabled: true,
+          onboarding_required: false,
+          call_session: {
+            call_id: "call-18",
+            state: "standby",
+            turn_count: 0,
+            active_correlation_id: null,
+          },
+          active_workspace: null,
+          available_workspaces: [],
+          pending_approvals: [],
+          messages: [],
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      );
+    }
+    if (url === "/api/health") {
+      return new Response(
+        JSON.stringify({ all_ok: true, missing_critical_count: 0, missing_optional_count: 0, components: [] }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      );
+    }
+    if (url === "/api/models/status") {
+      return new Response(JSON.stringify({ status: "idle", all_installed: true, models: [] }), {
+        status: 200,
+        headers: { "Content-Type": "application/json" },
+      });
+    }
+    if (url === "/api/events") {
+      const stream = new ReadableStream({
+        start(controller) {
+          sseController = controller;
+        },
+      });
+      return new Response(stream, { status: 200 });
+    }
+    return new Response("{}", { status: 404 });
+  };
+
+  const emitSse = async (eventType, correlationId, payload, seq) => {
+    const frame =
+      `event: nova_event\ndata: ${JSON.stringify({
+        seq,
+        event_type: eventType,
+        correlation_id: correlationId,
+        timestamp: "2026-11-20T21:00:00Z",
+        payload,
+      })}\n\n`;
+    sseController.enqueue(encoder.encode(frame));
+    await Promise.resolve();
+    await Promise.resolve();
+  };
+
+  try {
+    const ctrl = new DesktopAppController({ fetchImpl: fakeFetch });
+    await ctrl.start();
+    await Promise.resolve();
+
+    // 1. Transition to listening -> arms 12s sleep timer
+    await emitSse("call_state_changed", "c-1", { call_id: "call-18", state: "listening", turn_count: 0 }, 1);
+    assert.equal(scheduled.filter((t) => t.active && t.ms === 12000).length, 1);
+
+    // 2. Transition to thinking, executing, speaking -> MUST clear 12s timer and NEVER arm it
+    for (const [idx, busyState] of ["thinking", "executing", "speaking"].entries()) {
+      await emitSse(
+        "call_state_changed",
+        "c-1",
+        { call_id: "call-18", state: busyState, turn_count: 1 },
+        idx + 2,
+      );
+      assert.equal(
+        scheduled.filter((t) => t.active && t.ms === 12000).length,
+        0,
+        `12s sleep timer must NOT be active in state '${busyState}'`,
+      );
+    }
+    assert.equal(postCalls.includes("/api/call/end"), false);
+
+    // 3. Streaming chat + voice_speech_chunk updates lastMilestone and closes streaming only on is_final=true
+    await emitSse(
+      "chat_stream",
+      "c-speech",
+      { message_id: "m-sp-1", delta: "Respuesta larga en curso.", source: "tier1_pi", step_type: "agent_response" },
+      10,
+    );
+    assert.equal(ctrl.model.messages[0].streaming, true);
+
+    await emitSse(
+      "voice_speech_chunk",
+      "c-speech",
+      { text: "Primera oración hablada.", chunk_index: 0, is_final: false, priority: "normal" },
+      11,
+    );
+    assert.equal(ctrl.model.lastMilestone, "Primera oración hablada.");
+    assert.equal(ctrl.model.messages[0].streaming, true);
+
+    await emitSse(
+      "voice_speech_chunk",
+      "c-speech",
+      { text: "Segunda oración final.", chunk_index: 1, is_final: true, priority: "normal" },
+      12,
+    );
+    assert.equal(ctrl.model.lastMilestone, "Segunda oración final.");
+    assert.equal(ctrl.model.messages[0].streaming, false);
+
+    // 4. Back in listening -> 12s timer fires and invokes POST /api/call/end
+    await emitSse("call_state_changed", "c-idle", { call_id: "call-18", state: "listening", turn_count: 0 }, 13);
+    const activeListeningTimers = scheduled.filter((t) => t.active && t.ms === 12000);
+    assert.equal(activeListeningTimers.length, 1);
+    activeListeningTimers[0].fn();
+    await Promise.resolve();
+    await Promise.resolve();
+    assert.ok(postCalls.includes("/api/call/end"));
+
+    ctrl.dispose();
+  } finally {
+    globalThis.setTimeout = origSetTimeout;
+    globalThis.clearTimeout = origClearTimeout;
+    if (sseController) {
+      sseController.close();
+    }
+  }
+});
+
 
 

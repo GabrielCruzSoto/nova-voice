@@ -88,6 +88,8 @@ def serialize_settings_toml(settings: NovaPersistedSettings) -> str:
         f"wakeword_threshold = {_toml_value(settings.voice.wakeword_threshold)}",
         f"speech_threshold = {_toml_value(settings.voice.speech_threshold)}",
         f"barge_in_threshold = {_toml_value(settings.voice.barge_in_threshold)}",
+        f"half_duplex_turn_mode = {_toml_value(settings.voice.half_duplex_turn_mode)}",
+        f"require_voice_confirmation = {_toml_value(settings.voice.require_voice_confirmation)}",
         "",
         "[models]",
         f"tier1_engine = {_toml_value(settings.models.tier1_engine)}",

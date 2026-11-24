@@ -239,6 +239,8 @@ class NovaDesktopConfig(BaseModel):
     wakeword_threshold: float = Field(default=0.60, gt=0.0, le=1.0)
     speech_threshold: float = Field(default=0.50, gt=0.0, le=1.0)
     barge_in_threshold: float = Field(default=0.60, gt=0.0, le=1.0)
+    half_duplex_turn_mode: bool = True
+    require_voice_confirmation: bool = True
     ptt_mode: PttMode = "single_turn"
     global_shortcut: str = Field(default="Super+Shift+Space", min_length=1)
     remember_workspace: bool = True
@@ -393,6 +395,7 @@ def build_default_voice_coordinator(
             speech_threshold=config.speech_threshold,
             barge_in_threshold=config.barge_in_threshold,
             ptt_mode=config.ptt_mode,
+            half_duplex_turn_mode=config.half_duplex_turn_mode,
             min_speech_rms=0.005,
             barge_in_grace_seconds=0.60,
             barge_in_min_frames=10,
@@ -671,6 +674,9 @@ class NovaDesktopRuntime:
             )
         if self._orchestrator is not None:
             self._orchestrator.update_models(tier2_model=updated.models.tier2_model)
+            self._orchestrator.update_settings(
+                require_voice_confirmation=updated.voice.require_voice_confirmation
+            )
         if self._diagnostics_service is not None:
             self._diagnostics_service.update_config(
                 pi_provider=updated.models.pi_provider,
@@ -688,6 +694,7 @@ class NovaDesktopRuntime:
                 ptt_mode=updated.shortcuts.ptt_mode,
                 speech_threshold=updated.voice.speech_threshold,
                 barge_in_threshold=updated.voice.barge_in_threshold,
+                half_duplex_turn_mode=updated.voice.half_duplex_turn_mode,
             )
         audio_in = getattr(voice_coord, "_audio_input", None)
         if audio_in is not None and callable(getattr(audio_in, "update_settings", None)):
@@ -857,6 +864,7 @@ class NovaDesktopRuntime:
                     tier1_engine=eff_t1_engine,
                     tier2_engine=eff_t2_engine,
                     default_tier2_model=self._config.tier2_model,
+                    require_voice_confirmation=self._config.require_voice_confirmation,
                 ),
                 security_gatekeeper=gatekeeper,
                 history_store=self._history_store,
@@ -1541,6 +1549,8 @@ def config_from_namespace(
         wakeword_threshold=persisted.voice.wakeword_threshold,
         speech_threshold=persisted.voice.speech_threshold,
         barge_in_threshold=persisted.voice.barge_in_threshold,
+        half_duplex_turn_mode=persisted.voice.half_duplex_turn_mode,
+        require_voice_confirmation=persisted.voice.require_voice_confirmation,
         ptt_mode=persisted.shortcuts.ptt_mode,
         global_shortcut=persisted.shortcuts.global_shortcut,
         remember_workspace=persisted.general.remember_workspace,

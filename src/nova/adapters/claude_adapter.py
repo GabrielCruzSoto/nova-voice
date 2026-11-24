@@ -40,6 +40,7 @@ class ClaudeCodeConfig(BaseModel):
     provider_env: dict[str, str] | None = None
     enable_gatekeeper_hook: bool = True
     bundled_hook_path: str = Field(default=_BUNDLED_CLAUDE_HOOK, min_length=1)
+    append_system_prompt: str | None = None
 
 
 def _extract_claude_text_delta(record: dict[str, Any]) -> str:
@@ -176,6 +177,8 @@ class ClaudeCodeAdapter:
             cmd.extend(["--model", request.model.strip()])
         if request.conversation_id:
             cmd.extend(["--resume", request.conversation_id])
+        if self._config.append_system_prompt and self._config.append_system_prompt.strip():
+            cmd.extend(["--append-system-prompt", self._config.append_system_prompt.strip()])
         if settings_file is not None:
             cmd.extend(["--settings", str(settings_file)])
 

@@ -11,12 +11,13 @@ import re
 import time
 import uuid
 import weakref
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from pathlib import Path
 from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
+from nova.application.voice_intent import classify_confirmation_response
 from nova.domain.errors import (
     GatekeeperError,
     NovaDomainError,
@@ -28,11 +29,14 @@ from nova.domain.events import (
     OrchestratorEventBus,
     RunnerFailureEvent,
     VoiceMilestoneEvent,
+    VoiceSpeechChunkEvent,
 )
 from nova.domain.models import (
+    MAX_SPEECH_CHUNK_CHARS,
     AgentEngineId,
     AgentSessionPointer,
     CodingTaskRequest,
+    PendingVoiceTask,
     ResolveWorkspaceRequest,
     WorkspaceContext,
     WorkspaceQueryMode,
@@ -65,7 +69,19 @@ _HIGH_COMPLEXITY_KEYWORDS: tuple[str, ...] = (
 
 _DELEGATE_MARKER_RE = re.compile(r"\[delegate_tier2\]", re.IGNORECASE)
 _CODE_BLOCK_RE = re.compile(r"```.*?```", re.DOTALL)
+_PSEUDO_XML_BLOCK_RE = re.compile(
+    r"<(cd|search|bash|shell|command|tool|thinking|think)\b[^>]*>.*?</\1>",
+    re.IGNORECASE | re.DOTALL,
+)
+_XML_OPEN_TAG_RE = re.compile(
+    r"<(cd|search|bash|shell|command|tool|thinking|think)\b[^>]*>",
+    re.IGNORECASE,
+)
+_STRAY_TAG_RE = re.compile(r"</?(?!REDACTED:)[a-zA-Z_][\w-]*\b[^>]*>")
+_URL_RE = re.compile(r"https?://\S+", re.IGNORECASE)
 _PATH_TOKEN_RE = re.compile(r"(?:~|/)[\w./-]+")
+_MD_LINE_PREFIX_RE = re.compile(r"(?m)^\s*(?:#{1,6}\s+|[-*•]\s+|\d+\.\s+|>\s*)")
+_SENTENCE_BOUNDARY_RE = re.compile(r"(?:[.!?…]+(?:\s+|$)|\n\s*\n+)")
 
 
 @contextlib.asynccontextmanager
@@ -106,6 +122,9 @@ class OrchestratorSettings(BaseModel):
     tier1_engine: AgentEngineId = "pi"
     tier2_engine: AgentEngineId = "agy"
     default_tier2_model: str = Field(default="claude-opus-5-5-high", min_length=1)
+    require_voice_confirmation: bool = False
+    voice_confirmation_ttl_seconds: float = Field(default=300.0, ge=30.0, le=900.0)
+    max_voice_confirmation_revisions: int = Field(default=8, ge=1, le=20)
 
 
 def classify_complexity(utterance: str) -> Literal["low", "high"]:
@@ -120,6 +139,221 @@ def classify_complexity(utterance: str) -> Literal["low", "high"]:
     return "low"
 
 
+def sanitize_spoken_chunk(
+    raw_text: str,
+    *,
+    extra_secrets: tuple[str, ...] = (),
+) -> str:
+    """Clean Markdown, code blocks, XML pseudo-tags, paths, and secrets for natural TTS."""
+    redacted_first = redact_sensitive_text(raw_text, extra_secrets=extra_secrets)
+    without_code = _CODE_BLOCK_RE.sub(" ", redacted_first)
+    without_xml = _PSEUDO_XML_BLOCK_RE.sub(" ", without_code)
+    without_tags = _STRAY_TAG_RE.sub(" ", without_xml)
+    without_urls = _URL_RE.sub("enlace", without_tags)
+    without_paths = _PATH_TOKEN_RE.sub("archivo del proyecto", without_urls)
+    redacted = redact_sensitive_text(without_paths, extra_secrets=extra_secrets)
+    without_prefixes = _MD_LINE_PREFIX_RE.sub(" ", redacted)
+    cleaned = re.sub(r"[`*_~|]+", " ", without_prefixes)
+    cleaned = re.sub(r"\s+([,.;:!?])", r"\1", cleaned)
+    normalized = " ".join(cleaned.split())
+    if not any(ch.isalnum() for ch in normalized):
+        return ""
+    return normalized
+
+
+def _split_long_spoken_text(text: str, *, max_chars: int) -> list[str]:
+    """Split an over-long sanitized sentence cleanly at clause or word boundaries."""
+    limit = min(max_chars, MAX_SPEECH_CHUNK_CHARS)
+    remaining = text.strip()
+    if not remaining:
+        return []
+    parts: list[str] = []
+    while len(remaining) > limit:
+        window = remaining[:limit]
+        cut = -1
+        for sep in (". ", "? ", "! ", "; ", ", ", ": "):
+            pos = window.rfind(sep)
+            if pos >= limit // 3:
+                cut = max(cut, pos + len(sep) - 1)
+        if cut < 0:
+            space_pos = window.rfind(" ")
+            cut = space_pos if space_pos > 0 else limit
+        head = remaining[:cut].strip()
+        if head:
+            parts.append(head)
+        remaining = remaining[cut:].strip()
+    if remaining:
+        parts.append(remaining)
+    return parts
+
+
+class VoiceSentenceStreamSplitter:
+    """Incremental sentence splitter for streaming spoken TTS chunks (NOVA-018 OP-1)."""
+
+    def __init__(
+        self,
+        *,
+        extra_secrets: tuple[str, ...] = (),
+        min_chunk_chars: int = 24,
+        target_max_chars: int = 240,
+    ) -> None:
+        self._extra_secrets = extra_secrets
+        self._min_chunk_chars = max(1, min_chunk_chars)
+        self._target_max_chars = min(max(60, target_max_chars), MAX_SPEECH_CHUNK_CHARS)
+        self._raw_buf = ""
+        self._in_code_fence = False
+        self._xml_block_tag: str | None = None
+
+    def _consume_suppressed_blocks(self) -> None:
+        while True:
+            if self._in_code_fence:
+                end_fence = self._raw_buf.find("```")
+                if end_fence < 0:
+                    # Keep up to 2 trailing backticks in case closing fence splits across deltas
+                    self._raw_buf = self._raw_buf[-2:] if self._raw_buf.endswith("`") else ""
+                    return
+                self._raw_buf = self._raw_buf[end_fence + 3 :]
+                self._in_code_fence = False
+                continue
+
+            if self._xml_block_tag is not None:
+                close_re = re.compile(rf"</{re.escape(self._xml_block_tag)}\s*>", re.IGNORECASE)
+                match = close_re.search(self._raw_buf)
+                if match is None:
+                    self._raw_buf = self._raw_buf[-24:]
+                    return
+                self._raw_buf = self._raw_buf[match.end() :]
+                self._xml_block_tag = None
+                continue
+            return
+
+    def _extract_safe_prefix(self) -> tuple[str, bool]:
+        """Return (speakable_prefix, blocked_by_open_block) consuming suppressed spans."""
+        self._consume_suppressed_blocks()
+        if self._in_code_fence or self._xml_block_tag is not None:
+            return "", True
+
+        fence_idx = self._raw_buf.find("```")
+        xml_match = _XML_OPEN_TAG_RE.search(self._raw_buf)
+        xml_idx = xml_match.start() if xml_match is not None else -1
+
+        if fence_idx >= 0 and (xml_idx < 0 or fence_idx <= xml_idx):
+            prefix = self._raw_buf[:fence_idx]
+            self._raw_buf = self._raw_buf[fence_idx + 3 :]
+            self._in_code_fence = True
+            self._consume_suppressed_blocks()
+            return prefix, True
+
+        if xml_match is not None:
+            prefix = self._raw_buf[:xml_idx]
+            self._xml_block_tag = xml_match.group(1)
+            self._raw_buf = self._raw_buf[xml_match.end() :]
+            self._consume_suppressed_blocks()
+            return prefix, True
+
+        return self._raw_buf, False
+
+    def feed(self, delta: str) -> list[str]:
+        """Feed a streamed LLM delta and emit any complete spoken sentences immediately."""
+        if not delta:
+            return []
+        self._raw_buf += delta
+        emitted: list[str] = []
+
+        while True:
+            self._consume_suppressed_blocks()
+            if self._in_code_fence or self._xml_block_tag is not None:
+                break
+
+            fence_idx = self._raw_buf.find("```")
+            xml_match = _XML_OPEN_TAG_RE.search(self._raw_buf)
+            xml_idx = xml_match.start() if xml_match is not None else -1
+            if fence_idx >= 0 or xml_idx >= 0:
+                prefix, _ = self._extract_safe_prefix()
+                cleaned_prefix = sanitize_spoken_chunk(prefix, extra_secrets=self._extra_secrets)
+                if cleaned_prefix:
+                    emitted.extend(
+                        _split_long_spoken_text(
+                            cleaned_prefix,
+                            max_chars=self._target_max_chars,
+                        )
+                    )
+                continue
+
+            # Emit completed sentence only once subsequent text has started so final chunk
+            # naturally flushes with is_final=True when the stream ends. Scan across multiple
+            # boundaries so a short prefix ("Claro. ", "1. ") never stalls streaming (F3).
+            emitted_sentence = False
+            for match in _SENTENCE_BOUNDARY_RE.finditer(self._raw_buf):
+                if not self._raw_buf[match.end() :].strip():
+                    break
+                candidate = self._raw_buf[: match.end()]
+                cleaned = sanitize_spoken_chunk(candidate, extra_secrets=self._extra_secrets)
+                if len(cleaned) >= self._min_chunk_chars or cleaned.endswith(("?", "!")):
+                    self._raw_buf = self._raw_buf[match.end() :]
+                    emitted.extend(
+                        _split_long_spoken_text(cleaned, max_chars=self._target_max_chars)
+                    )
+                    emitted_sentence = True
+                    break
+            if emitted_sentence:
+                continue
+
+            if len(self._raw_buf) >= self._target_max_chars * 2:
+                # Preserve a short raw tail so split ``` or <tag delimiters are not corrupted
+                tail_guard = 12
+                head_raw = self._raw_buf[:-tail_guard]
+                tail_raw = self._raw_buf[-tail_guard:]
+                cleaned_head = sanitize_spoken_chunk(
+                    head_raw,
+                    extra_secrets=self._extra_secrets,
+                )
+                split_parts = _split_long_spoken_text(
+                    cleaned_head,
+                    max_chars=self._target_max_chars,
+                )
+                if len(split_parts) > 1:
+                    emitted.extend(split_parts[:-1])
+                    self._raw_buf = split_parts[-1] + " " + tail_raw
+                    continue
+                if len(split_parts) == 1:
+                    emitted.append(split_parts[0])
+                    self._raw_buf = tail_raw
+                    continue
+            break
+
+        return emitted
+
+    def flush(self) -> list[str]:
+        """Drain remaining speakable text at end of stream."""
+        self._consume_suppressed_blocks()
+        if self._in_code_fence or self._xml_block_tag is not None:
+            self._raw_buf = ""
+            self._in_code_fence = False
+            self._xml_block_tag = None
+            return []
+        leftover = self._raw_buf
+        self._raw_buf = ""
+        cleaned = sanitize_spoken_chunk(leftover, extra_secrets=self._extra_secrets)
+        if not cleaned:
+            return []
+        return _split_long_spoken_text(cleaned, max_chars=self._target_max_chars)
+
+    @classmethod
+    def split_text(
+        cls,
+        text: str,
+        *,
+        extra_secrets: tuple[str, ...] = (),
+        target_max_chars: int = 240,
+    ) -> list[str]:
+        """Split a complete response string into bounded sanitized spoken chunks."""
+        splitter = cls(extra_secrets=extra_secrets, target_max_chars=target_max_chars)
+        chunks = splitter.feed(text)
+        chunks.extend(splitter.flush())
+        return chunks
+
+
 def sanitize_for_voice(
     raw_text: str,
     fallback: str,
@@ -127,10 +361,7 @@ def sanitize_for_voice(
     extra_secrets: tuple[str, ...] = (),
 ) -> str:
     """Strip code blocks and filesystem paths, returning a <=25-word spoken summary."""
-    without_code = _CODE_BLOCK_RE.sub(" ", raw_text)
-    without_paths = _PATH_TOKEN_RE.sub("archivo del proyecto", without_code)
-    redacted = redact_sensitive_text(without_paths, extra_secrets=extra_secrets)
-    cleaned = re.sub(r"[`*_#>]+", " ", redacted)
+    cleaned = sanitize_spoken_chunk(raw_text, extra_secrets=extra_secrets)
     words = [w for w in cleaned.split() if w]
     if not words:
         words = fallback.split()
@@ -150,6 +381,7 @@ class NovaOrchestrator:
         settings: OrchestratorSettings | None = None,
         security_gatekeeper: SecurityGatekeeperPort | None = None,
         history_store: HistoryStorePort | None = None,
+        clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self._workspace_resolver = workspace_resolver
         self._tier1_client = tier1_client
@@ -158,10 +390,40 @@ class NovaOrchestrator:
         self._settings = settings or OrchestratorSettings()
         self._security_gatekeeper = security_gatekeeper
         self._history_store = history_store
+        self._clock = clock
         self._tier2_conversations: dict[str, str] = {}
+        self._pending_voice_task: PendingVoiceTask | None = None
         self._turn_lock = asyncio.Lock()
         self._active_turn_task: asyncio.Task[None] | None = None
         self._barge_in_cancelled: weakref.WeakSet[asyncio.Task[None]] = weakref.WeakSet()
+
+    def _prune_expired_voice_task(self) -> PendingVoiceTask | None:
+        task = self._pending_voice_task
+        if task is None:
+            return None
+        if self._clock() >= task.expires_at_monotonic:
+            self._pending_voice_task = None
+            self._log(
+                "voice_task_expired",
+                task_id=task.task_id,
+                correlation_id=task.correlation_id,
+            )
+            return None
+        return task
+
+    @property
+    def pending_voice_task(self) -> PendingVoiceTask | None:
+        """Return currently active non-expired PendingVoiceTask, if any."""
+        return self._prune_expired_voice_task()
+
+    def update_settings(self, *, require_voice_confirmation: bool | None = None) -> None:
+        """Hot-update voice confirmation behavior in RAM (NOVA-018)."""
+        if require_voice_confirmation is not None:
+            self._settings = self._settings.model_copy(
+                update={"require_voice_confirmation": require_voice_confirmation}
+            )
+            if not require_voice_confirmation:
+                self._pending_voice_task = None
 
     def update_models(self, *, tier2_model: str | None = None) -> None:
         """Hot-update default Tier 2 model for future delegations."""
@@ -284,6 +546,7 @@ class NovaOrchestrator:
                 allowed_project_paths=project_paths,
                 session_id=tier1_session_id,
             )
+            self._pending_voice_task = None
             self._log(
                 "workspace_selected",
                 correlation_id=corr_id,
@@ -318,6 +581,7 @@ class NovaOrchestrator:
                 workspace_active=False,
                 allowed_project_paths=(),
             )
+            self._pending_voice_task = None
             self._log("workspace_cleared", correlation_id=corr_id)
             await self._event_bus.publish(
                 VoiceMilestoneEvent(
@@ -327,17 +591,281 @@ class NovaOrchestrator:
                 )
             )
 
+    async def _publish_spoken_text_chunks(
+        self,
+        text: str,
+        *,
+        correlation_id: str,
+        fallback: str,
+        priority: Literal["normal", "interrupt"] = "normal",
+    ) -> None:
+        chunks = VoiceSentenceStreamSplitter.split_text(
+            text,
+            extra_secrets=self._extra_secrets(),
+        )
+        if not chunks:
+            cleaned_fb = sanitize_spoken_chunk(fallback, extra_secrets=self._extra_secrets())
+            safe_fb = cleaned_fb or "Operación completada."
+            chunks = _split_long_spoken_text(safe_fb, max_chars=MAX_SPEECH_CHUNK_CHARS)
+            if not chunks:
+                chunks = ["Operación completada."]
+        last_idx = len(chunks) - 1
+        for idx, chunk in enumerate(chunks):
+            await self._event_bus.publish(
+                VoiceSpeechChunkEvent(
+                    correlation_id=correlation_id,
+                    text=chunk,
+                    chunk_index=idx,
+                    is_final=(idx == last_idx),
+                    priority=priority,
+                )
+            )
+
+    def _build_confirmation_message(
+        self,
+        understood_utterance: str,
+        active_ws: WorkspaceContext | None,
+        *,
+        is_revision: bool = False,
+    ) -> str:
+        prefix = "Actualicé la instrucción. " if is_revision else ""
+        if active_ws is not None:
+            return (
+                f"{prefix}Entendí que en el proyecto {active_ws.name} quieres que haga lo "
+                f"siguiente: {understood_utterance}. "
+                "¿Es correcto? Di Oye Nova, sí para ejecutarlo, o dime qué corregir."
+            )
+        return (
+            f"{prefix}Entendí que quieres lo siguiente: {understood_utterance}. "
+            "¿Es correcto? Di Oye Nova, sí para continuar, o dime qué corregir."
+        )
+
     async def handle_user_utterance(
         self,
         utterance: str,
         correlation_id: str | None = None,
+        *,
+        origin: Literal["chat", "voice"] = "chat",
     ) -> None:
-        """Route a user utterance by complexity and emit synchronized Chat + Voice events."""
+        """Route a user utterance by origin/complexity and emit synchronized Chat + Voice events."""
         corr_id = correlation_id or f"corr-{uuid.uuid4()}"
         async with self._turn_lock:
             active_ws = self._workspace_resolver.active_context
+            effective_utterance = utterance
+            speak_full_response = origin == "voice"
+
+            if origin == "voice" and self._settings.require_voice_confirmation:
+                pending = self._prune_expired_voice_task()
+                decision = classify_confirmation_response(utterance)
+                if decision.action == "ignore_empty":
+                    return
+
+                if pending is None:
+                    if decision.action in ("confirm", "cancel"):
+                        msg = (
+                            "No hay ninguna tarea pendiente para confirmar. "
+                            "Dime qué necesitas que haga."
+                            if decision.action == "confirm"
+                            else "No hay ninguna tarea pendiente para cancelar."
+                        )
+                        await self._event_bus.publish(
+                            ChatStreamEvent(
+                                correlation_id=corr_id,
+                                delta=msg,
+                                source="tier1_pi",
+                                step_type="voice_confirmation",
+                            )
+                        )
+                        await self._publish_spoken_text_chunks(
+                            msg,
+                            correlation_id=corr_id,
+                            fallback=msg,
+                        )
+                        return
+
+                    redacted_draft = self._redact(decision.cleaned_text).strip()
+                    if not redacted_draft:
+                        return
+                    if active_ws is None and classify_complexity(redacted_draft) == "high":
+                        self._log(
+                            "utterance_blocked_no_workspace",
+                            correlation_id=corr_id,
+                            tier="high",
+                        )
+                        warn_msg = (
+                            "Para realizar tareas de código o modificar archivos, "
+                            "por favor selecciona un proyecto en pantalla primero."
+                        )
+                        await self._event_bus.publish(
+                            ChatStreamEvent(
+                                correlation_id=corr_id,
+                                delta=warn_msg,
+                                source="tier1_pi",
+                                step_type="agent_response",
+                            )
+                        )
+                        await self._publish_spoken_text_chunks(
+                            warn_msg,
+                            correlation_id=corr_id,
+                            fallback=warn_msg,
+                        )
+                        return
+
+                    now = self._clock()
+                    summary = (
+                        f"En {active_ws.name}: {redacted_draft}"
+                        if active_ws is not None
+                        else redacted_draft
+                    )
+                    task = PendingVoiceTask(
+                        task_id=f"vtask-{uuid.uuid4()}",
+                        correlation_id=corr_id,
+                        utterance=redacted_draft,
+                        understood_summary=summary,
+                        workspace_canonical_path=(
+                            active_ws.canonical_path if active_ws is not None else None
+                        ),
+                        workspace_name=active_ws.name if active_ws is not None else None,
+                        revision=1,
+                        created_at_monotonic=now,
+                        expires_at_monotonic=now + self._settings.voice_confirmation_ttl_seconds,
+                    )
+                    self._pending_voice_task = task
+                    self._log(
+                        "voice_task_confirmation_requested",
+                        task_id=task.task_id,
+                        correlation_id=corr_id,
+                        workspace_name=active_ws.name if active_ws is not None else "none",
+                    )
+                    confirm_msg = self._build_confirmation_message(
+                        redacted_draft,
+                        active_ws,
+                        is_revision=False,
+                    )
+                    await self._event_bus.publish(
+                        ChatStreamEvent(
+                            correlation_id=corr_id,
+                            delta=confirm_msg,
+                            source="tier1_pi",
+                            step_type="voice_confirmation",
+                        )
+                    )
+                    await self._publish_spoken_text_chunks(
+                        confirm_msg,
+                        correlation_id=corr_id,
+                        fallback=confirm_msg,
+                    )
+                    return
+
+                # Active pending task exists
+                if decision.action == "cancel":
+                    self._pending_voice_task = None
+                    self._log(
+                        "voice_task_cancelled",
+                        task_id=pending.task_id,
+                        correlation_id=corr_id,
+                    )
+                    cancel_msg = "Entendido, cancelé la tarea pendiente."
+                    await self._event_bus.publish(
+                        ChatStreamEvent(
+                            correlation_id=corr_id,
+                            delta=cancel_msg,
+                            source="tier1_pi",
+                            step_type="voice_confirmation",
+                        )
+                    )
+                    await self._publish_spoken_text_chunks(
+                        cancel_msg,
+                        correlation_id=corr_id,
+                        fallback=cancel_msg,
+                    )
+                    return
+
+                if decision.action == "correct":
+                    redacted_corr = self._redact(decision.cleaned_text).strip()
+                    if not redacted_corr:
+                        return
+                    if pending.revision >= self._settings.max_voice_confirmation_revisions:
+                        self._pending_voice_task = None
+                        self._log(
+                            "voice_task_revision_limit_reached",
+                            task_id=pending.task_id,
+                            correlation_id=corr_id,
+                        )
+                        limit_msg = (
+                            "Alcanzaste el máximo de correcciones para esta tarea. "
+                            "Cancelé el borrador; dime de nuevo la instrucción completa."
+                        )
+                        await self._event_bus.publish(
+                            ChatStreamEvent(
+                                correlation_id=corr_id,
+                                delta=limit_msg,
+                                source="tier1_pi",
+                                step_type="voice_confirmation",
+                            )
+                        )
+                        await self._publish_spoken_text_chunks(
+                            limit_msg,
+                            correlation_id=corr_id,
+                            fallback=limit_msg,
+                        )
+                        return
+                    now = self._clock()
+                    next_rev = pending.revision + 1
+                    updated_utterance = f"{pending.utterance}. Corrección: {redacted_corr}"
+                    updated_summary = (
+                        f"En {active_ws.name}: {updated_utterance}"
+                        if active_ws is not None
+                        else updated_utterance
+                    )
+                    updated_task = pending.model_copy(
+                        update={
+                            "correlation_id": corr_id,
+                            "utterance": updated_utterance,
+                            "understood_summary": updated_summary,
+                            "revision": next_rev,
+                            "expires_at_monotonic": (
+                                now + self._settings.voice_confirmation_ttl_seconds
+                            ),
+                        }
+                    )
+                    self._pending_voice_task = updated_task
+                    self._log(
+                        "voice_task_corrected",
+                        task_id=updated_task.task_id,
+                        correlation_id=corr_id,
+                    )
+                    confirm_msg = self._build_confirmation_message(
+                        updated_utterance,
+                        active_ws,
+                        is_revision=True,
+                    )
+                    await self._event_bus.publish(
+                        ChatStreamEvent(
+                            correlation_id=corr_id,
+                            delta=confirm_msg,
+                            source="tier1_pi",
+                            step_type="voice_confirmation",
+                        )
+                    )
+                    await self._publish_spoken_text_chunks(
+                        confirm_msg,
+                        correlation_id=corr_id,
+                        fallback=confirm_msg,
+                    )
+                    return
+
+                # Explicit confirmation -> atomically consume pending task and execute
+                self._pending_voice_task = None
+                effective_utterance = pending.utterance
+                self._log(
+                    "voice_task_confirmed",
+                    task_id=pending.task_id,
+                    correlation_id=corr_id,
+                )
+
             if active_ws is None:
-                tier = classify_complexity(utterance)
+                tier = classify_complexity(effective_utterance)
                 if tier == "high":
                     self._log(
                         "utterance_blocked_no_workspace",
@@ -368,11 +896,20 @@ class NovaOrchestrator:
                     return
 
                 turn_task = asyncio.create_task(
-                    self._execute_conversational_utterance(utterance, corr_id)
+                    self._execute_conversational_utterance(
+                        effective_utterance,
+                        corr_id,
+                        speak_full_response=speak_full_response,
+                    )
                 )
             else:
                 turn_task = asyncio.create_task(
-                    self._execute_utterance(utterance, active_ws, corr_id)
+                    self._execute_utterance(
+                        effective_utterance,
+                        active_ws,
+                        corr_id,
+                        speak_full_response=speak_full_response,
+                    )
                 )
             self._active_turn_task = turn_task
             try:
@@ -393,6 +930,8 @@ class NovaOrchestrator:
         self,
         utterance: str,
         corr_id: str,
+        *,
+        speak_full_response: bool = False,
     ) -> None:
         self._log(
             "utterance_routed",
@@ -401,7 +940,11 @@ class NovaOrchestrator:
             workspace_name="none",
         )
         try:
-            await self._run_tier1(utterance, corr_id)
+            await self._run_tier1(
+                utterance,
+                corr_id,
+                speak_full_response=speak_full_response,
+            )
         except NovaDomainError as exc:
             redacted_err = self._redact(exc.sanitized_message)
             self._log(
@@ -433,6 +976,8 @@ class NovaOrchestrator:
         utterance: str,
         active_ws: WorkspaceContext,
         corr_id: str,
+        *,
+        speak_full_response: bool = False,
     ) -> None:
         tier = classify_complexity(utterance)
         self._log(
@@ -443,9 +988,18 @@ class NovaOrchestrator:
         )
         try:
             if tier == "low":
-                await self._run_tier1(utterance, corr_id)
+                await self._run_tier1(
+                    utterance,
+                    corr_id,
+                    speak_full_response=speak_full_response,
+                )
             else:
-                await self._run_tier2(utterance, active_ws.canonical_path, corr_id)
+                await self._run_tier2(
+                    utterance,
+                    active_ws.canonical_path,
+                    corr_id,
+                    speak_full_response=speak_full_response,
+                )
         except NovaDomainError as exc:
             redacted_err = self._redact(exc.sanitized_message)
             self._log(
@@ -475,6 +1029,7 @@ class NovaOrchestrator:
     async def barge_in(self) -> None:
         """Interrupt active speech/agent turn immediately on user voice activity."""
         self._log("barge_in_triggered")
+        self._pending_voice_task = None
         turn_task = self._active_turn_task
         if turn_task is not None and not turn_task.done():
             self._barge_in_cancelled.add(turn_task)
@@ -503,8 +1058,20 @@ class NovaOrchestrator:
             resolved_by=resolved_by,
         )
 
-    async def _run_tier1(self, utterance: str, correlation_id: str) -> None:
+    async def _run_tier1(
+        self,
+        utterance: str,
+        correlation_id: str,
+        *,
+        speak_full_response: bool = False,
+    ) -> None:
         collected: list[str] = []
+        splitter = (
+            VoiceSentenceStreamSplitter(extra_secrets=self._extra_secrets())
+            if speak_full_response
+            else None
+        )
+        chunk_index = 0
         async with _closing_async_iter(self._tier1_client.stream_prompt(utterance)) as stream:
             async for delta in stream:
                 redacted_delta = self._redact(delta)
@@ -517,6 +1084,18 @@ class NovaOrchestrator:
                         step_type="agent_response",
                     )
                 )
+                if splitter is not None:
+                    for ready_chunk in splitter.feed(redacted_delta):
+                        await self._event_bus.publish(
+                            VoiceSpeechChunkEvent(
+                                correlation_id=correlation_id,
+                                text=ready_chunk,
+                                chunk_index=chunk_index,
+                                is_final=False,
+                                priority="normal",
+                            )
+                        )
+                        chunk_index += 1
 
         joined = "".join(collected)
         active_ws = self._workspace_resolver.active_context
@@ -555,6 +1134,27 @@ class NovaOrchestrator:
                         )
                     )
 
+        if splitter is not None:
+            tail = splitter.flush()
+            if not tail:
+                tail = [
+                    "Listo, completé la consulta en el proyecto."
+                    if chunk_index == 0
+                    else "Tienes el detalle en el chat."
+                ]
+            for idx, chunk in enumerate(tail):
+                await self._event_bus.publish(
+                    VoiceSpeechChunkEvent(
+                        correlation_id=correlation_id,
+                        text=chunk,
+                        chunk_index=chunk_index,
+                        is_final=(idx == len(tail) - 1),
+                        priority="normal",
+                    )
+                )
+                chunk_index += 1
+            return
+
         await self._event_bus.publish(
             VoiceMilestoneEvent(
                 correlation_id=correlation_id,
@@ -572,22 +1172,44 @@ class NovaOrchestrator:
         utterance: str,
         workspace_path: str,
         correlation_id: str,
+        *,
+        speak_full_response: bool = False,
     ) -> None:
         cleaned_prompt = _DELEGATE_MARKER_RE.sub("", utterance).strip() or utterance.strip()
         prior_conv = self._tier2_conversations.get(workspace_path)
+        chunk_index = 0
 
-        await self._event_bus.publish(
-            VoiceMilestoneEvent(
-                correlation_id=correlation_id,
-                summary_text=(
-                    "Tarea compleja detectada. Delegando ejecucion profunda a Antigravity."
-                ),
-                priority="normal",
+        if speak_full_response:
+            await self._event_bus.publish(
+                VoiceSpeechChunkEvent(
+                    correlation_id=correlation_id,
+                    text="Tarea compleja detectada. Delegando ejecución profunda.",
+                    chunk_index=chunk_index,
+                    is_final=False,
+                    priority="normal",
+                )
             )
-        )
+            chunk_index += 1
+        else:
+            await self._event_bus.publish(
+                VoiceMilestoneEvent(
+                    correlation_id=correlation_id,
+                    summary_text=(
+                        "Tarea compleja detectada. Delegando ejecucion profunda a Antigravity."
+                    ),
+                    priority="normal",
+                )
+            )
 
         last_milestone_stage: str | None = None
         final_summary = "Ejecucion profunda completada en Antigravity."
+        final_response_raw = ""
+        splitter = (
+            VoiceSentenceStreamSplitter(extra_secrets=self._extra_secrets())
+            if speak_full_response
+            else None
+        )
+        emitted_body_chunks = 0
 
         request = CodingTaskRequest(
             correlation_id=correlation_id,
@@ -632,7 +1254,20 @@ class NovaOrchestrator:
                             step_type=progress.step_type,
                         )
                     )
-                    if progress.step_type != last_milestone_stage:
+                    if splitter is not None:
+                        for ready_chunk in splitter.feed(redacted_delta):
+                            await self._event_bus.publish(
+                                VoiceSpeechChunkEvent(
+                                    correlation_id=correlation_id,
+                                    text=ready_chunk,
+                                    chunk_index=chunk_index,
+                                    is_final=False,
+                                    priority="normal",
+                                )
+                            )
+                            chunk_index += 1
+                            emitted_body_chunks += 1
+                    elif progress.step_type != last_milestone_stage:
                         last_milestone_stage = progress.step_type
                         await self._event_bus.publish(
                             VoiceMilestoneEvent(
@@ -650,20 +1285,22 @@ class NovaOrchestrator:
                     and progress.step_type != last_milestone_stage
                 ):
                     last_milestone_stage = progress.step_type
-                    await self._event_bus.publish(
-                        VoiceMilestoneEvent(
-                            correlation_id=correlation_id,
-                            summary_text=sanitize_for_voice(
-                                f"Entrando en etapa {progress.step_type}.",
-                                fallback="Avanzando en el proyecto.",
-                                extra_secrets=self._extra_secrets(),
-                            ),
-                            priority="normal",
+                    if not speak_full_response:
+                        await self._event_bus.publish(
+                            VoiceMilestoneEvent(
+                                correlation_id=correlation_id,
+                                summary_text=sanitize_for_voice(
+                                    f"Entrando en etapa {progress.step_type}.",
+                                    fallback="Avanzando en el proyecto.",
+                                    extra_secrets=self._extra_secrets(),
+                                ),
+                                priority="normal",
+                            )
                         )
-                    )
                 elif progress.kind == "completed":
                     if progress.final_response:
                         redacted_final = self._redact(progress.final_response)
+                        final_response_raw = redacted_final
                         await self._event_bus.publish(
                             ChatStreamEvent(
                                 correlation_id=correlation_id,
@@ -677,6 +1314,28 @@ class NovaOrchestrator:
                             fallback=final_summary,
                             extra_secrets=self._extra_secrets(),
                         )
+
+        if splitter is not None:
+            tail = splitter.flush()
+            if not tail and emitted_body_chunks == 0:
+                tail = VoiceSentenceStreamSplitter.split_text(
+                    final_response_raw or final_summary,
+                    extra_secrets=self._extra_secrets(),
+                )
+            if not tail:
+                tail = [final_summary]
+            for idx, chunk in enumerate(tail):
+                await self._event_bus.publish(
+                    VoiceSpeechChunkEvent(
+                        correlation_id=correlation_id,
+                        text=chunk,
+                        chunk_index=chunk_index,
+                        is_final=(idx == len(tail) - 1),
+                        priority="normal",
+                    )
+                )
+                chunk_index += 1
+            return
 
         await self._event_bus.publish(
             VoiceMilestoneEvent(

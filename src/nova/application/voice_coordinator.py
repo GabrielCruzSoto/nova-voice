@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import inspect
 import json
 import logging
 import math
@@ -14,7 +15,7 @@ import uuid
 from collections import deque
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Literal, Protocol
+from typing import Any, Literal, Protocol
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -28,6 +29,7 @@ from nova.domain.events import (
     OrchestratorEventBus,
     RunnerFailureEvent,
     VoiceMilestoneEvent,
+    VoiceSpeechChunkEvent,
     VoiceTranscriptionEvent,
 )
 from nova.domain.models import (
@@ -74,6 +76,15 @@ def _extract_post_wake_utterance(raw_text: str) -> tuple[bool, str]:
     if any(ch.isalnum() for ch in remainder):
         return True, remainder
     return True, ""
+
+
+_SpokenQueueItem = VoiceMilestoneEvent | VoiceSpeechChunkEvent
+
+
+def _spoken_item_text(item: _SpokenQueueItem) -> str:
+    if isinstance(item, VoiceSpeechChunkEvent):
+        return item.text
+    return item.summary_text
 
 
 @dataclass(slots=True, frozen=True)
@@ -194,9 +205,10 @@ class VoiceCoordinatorSettings(BaseModel):
     min_speech_frames: int = Field(default=5, ge=1, le=50)
     end_silence_frames: int = Field(default=19, ge=1, le=200)
     max_utterance_bytes: int = Field(default=960_000, ge=2048, le=3_840_000)
-    max_tts_queue: int = Field(default=16, ge=1, le=64)
+    max_tts_queue: int = Field(default=64, ge=1, le=128)
     call_idle_timeout_seconds: float = Field(default=180.0, gt=0.0, le=3600.0)
     allow_barge_in_during_tts: bool = True
+    half_duplex_turn_mode: bool = False
     barge_in_grace_seconds: float = Field(default=0.35, ge=0.0, le=2.0)
     barge_in_min_frames: int | None = Field(default=None, ge=1, le=50)
     barge_in_echo_multiplier: float = Field(default=1.8, ge=1.0, le=10.0)
@@ -255,7 +267,7 @@ class VoiceCallCoordinator:
         self._speaking_started_at = 0.0
         self._earcon_audio: SynthesizedAudio | None = generate_earcon_chime(sample_rate_hz=16000)
 
-        self._tts_queue: deque[VoiceMilestoneEvent] = deque()
+        self._tts_queue: deque[_SpokenQueueItem] = deque()
         self._tts_wakeup = asyncio.Event()
         self._tts_epoch = 0
         self._current_tts_priority: Literal["normal", "interrupt"] | None = None
@@ -488,6 +500,7 @@ class VoiceCallCoordinator:
         barge_in_threshold: float | None = None,
         barge_in_grace_seconds: float | None = None,
         enable_wake_earcon: bool | None = None,
+        half_duplex_turn_mode: bool | None = None,
     ) -> None:
         """Update dynamic voice coordinator thresholds and PTT mode in RAM."""
         updates: dict[str, object] = {}
@@ -501,6 +514,8 @@ class VoiceCallCoordinator:
             updates["barge_in_grace_seconds"] = barge_in_grace_seconds
         if enable_wake_earcon is not None:
             updates["enable_wake_earcon"] = enable_wake_earcon
+        if half_duplex_turn_mode is not None:
+            updates["half_duplex_turn_mode"] = half_duplex_turn_mode
         if updates:
             self._settings = self._settings.model_copy(update=updates)
 
@@ -632,7 +647,7 @@ class VoiceCallCoordinator:
             )
             return
 
-        if isinstance(event, VoiceMilestoneEvent):
+        if isinstance(event, (VoiceMilestoneEvent, VoiceSpeechChunkEvent)):
             if self._session.state == "closed" or not self._call_open:
                 return
             if event.priority == "interrupt":
@@ -784,11 +799,13 @@ class VoiceCallCoordinator:
                                         silence_run = 0
                             continue
 
-                        # Active call states: monitor for <100 ms barge-in
+                        # Active call states: monitor for <100 ms barge-in (gated in half-duplex)
                         if state in ("speaking", "thinking", "executing"):
                             if state != "speaking":
                                 speaking_echo_rms = 0.0
-                            if state == "speaking" and not self._settings.allow_barge_in_during_tts:
+                            if self._settings.half_duplex_turn_mode or (
+                                state == "speaking" and not self._settings.allow_barge_in_during_tts
+                            ):
                                 if (
                                     in_speech
                                     or utterance_buf
@@ -1272,6 +1289,16 @@ class VoiceCallCoordinator:
                     and self._pending_approvals[0].audit_id == head_approval.audit_id
                 ):
                     self._pending_approvals.popleft()
+                if (
+                    self._active_turn_tasks
+                    and not self._has_active_pending_approval()
+                    and self._call_open
+                ):
+                    await self._transition_state(
+                        "executing",
+                        reason="approval_resolved_resuming_turn",
+                        correlation_id=corr_id,
+                    )
                 try:
                     await self._orchestrator.resolve_command_approval(
                         head_approval.audit_id,
@@ -1351,6 +1378,13 @@ class VoiceCallCoordinator:
             self._active_turn_tasks.add(turn_task)
             turn_task.add_done_callback(self._active_turn_tasks.discard)
 
+    async def _invoke_orchestrator_utterance(self, utterance: str, corr_id: str) -> None:
+        sig = inspect.signature(self._orchestrator.handle_user_utterance)
+        kwargs: dict[str, Any] = {"correlation_id": corr_id}
+        if "origin" in sig.parameters:
+            kwargs["origin"] = "voice"
+        await self._orchestrator.handle_user_utterance(utterance, **kwargs)
+
     async def _run_orchestrator_turn(
         self,
         utterance: str,
@@ -1367,7 +1401,7 @@ class VoiceCallCoordinator:
                     reason="orchestrator_turn_executing",
                     correlation_id=corr_id,
                 )
-            await self._orchestrator.handle_user_utterance(utterance, correlation_id=corr_id)
+            await self._invoke_orchestrator_utterance(utterance, corr_id)
         except asyncio.CancelledError:
             raise
         except NovaDomainError as exc:
@@ -1385,20 +1419,35 @@ class VoiceCallCoordinator:
         finally:
             if this_task is not None:
                 self._active_turn_tasks.discard(this_task)
+            tts_idle = (
+                not self._audio_output.is_playing
+                and not self._tts_queue
+                and (
+                    self._current_tts_item_task is None
+                    or self._current_tts_item_task.done()
+                )
+            )
             if (
                 self._call_open
-                and expected_call_epoch == self._call_epoch
                 and self._session.state in ("thinking", "executing")
                 and not self._active_turn_tasks
-                and not self._audio_output.is_playing
-                and not self._tts_queue
+                and tts_idle
+                and (
+                    expected_call_epoch == self._call_epoch
+                    or self._settings.half_duplex_turn_mode
+                )
             ):
                 if (
-                    self._single_turn_active
-                    and self._session.turn_count > 0
+                    (self._single_turn_active or self._settings.half_duplex_turn_mode)
                     and not self._has_active_pending_approval()
+                    and (self._session.turn_count > 0 or self._settings.half_duplex_turn_mode)
                 ):
-                    await self.end_call(reason="ptt_single_turn_completed")
+                    reason = (
+                        "half_duplex_turn_completed"
+                        if self._settings.half_duplex_turn_mode
+                        else "ptt_single_turn_completed"
+                    )
+                    await self.end_call(reason=reason)
                 else:
                     await self._transition_state(
                         "listening",
@@ -1408,10 +1457,10 @@ class VoiceCallCoordinator:
 
     async def _synthesize_and_play_item(
         self,
-        milestone: VoiceMilestoneEvent,
+        milestone: _SpokenQueueItem,
         expected_epoch: int,
     ) -> None:
-        synth = await self._tts.synthesize(milestone.summary_text)
+        synth = await self._tts.synthesize(_spoken_item_text(milestone))
         if (
             expected_epoch != self._tts_epoch
             or not self._call_open
@@ -1475,7 +1524,15 @@ class VoiceCallCoordinator:
                 and self._call_open
             ):
                 if self._session.state == "speaking":
-                    if (
+                    if self._settings.half_duplex_turn_mode and self._has_active_pending_approval():
+                        await self.end_call(reason="half_duplex_awaiting_approval")
+                    elif (
+                        self._settings.half_duplex_turn_mode
+                        and not self._active_turn_tasks
+                        and not self._has_active_pending_approval()
+                    ):
+                        await self.end_call(reason="half_duplex_turn_completed")
+                    elif (
                         self._single_turn_active
                         and self._session.turn_count > 0
                         and not self._active_turn_tasks
@@ -1494,11 +1551,16 @@ class VoiceCallCoordinator:
                     and not self._active_turn_tasks
                 ):
                     if (
-                        self._single_turn_active
-                        and self._session.turn_count > 0
+                        (self._single_turn_active or self._settings.half_duplex_turn_mode)
                         and not self._has_active_pending_approval()
+                        and (self._session.turn_count > 0 or self._settings.half_duplex_turn_mode)
                     ):
-                        await self.end_call(reason="ptt_single_turn_completed")
+                        reason = (
+                            "half_duplex_turn_completed"
+                            if self._settings.half_duplex_turn_mode
+                            else "ptt_single_turn_completed"
+                        )
+                        await self.end_call(reason=reason)
                     else:
                         await self._transition_state(
                             "listening",

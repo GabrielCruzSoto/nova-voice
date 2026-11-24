@@ -23,6 +23,16 @@ DEFAULT_MAX_LINE_BYTES = 8 * 1024 * 1024
 PI_GATEKEEPER_EXTENSION_PATH = (
     Path(__file__).resolve().parents[1] / "extensions" / "pi_gatekeeper.ts"
 )
+NOVA_VOICE_SYSTEM_PROMPT = (
+    "Eres Nova, un asistente local de ingenieria de software orientado a voz. "
+    "Responde siempre en espanol claro, directo y natural, redactado para ser escuchado en voz "
+    "alta. Evita paredes extensas de Markdown, encabezados innecesarios, tablas largas o listas "
+    "interminables salvo que el usuario pida codigo o detalle escrito explicitamente. "
+    "Nunca emitas etiquetas XML falsas como <cd>, <search> o <bash> en texto plano; utiliza "
+    "unicamente las herramientas habilitadas o indica con claridad si no tienes acceso. "
+    "Al referirte a archivos o arquitectura, explica su funcion con lenguaje hablado natural en "
+    "lugar de recitar rutas absolutas o sintaxis cruda."
+)
 
 
 class PiRpcConfig(BaseModel):
@@ -39,6 +49,7 @@ class PiRpcConfig(BaseModel):
     allowed_project_paths: tuple[str, ...] = ()
     session_id: str | None = None
     no_session: bool = False
+    append_system_prompt: str | None = NOVA_VOICE_SYSTEM_PROMPT
     ack_timeout_seconds: float = Field(default=5.0, gt=0.0)
     run_timeout_seconds: float = Field(default=180.0, gt=0.0)
     max_line_bytes: int = Field(default=DEFAULT_MAX_LINE_BYTES, gt=0)
@@ -110,6 +121,8 @@ class PiRpcClient:
         ]
         if not self._config.workspace_active:
             cmd.append("--no-tools")
+        if self._config.append_system_prompt and self._config.append_system_prompt.strip():
+            cmd.extend(["--append-system-prompt", self._config.append_system_prompt.strip()])
         if self._config.session_id:
             cmd.extend(["--session-id", self._config.session_id])
         elif self._config.no_session or not self._config.workspace_active:

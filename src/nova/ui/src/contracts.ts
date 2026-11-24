@@ -31,6 +31,7 @@ export type UiEventType =
   | "workspace_cleared"
   | "chat_stream"
   | "voice_milestone"
+  | "voice_speech_chunk"
   | "runner_failure"
   | "command_blocked"
   | "command_approval_requested"
@@ -183,6 +184,8 @@ export interface NovaSettingsDocument {
     readonly tts_engine: TtsEngineChoice;
     readonly tts_speed: number;
     readonly kokoro_voice: string;
+    readonly half_duplex_turn_mode?: boolean | undefined;
+    readonly require_voice_confirmation?: boolean | undefined;
   };
   readonly models: {
     readonly tier1_engine?: AgentEngineChoice | undefined;
