@@ -55,6 +55,24 @@ def test_ac1_visual_explanation_intent_detection_and_negative_guards() -> None:
     assert (
         is_visual_explanation_request("Explícame en la pizarra de qué trata este proyecto") is True
     )
+    # F1 regression: English & Spanish code-mutation prompts and filenames must NOT hijack to board
+    assert (
+        is_visual_explanation_request("Crea una migración de contratos y explica los cambios")
+        is False
+    )
+    assert is_visual_explanation_request("Edit whiteboard.ts to fix the layout") is False
+    assert (
+        is_visual_explanation_request(
+            "Fix the architecture bug in microservices and explain the root cause"
+        )
+        is False
+    )
+    assert is_visual_explanation_request("Actualiza el archivo whiteboard.py") is False
+    assert is_visual_explanation_request("Agrega tests para el tablero de pizarra") is False
+    assert is_visual_explanation_request("Corrige el layout en whiteboard.ts") is False
+    # Creating a presentation/diagram itself MUST still work
+    assert is_visual_explanation_request("Crea una presentación sobre OAuth2") is True
+    assert is_visual_explanation_request("Crea un mapa mental sobre Redis") is True
 
 
 def test_ac2_domain_models_enforce_hard_bounds_and_referential_integrity() -> None:
@@ -292,10 +310,58 @@ def test_ac4_ac10_additive_events_and_prompt_builder() -> None:
     assert created_ev.auto_open is True
     assert changed_ev.reason == "narration_sync"
 
-    # Defense-in-depth deck redaction
+    # Defense-in-depth deck redaction (including node.id & edge endpoints, F5)
+    secret_id = "sk-nodeidsecret987654"
+    secret_node_payload = {
+        "topic": "Seguridad",
+        "slides": [
+            {
+                "title": "Nodos",
+                "visual_kind": "flowchart",
+                "nodes": [
+                    {"id": secret_id, "label": "Origen"},
+                    {"id": "n_ok", "label": "Destino"},
+                ],
+                "edges": [{"source_id": secret_id, "target_id": "n_ok", "label": "envia"}],
+                "narration": "Flujo seguro.",
+            }
+        ],
+    }
+    parsed_sec = parse_whiteboard_deck(
+        f"```nova-whiteboard\n{json.dumps(secret_node_payload)}\n```",
+        topic="Seguridad",
+        correlation_id="corr-f5-parse",
+        extra_secrets=(secret_id,),
+    )
+    assert secret_id not in parsed_sec.model_dump_json()
+    assert len(parsed_sec.slides[0].edges) == 1
+    assert parsed_sec.slides[0].edges[0].source_id == parsed_sec.slides[0].nodes[0].id
+
+    raw_deck_with_secret_id = WhiteboardDeck(
+        deck_id="deck-f5",
+        correlation_id="corr-f5",
+        topic="Seguridad",
+        summary="Token interno my-csrf-secret-999",
+        slides=(
+            WhiteboardSlide(
+                slide_index=0,
+                title="Mapa",
+                visual_kind="flowchart",
+                nodes=(
+                    WhiteboardNode(id="tok_csrf_secret_999", label="Nodo A"),
+                    WhiteboardNode(id="n2", label="Nodo B"),
+                ),
+                edges=(WhiteboardEdge(source_id="tok_csrf_secret_999", target_id="n2"),),
+                narration="Flujo protegido.",
+            ),
+        ),
+    )
     redacted = redact_whiteboard_deck(
-        deck.model_copy(update={"summary": "Token interno my-csrf-secret-999"}),
-        extra_secrets=("my-csrf-secret-999",),
+        raw_deck_with_secret_id,
+        extra_secrets=("my-csrf-secret-999", "tok_csrf_secret_999"),
     )
     assert "my-csrf-secret-999" not in redacted.summary
+    assert "tok_csrf_secret_999" not in redacted.model_dump_json()
     assert "<REDACTED:" in redacted.summary
+    assert len(redacted.slides[0].edges) == 1
+    assert redacted.slides[0].edges[0].source_id == redacted.slides[0].nodes[0].id

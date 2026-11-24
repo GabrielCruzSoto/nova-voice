@@ -420,20 +420,36 @@ export class DesktopAppController {
     if (!deck || slideIndex < 0 || slideIndex >= deck.slides.length) {
       return;
     }
+    const prevDeck = deck;
+    const prevHistory = this.#model.whiteboardHistory ?? [];
     const nextDeck: WhiteboardDeck = { ...deck, active_slide_index: slideIndex };
-    const nextHistory = (this.#model.whiteboardHistory ?? []).map((h) =>
+    const nextHistory = prevHistory.map((h) =>
       h.deck_id === deck.deck_id ? { ...h, active_slide_index: slideIndex } : h,
     );
     this.#updateModel({ activeWhiteboard: nextDeck, whiteboardHistory: nextHistory });
 
-    const resp = await this.#postJson("/api/whiteboard/navigate", {
-      deck_id: deck.deck_id,
-      slide_index: slideIndex,
-    });
-    if (!resp.ok) {
-      const errBody = await this.#safeParseError(resp);
-      const code = errBody?.error_code ?? "ORCHESTRATOR_UNEXPECTED_FAILURE";
-      this.#updateModel({ noticeBanner: resolveHumanNotice(code, errBody?.message) });
+    try {
+      const resp = await this.#postJson("/api/whiteboard/navigate", {
+        deck_id: deck.deck_id,
+        slide_index: slideIndex,
+      });
+      if (!resp.ok) {
+        const errBody = await this.#safeParseError(resp);
+        const code = errBody?.error_code ?? "ORCHESTRATOR_UNEXPECTED_FAILURE";
+        this.#updateModel({
+          activeWhiteboard: prevDeck,
+          whiteboardHistory: prevHistory,
+          noticeBanner: resolveHumanNotice(code, errBody?.message),
+        });
+      }
+    } catch {
+      if (!this.#disposed) {
+        this.#updateModel({
+          activeWhiteboard: prevDeck,
+          whiteboardHistory: prevHistory,
+          noticeBanner: resolveHumanNotice("ORCHESTRATOR_UNEXPECTED_FAILURE"),
+        });
+      }
     }
   }
 
@@ -1478,8 +1494,14 @@ export class DesktopAppController {
       availableWorkspaces: snap.available_workspaces,
       pendingApprovals: snap.pending_approvals,
       messages: capped,
-      activeWhiteboard: snap.active_whiteboard ?? this.#model.activeWhiteboard ?? null,
-      whiteboardHistory: snap.whiteboard_history ?? this.#model.whiteboardHistory ?? [],
+      activeWhiteboard:
+        snap.active_whiteboard !== undefined
+          ? snap.active_whiteboard
+          : (this.#model.activeWhiteboard ?? null),
+      whiteboardHistory:
+        snap.whiteboard_history !== undefined
+          ? snap.whiteboard_history
+          : (this.#model.whiteboardHistory ?? []),
       errorBanner: null,
     });
   }
@@ -2188,6 +2210,35 @@ export class DesktopAppController {
       { signal: sig },
     );
 
+    const handleWhiteboardArrowKey = (ev: KeyboardEvent): void => {
+      if (this.#model.activeTab !== "whiteboard") {
+        return;
+      }
+      const target = ev.target as HTMLElement | null;
+      const tag = target?.tagName ?? "";
+      const inEditable =
+        tag === "INPUT" ||
+        tag === "TEXTAREA" ||
+        tag === "SELECT" ||
+        Boolean(target?.isContentEditable);
+      if (inEditable) {
+        return;
+      }
+      if (ev.key === "ArrowLeft") {
+        ev.preventDefault();
+        void this.stepWhiteboard(-1);
+      } else if (ev.key === "ArrowRight") {
+        ev.preventDefault();
+        void this.stepWhiteboard(1);
+      }
+    };
+
+    const docTarget =
+      root.ownerDocument ?? (typeof document !== "undefined" ? document : null);
+    if (docTarget && typeof docTarget.addEventListener === "function") {
+      docTarget.addEventListener("keydown", handleWhiteboardArrowKey, { signal: sig });
+    }
+
     root.addEventListener(
       "keydown",
       (ev) => {
@@ -2196,19 +2247,8 @@ export class DesktopAppController {
           return;
         }
         const target = ev.target as HTMLElement | null;
-        const tag = target?.tagName ?? "";
-        const inEditable = tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT";
-        if (this.#model.activeTab === "whiteboard" && !inEditable) {
-          if (ev.key === "ArrowLeft") {
-            ev.preventDefault();
-            void this.stepWhiteboard(-1);
-            return;
-          }
-          if (ev.key === "ArrowRight") {
-            ev.preventDefault();
-            void this.stepWhiteboard(1);
-            return;
-          }
+        if (!docTarget || typeof docTarget.addEventListener !== "function") {
+          handleWhiteboardArrowKey(ev);
         }
         if (
           target?.id === "nova-chat-input" &&

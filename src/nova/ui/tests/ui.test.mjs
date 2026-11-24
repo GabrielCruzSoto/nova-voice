@@ -3505,6 +3505,187 @@ test("NOVA-019 AC-3, AC-6, AC-7, AC-9, NFR-1, NFR-4: Pizarra tab, 4 SVG diagram 
   }
 });
 
+test("NOVA-019 F2, F6, F8 remediation: document-level ArrowLeft/ArrowRight navigation, TTL null snapshot clear, optimistic rollback, and loading state", async () => {
+  const wbMod = await import("../static/whiteboard.js");
+
+  // F8: Loading view state before initial /api/state resolves
+  const loadingHtml = wbMod.renderWhiteboardView({
+    status: "loading",
+    voiceEnabled: false,
+    callSession: { call_id: "c", state: "standby", turn_count: 0, active_correlation_id: null },
+    activeWorkspace: null,
+    availableWorkspaces: [],
+    pendingApprovals: [],
+    messages: [],
+    errorBanner: null,
+    pickerFallbackOpen: false,
+    lastMilestone: null,
+    uiMode: "panel",
+    activeTab: "whiteboard",
+    activeWhiteboard: null,
+    whiteboardHistory: [],
+  });
+  assert.match(loadingHtml, /data-view-status="loading"/);
+  assert.match(loadingHtml, /role="status"/);
+
+  const deck = {
+    deck_id: "deck-nav-remed",
+    correlation_id: "corr-nav",
+    topic: "Teclado y Resiliencia",
+    summary: "Resumen",
+    active_slide_index: 0,
+    created_at: "2026-11-24T00:10:00Z",
+    source: "llm_structured",
+    slides: [0, 1, 2].map((i) => ({
+      slide_index: i,
+      title: `Lámina ${i + 1}`,
+      subtitle: "",
+      visual_kind: "sketch_cards",
+      nodes: [{ id: "n1", label: `Paso ${i + 1}`, detail: "", shape: "box", icon: "bulb", accent: "blue", group: "" }],
+      edges: [],
+      callouts: [],
+      narration: `Narración ${i + 1}.`,
+    })),
+  };
+
+  let failNextNavigate = false;
+  let sseController = null;
+  const encoder = new TextEncoder();
+  const docListeners = new Map();
+  const fakeDoc = {
+    addEventListener(type, fn, opts) {
+      const list = docListeners.get(type) ?? [];
+      list.push(fn);
+      docListeners.set(type, list);
+      opts?.signal?.addEventListener?.("abort", () => {
+        const cur = docListeners.get(type) ?? [];
+        docListeners.set(type, cur.filter((f) => f !== fn));
+      });
+    },
+    dispatchKey(key, target = { tagName: "BODY", isContentEditable: false }) {
+      let prevented = false;
+      const ev = { key, target, preventDefault: () => { prevented = true; } };
+      for (const fn of [...(docListeners.get("keydown") ?? [])]) {
+        fn(ev);
+      }
+      return prevented;
+    },
+  };
+  const fakeRoot = {
+    ownerDocument: fakeDoc,
+    innerHTML: "",
+    addEventListener() {},
+    querySelector() { return null; },
+  };
+
+  const fakeFetch = async (url, init = {}) => {
+    if (url === "/api/state") {
+      return new Response(
+        JSON.stringify({
+          schema_version: "1.3.0",
+          csrf_token: "csrf-remed",
+          voice_enabled: true,
+          call_session: { call_id: "c1", state: "standby", turn_count: 0, active_correlation_id: null },
+          active_workspace: null,
+          available_workspaces: [],
+          pending_approvals: [],
+          messages: [],
+          active_whiteboard: deck,
+          whiteboard_history: [{ deck_id: deck.deck_id, topic: deck.topic, slide_count: 3, active_slide_index: 0, created_at: deck.created_at, source: "llm_structured" }],
+        }),
+        { status: 200 },
+      );
+    }
+    if (url === "/api/health") {
+      return new Response(JSON.stringify({ all_ok: true, missing_critical_count: 0, missing_optional_count: 0, components: [] }), { status: 200 });
+    }
+    if (url === "/api/models/status") {
+      return new Response(JSON.stringify({ status: "idle", all_installed: true, total_models: 0, completed_models: 0, bytes_downloaded: 0, total_bytes: 0, percent: 100, models: [] }), { status: 200 });
+    }
+    if (url === "/api/events") {
+      return new Response(new ReadableStream({ start(c) { sseController = c; } }), { status: 200 });
+    }
+    if (url === "/api/whiteboard/navigate" && init.method === "POST") {
+      if (failNextNavigate) {
+        return new Response(
+          JSON.stringify({ error_code: "WHITEBOARD_DECK_NOT_FOUND", message: "Expired", correlation_id: "c-err" }),
+          { status: 404 },
+        );
+      }
+      const body = JSON.parse(String(init.body));
+      return new Response(JSON.stringify({ active_whiteboard: { ...deck, active_slide_index: body.slide_index } }), { status: 200 });
+    }
+    return new Response("{}", { status: 404 });
+  };
+
+  const ctrl = new DesktopAppController({
+    rootElement: fakeRoot,
+    initialTab: "whiteboard",
+    fetchImpl: fakeFetch,
+  });
+  await ctrl.start();
+  await Promise.resolve();
+
+  // F2: Consecutive ArrowRight -> ArrowRight -> ArrowLeft work on document.body without focusing root
+  assert.equal(ctrl.model.activeTab, "whiteboard");
+  assert.equal(ctrl.model.activeWhiteboard?.active_slide_index, 0);
+  assert.equal(fakeDoc.dispatchKey("ArrowRight"), true);
+  await Promise.resolve();
+  await Promise.resolve();
+  assert.equal(ctrl.model.activeWhiteboard?.active_slide_index, 1);
+
+  assert.equal(fakeDoc.dispatchKey("ArrowRight"), true);
+  await Promise.resolve();
+  await Promise.resolve();
+  assert.equal(ctrl.model.activeWhiteboard?.active_slide_index, 2);
+
+  // Editable targets (textarea or contentEditable) must NOT steal arrow keys
+  assert.equal(fakeDoc.dispatchKey("ArrowLeft", { tagName: "TEXTAREA", isContentEditable: false }), false);
+  assert.equal(fakeDoc.dispatchKey("ArrowLeft", { tagName: "DIV", isContentEditable: true }), false);
+  assert.equal(ctrl.model.activeWhiteboard?.active_slide_index, 2);
+
+  assert.equal(fakeDoc.dispatchKey("ArrowLeft"), true);
+  await Promise.resolve();
+  await Promise.resolve();
+  assert.equal(ctrl.model.activeWhiteboard?.active_slide_index, 1);
+
+  // F6(b): Failed navigateWhiteboard MUST revert optimistic active_slide_index
+  failNextNavigate = true;
+  await ctrl.navigateWhiteboard(2);
+  assert.equal(ctrl.model.activeWhiteboard?.active_slide_index, 1);
+  assert.equal(ctrl.model.noticeBanner?.code, "WHITEBOARD_DECK_NOT_FOUND");
+
+  // F6(a): SSE resync_snapshot with active_whiteboard: null MUST clear expired whiteboard in UI
+  sseController.enqueue(
+    encoder.encode(
+      `event: snapshot\ndata: ${JSON.stringify({
+        schema_version: "1.3.0",
+        csrf_token: "csrf-remed",
+        voice_enabled: true,
+        call_session: { call_id: "c1", state: "standby", turn_count: 0, active_correlation_id: null },
+        active_workspace: null,
+        available_workspaces: [],
+        pending_approvals: [],
+        messages: [],
+        active_whiteboard: null,
+        whiteboard_history: [],
+      })}\n\n`,
+    ),
+  );
+  await Promise.resolve();
+  await Promise.resolve();
+  assert.equal(ctrl.model.activeWhiteboard, null);
+  assert.deepEqual(ctrl.model.whiteboardHistory, []);
+
+  // dispose() removes document keydown listener cleanly
+  ctrl.dispose();
+  assert.equal((docListeners.get("keydown") ?? []).length, 0);
+  if (sseController) {
+    sseController.close();
+  }
+});
+
+
 
 
 

@@ -1121,3 +1121,53 @@ async def test_nova019_op3_to_op6_whiteboard_http_routes_csrf_and_browser_open(
     hub.close()
 
 
+async def test_nova019_f9_open_browser_timeout_returns_503(tmp_path: Path) -> None:
+    root = tmp_path / "Proyectos"
+    root.mkdir()
+    bus = OrchestratorEventBus()
+    resolver = LocalWorkspaceResolver(allowed_roots=[root], event_bus=bus)
+    orchestrator = NovaOrchestrator(
+        workspace_resolver=resolver,
+        tier1_client=_StubTier1(),
+        tier2_runner=_StubTier2(),
+        event_bus=bus,
+    )
+    hub = UiStateHub(event_bus=bus)
+
+    async def _hung_opener(_url: str) -> bool:
+        await asyncio.sleep(5.0)
+        return True
+
+    server = DesktopUiServer(
+        orchestrator=orchestrator,
+        state_hub=hub,
+        event_bus=bus,
+        browser_opener=_hung_opener,
+        settings=DesktopUiServerSettings(host="127.0.0.1", port=0, request_timeout_seconds=0.1),
+    )
+    async with server:
+        port = server.port
+        _, idx_hdrs, _ = await _raw_http_request(port, "GET", "/")
+        cookie = idx_hdrs["set-cookie"].split(";", 1)[0]
+        _, _, st_body = await _raw_http_request(
+            port, "GET", "/api/state", headers={"Cookie": cookie}
+        )
+        csrf = json.loads(st_body.decode("utf-8"))["csrf_token"]
+        st_to, _, body_to = await _raw_http_request(
+            port,
+            "POST",
+            "/api/whiteboard/open-browser",
+            headers={
+                "Cookie": cookie,
+                "Origin": f"http://127.0.0.1:{port}",
+                "X-Nova-CSRF": csrf,
+                "Content-Type": "application/json",
+            },
+            body=b"{}",
+        )
+        assert st_to == 503
+        assert json.loads(body_to)["error_code"] == "WHITEBOARD_BROWSER_UNAVAILABLE"
+    hub.close()
+
+
+

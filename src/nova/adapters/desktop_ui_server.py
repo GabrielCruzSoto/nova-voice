@@ -1531,7 +1531,19 @@ class DesktopUiServer:
                 )
                 return
             try:
-                opened = await self._browser_opener(target_url)
+                opened = await asyncio.wait_for(
+                    self._browser_opener(target_url),
+                    timeout=self._settings.request_timeout_seconds,
+                )
+            except TimeoutError:
+                await self._write_error(
+                    writer,
+                    503,
+                    "WHITEBOARD_BROWSER_UNAVAILABLE",
+                    "Timed out launching local graphical browser.",
+                    corr_id,
+                )
+                return
             except Exception as exc:
                 safe_err = redact_sensitive_text(str(exc), extra_secrets=self.extra_secrets)
                 await self._write_error(

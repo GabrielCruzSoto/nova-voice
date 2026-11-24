@@ -94,12 +94,26 @@ _EXPLAIN_TRIGGER_RE = re.compile(
 )
 _CODE_MUTATION_GUARD_RE = re.compile(
     r"\b("
-    r"modifica|modificar|edita|editar|refactoriza|refactorizar|refactor|"
-    r"implementa|implementar|implement|crea\s+(?:un|el)\s+archivo|"
-    r"corrige\s+(?:el\s+)?(?:bug|error)|arregla\s+(?:el\s+)?(?:bug|error)|"
-    r"ejecuta|ejecutar|corre\s+los\s+tests|run\s+tests|"
-    r"haz\s+commit|borra|elimina|instala|despliega|delete\s+file"
+    r"modifica(?:r)?|edita(?:r)?|refactoriza(?:r)?|refactor|"
+    r"implementa(?:r)?|implement|"
+    r"agrega(?:r)?|anade|anadir|actualiza(?:r)?|cambia(?:r)?|"
+    r"escribe|escribir|corrige|corregir|arregla(?:r)?|"
+    r"parchea(?:r)?|renombra(?:r)?|"
+    r"crea(?:r)?\s+(?:un|una|el|la)\s+"
+    r"(?:archivo|modulo|clase|funcion|test|prueba|migracion|contrato|endpoint|ruta|servicio|componente)|"
+    r"crea(?:r)?\s+tests?|"
+    r"ejecuta(?:r)?|corre(?:r)?\s+(?:los\s+)?tests?|run\s+tests?|"
+    r"haz\s+commit|borra(?:r)?|elimina(?:r)?|instala(?:r)?|despliega|desplegar|"
+    r"edit|modify|fix|update|patch|change|remove|delete|commit|deploy|install|"
+    r"create\s+(?:a|an|the)\s+"
+    r"(?:file|module|class|function|test|migration|contract|endpoint|service|component)|"
+    r"add\s+(?:a|an|the)?\s*(?:test|tests|field|endpoint|route|file|function|method|feature|guard)|"
+    r"write\s+(?:a|an|the)?\s*(?:test|tests|file|script|code|function|migration)"
     r")\b",
+    re.IGNORECASE,
+)
+_SOURCE_FILE_REF_RE = re.compile(
+    r"\b[\w-]+\.(?:py|ts|tsx|js|mjs|jsx|css|html|json|yaml|yml|toml|sql|sh|go|rs|java|kt|md)\b",
     re.IGNORECASE,
 )
 _LOCAL_INSPECTION_GUARD_RE = re.compile(
@@ -148,7 +162,8 @@ def is_visual_explanation_request(utterance: str) -> bool:
     folded = _strip_accents(trimmed).lower()
     if _CODE_MUTATION_GUARD_RE.search(folded) is not None:
         return False
-    if _EXPLICIT_BOARD_RE.search(folded) is not None:
+    without_filenames = _SOURCE_FILE_REF_RE.sub(" ", folded)
+    if _EXPLICIT_BOARD_RE.search(without_filenames) is not None:
         return True
     if _LOCAL_INSPECTION_GUARD_RE.search(folded) is not None:
         return False
@@ -224,8 +239,16 @@ def _clean_text(
     return normalized
 
 
-def _sanitize_node_id(raw: Any, fallback_idx: int) -> str:
-    candidate = _SAFE_NODE_ID_CLEAN_RE.sub("_", str(raw or "").strip()).strip("_")
+def _sanitize_node_id(
+    raw: Any,
+    fallback_idx: int,
+    *,
+    extra_secrets: tuple[str, ...] = (),
+) -> str:
+    raw_str = str(raw or "").strip()
+    if raw_str and redact_sensitive_text(raw_str, extra_secrets=extra_secrets) != raw_str:
+        return f"n{fallback_idx}"
+    candidate = _SAFE_NODE_ID_CLEAN_RE.sub("_", raw_str).strip("_")
     if not candidate:
         return f"n{fallback_idx}"
     return candidate[:32]
@@ -307,7 +330,7 @@ def _coerce_slide(
         if not label:
             continue
         raw_id = str(item.get("id") or f"n{idx + 1}").strip()
-        node_id = _sanitize_node_id(raw_id, idx + 1)
+        node_id = _sanitize_node_id(raw_id, idx + 1, extra_secrets=extra_secrets)
         unique_id = node_id
         suffix = 2
         while unique_id in seen_ids:
@@ -656,27 +679,44 @@ def redact_whiteboard_deck(
     *,
     extra_secrets: tuple[str, ...] = (),
 ) -> WhiteboardDeck:
-    """Defense-in-depth re-redaction of every text field inside an existing WhiteboardDeck."""
+    """Defense-in-depth re-redaction of every text and ID field inside an existing deck."""
     redacted_slides: list[WhiteboardSlide] = []
     for slide in deck.slides:
-        redacted_nodes = tuple(
-            node.model_copy(
-                update={
-                    "label": _clean_text(node.label, max_len=60, extra_secrets=extra_secrets)
-                    or "Concepto",
-                    "detail": _clean_text(node.detail, max_len=120, extra_secrets=extra_secrets),
-                    "group": _clean_text(node.group, max_len=40, extra_secrets=extra_secrets),
-                }
+        seen_ids: set[str] = set()
+        id_remap: dict[str, str] = {}
+        redacted_nodes_list: list[WhiteboardNode] = []
+        for idx, node in enumerate(slide.nodes):
+            safe_id = _sanitize_node_id(node.id, idx + 1, extra_secrets=extra_secrets)
+            unique_id = safe_id
+            suffix = 2
+            while unique_id in seen_ids:
+                unique_id = f"{safe_id[:28]}_{suffix}"
+                suffix += 1
+            seen_ids.add(unique_id)
+            id_remap[node.id] = unique_id
+            redacted_nodes_list.append(
+                node.model_copy(
+                    update={
+                        "id": unique_id,
+                        "label": _clean_text(node.label, max_len=60, extra_secrets=extra_secrets)
+                        or "Concepto",
+                        "detail": _clean_text(
+                            node.detail, max_len=120, extra_secrets=extra_secrets
+                        ),
+                        "group": _clean_text(node.group, max_len=40, extra_secrets=extra_secrets),
+                    }
+                )
             )
-            for node in slide.nodes
-        )
         redacted_edges = tuple(
             edge.model_copy(
                 update={
+                    "source_id": id_remap[edge.source_id],
+                    "target_id": id_remap[edge.target_id],
                     "label": _clean_text(edge.label, max_len=40, extra_secrets=extra_secrets),
                 }
             )
             for edge in slide.edges
+            if edge.source_id in id_remap and edge.target_id in id_remap
         )
         redacted_callouts = tuple(
             c
@@ -694,7 +734,7 @@ def redact_whiteboard_deck(
                     "subtitle": _clean_text(
                         slide.subtitle, max_len=160, extra_secrets=extra_secrets
                     ),
-                    "nodes": redacted_nodes,
+                    "nodes": tuple(redacted_nodes_list),
                     "edges": redacted_edges,
                     "callouts": redacted_callouts,
                     "narration": _clean_text(

@@ -1142,4 +1142,50 @@ async def test_nova019_ac10_barge_in_during_whiteboard_generation_emits_no_parti
     assert [e for e in events if isinstance(e, WhiteboardDeckCreatedEvent)] == []
 
 
+async def test_nova019_f1_coding_and_tier2_prompts_in_workspace_are_never_hijacked_to_whiteboard(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "Proyectos"
+    repo = root / "nova-app"
+    repo.mkdir(parents=True)
+    bus = OrchestratorEventBus()
+    events: list[OrchestratorEvent] = []
+
+    async def collect(ev: OrchestratorEvent) -> None:
+        events.append(ev)
+
+    bus.subscribe(collect)
+    resolver = LocalWorkspaceResolver(allowed_roots=[root], event_bus=bus)
+    tier1 = _FakeTier1Client(chunks=["Archivo editado correctamente."])
+    tier2 = _FakeTier2Runner()
+    orchestrator = NovaOrchestrator(
+        workspace_resolver=resolver,
+        tier1_client=tier1,
+        tier2_runner=tier2,
+        event_bus=bus,
+    )
+    await orchestrator.select_workspace(str(repo), mode="exact_path")
+    events.clear()
+
+    # 1. Tier 2 high-complexity coding prompt mentioning "explica" MUST go to Tier 2, NOT whiteboard
+    await orchestrator.handle_user_utterance(
+        "Crea una migración de contratos y explica los cambios",
+        correlation_id="c-f1-t2",
+        origin="chat",
+    )
+    assert len(tier2.requests) == 1
+    assert [e for e in events if isinstance(e, WhiteboardDeckCreatedEvent)] == []
+
+    # 2. Tier 1 coding prompt referencing whiteboard.ts MUST pass straight through to Tier 1
+    events.clear()
+    await orchestrator.handle_user_utterance(
+        "Edit whiteboard.ts to fix the layout",
+        correlation_id="c-f1-t1",
+        origin="chat",
+    )
+    assert tier1.prompts == ["Edit whiteboard.ts to fix the layout"]
+    assert [e for e in events if isinstance(e, WhiteboardDeckCreatedEvent)] == []
+
+
+
 

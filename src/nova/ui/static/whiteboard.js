@@ -603,6 +603,16 @@ export function renderWhiteboardSlideSvg(slide) {
 export function renderWhiteboardView(model) {
     const deck = model.activeWhiteboard ?? null;
     const history = model.whiteboardHistory ?? [];
+    if (!deck && model.status === "loading") {
+        return `
+      <section class="wb-shell wb-shell--empty" data-view-status="loading" role="status" aria-live="polite" aria-label="Cargando pizarra visual">
+        <div class="wb-empty-board">
+          <h2 class="wb-empty-title">Cargando pizarra visual…</h2>
+          <p class="wb-empty-copy">Sincronizando las láminas activas con el puente local de Nova.</p>
+        </div>
+      </section>
+    `.trim();
+    }
     if (!deck || deck.slides.length === 0) {
         return `
       <section class="wb-shell wb-shell--empty" data-view-status="empty" aria-label="Pizarra visual vacía">
