@@ -411,8 +411,9 @@ export class DesktopAppController {
 
     if (action === "inspect") {
       const detail = targetTask.lastLog ? ` — ${targetTask.lastLog}` : "";
+      const displayId = targetTask.id.startsWith("tsk-") ? `#${targetTask.id}` : `#tsk-${targetTask.id}`;
       this.#updateModel({
-        lastMilestone: `#tsk-${targetTask.id}: ${targetTask.title}${detail}`,
+        lastMilestone: `${displayId}: ${targetTask.title}${detail}`,
       });
       return;
     }

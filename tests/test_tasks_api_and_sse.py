@@ -12,6 +12,7 @@ import pytest
 
 from nova.adapters.desktop_ui_server import DesktopUiServer, DesktopUiServerSettings
 from nova.adapters.sqlite_history_store import SqliteHistoryStore
+from nova.adapters.workspace_resolver import LocalWorkspaceResolver
 from nova.application.orchestrator import NovaOrchestrator
 from nova.application.task_manager import TaskManager
 from nova.application.ui_state_hub import UiStateHub
@@ -347,3 +348,149 @@ async def test_nova020_ac10_desktop_ui_server_tasks_rest_and_csrf_guards(
 
     await mgr.close()
     await store.close()
+
+
+@pytest.mark.asyncio
+async def test_nova020_f1_f12_post_tasks_enforces_allowed_roots_existence_and_input_bounds(
+    tmp_path: Path,
+) -> None:
+    allowed_root = tmp_path / "Proyectos"
+    allowed_root.mkdir()
+    ws_alpha = allowed_root / "alpha"
+    ws_alpha.mkdir()
+    ws_beta = allowed_root / "beta"
+    ws_beta.mkdir()
+    outside_dir = tmp_path / "OutsideSecret"
+    outside_dir.mkdir()
+    symlink_escape = allowed_root / "escape-link"
+    symlink_escape.symlink_to(outside_dir, target_is_directory=True)
+
+    bus = OrchestratorEventBus()
+    resolver = LocalWorkspaceResolver(allowed_roots=[allowed_root], event_bus=bus)
+    active_ws = await resolver.resolve(
+        ResolveWorkspaceRequest(
+            correlation_id="c-init",
+            query=str(ws_alpha),
+            mode="exact_path",
+        )
+    )
+    started = asyncio.Event()
+    release = asyncio.Event()
+    release.set()
+
+    mgr = TaskManager(
+        runner_factory=lambda p, w, tid, m: _GateRunner(started, release),
+        event_bus=bus,
+        allowed_roots_provider=lambda: resolver.allowed_roots,
+    )
+    mgr.start()
+    orch = NovaOrchestrator(
+        workspace_resolver=resolver,
+        tier1_client=_FakeTier1(),
+        tier2_runner=_GateRunner(started, release),
+        event_bus=bus,
+        task_manager=mgr,
+    )
+    hub = UiStateHub(event_bus=bus, initial_workspace=active_ws)
+
+    async with DesktopUiServer(
+        orchestrator=orch,
+        state_hub=hub,
+        event_bus=bus,
+        workspace_resolver=resolver,
+        task_manager=mgr,
+        settings=DesktopUiServerSettings(host="127.0.0.1", port=0),
+    ) as server:
+        st_idx, hdrs_idx, _ = await _http_request(server.port, "GET", "/")
+        assert st_idx == 200
+        cookie = hdrs_idx["set-cookie"].split(";", 1)[0]
+        _, _, raw = await _http_request(server.port, "GET", "/api/state", cookie=cookie)
+        csrf = json.loads(raw.decode("utf-8"))["csrf_token"]
+
+        # F1: Outside allowed_roots (/etc, outside_dir, symlink escape, container root) -> 403
+        for forbidden_path in (
+            "/etc",
+            str(outside_dir),
+            str(symlink_escape),
+            str(allowed_root),
+            str(Path.home() / ".ssh"),
+        ):
+            st_forb, _, raw_forb = await _http_request(
+                server.port,
+                "POST",
+                "/api/tasks",
+                cookie=cookie,
+                csrf=csrf,
+                body={"objective": "Inspect files", "workspace_path": forbidden_path},
+            )
+            assert st_forb == 403, f"Expected 403 for {forbidden_path}, got {st_forb}"
+            assert json.loads(raw_forb.decode("utf-8"))["error_code"] == (
+                "WORKSPACE_OUTSIDE_ALLOWED_ROOTS"
+            )
+
+        # F1: Non-existent path inside allowed_roots -> 400 WORKSPACE_NOT_FOUND
+        st_nf, _, raw_nf = await _http_request(
+            server.port,
+            "POST",
+            "/api/tasks",
+            cookie=cookie,
+            csrf=csrf,
+            body={"objective": "Missing dir", "workspace_path": str(allowed_root / "missing")},
+        )
+        assert st_nf == 400
+        assert json.loads(raw_nf.decode("utf-8"))["error_code"] == "WORKSPACE_NOT_FOUND"
+
+        # F1: ~ / $HOME -> 400 WORKSPACE_HOME_FORBIDDEN
+        for home_expr in ("~", "$HOME"):
+            st_h, _, raw_h = await _http_request(
+                server.port,
+                "POST",
+                "/api/tasks",
+                cookie=cookie,
+                csrf=csrf,
+                body={"objective": "Home test", "workspace_path": home_expr},
+            )
+            assert st_h == 400
+            assert json.loads(raw_h.decode("utf-8"))["error_code"] == "WORKSPACE_HOME_FORBIDDEN"
+
+        # F12: objective > 4000 chars -> 400 TASK_INVALID_REQUEST
+        st_obj, _, raw_obj = await _http_request(
+            server.port,
+            "POST",
+            "/api/tasks",
+            cookie=cookie,
+            csrf=csrf,
+            body={"objective": "x" * 4001},
+        )
+        assert st_obj == 400
+        assert json.loads(raw_obj.decode("utf-8"))["error_code"] == "TASK_INVALID_REQUEST"
+
+        # F12: invalid model tokens (leading '-', whitespace, > 200 chars) -> 400
+        for bad_model in ("-rf", "model with space", "m" * 201):
+            st_mod, _, raw_mod = await _http_request(
+                server.port,
+                "POST",
+                "/api/tasks",
+                cookie=cookie,
+                csrf=csrf,
+                body={"objective": "Valid task", "model": bad_model},
+            )
+            assert st_mod == 400
+            assert json.loads(raw_mod.decode("utf-8"))["error_code"] == "TASK_INVALID_REQUEST"
+
+        # Valid workspace inside allowed_roots succeeds (201) without mutating active_context
+        st_ok, _, raw_ok = await _http_request(
+            server.port,
+            "POST",
+            "/api/tasks",
+            cookie=cookie,
+            csrf=csrf,
+            body={"objective": "Work in beta", "workspace_path": str(ws_beta)},
+        )
+        assert st_ok == 201
+        tid = json.loads(raw_ok.decode("utf-8"))["task"]["task_id"]
+        assert resolver.active_context is not None
+        assert resolver.active_context.canonical_path == str(ws_alpha.resolve())
+        await asyncio.wait_for(mgr.wait_for_task(tid), timeout=2.0)
+
+    await mgr.close()

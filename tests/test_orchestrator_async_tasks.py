@@ -299,3 +299,104 @@ async def test_nova020_ac3_no_workspace_rejects_dispatch_and_voice_confirmation_
 
     await mgr.wait_for_task(tasks[0].task_id)
     await mgr.close()
+
+
+def test_nova020_f10_oversized_directive_discards_entire_block_without_leaking_suffix() -> None:
+    flt = ActionDirectiveStreamFilter()
+    huge_payload = "x" * 10_000
+    raw = (
+        "Antes del bloque. "
+        f'[[NOVA_ACTION:{{"action":"dispatch_task","objective":"{huge_payload}"}}]]'
+        " Despues del bloque."
+    )
+    out_parts: list[str] = []
+    for idx in range(0, len(raw), 17):
+        vis = flt.feed(raw[idx : idx + 17])
+        if vis:
+            out_parts.append(vis)
+    tail = flt.flush()
+    if tail:
+        out_parts.append(tail)
+
+    visible = "".join(out_parts)
+    assert visible == "Antes del bloque.  Despues del bloque."
+    assert "NOVA_ACTION" not in visible
+    assert "xxxx" not in visible
+    assert "]]" not in visible
+    assert flt.directives == ()
+    assert flt.invalid_count == 1
+
+
+@pytest.mark.asyncio
+async def test_nova020_f4_f5_directive_rejects_home_and_unknown_workspace_and_resolves_model(
+    tmp_path: Path,
+) -> None:
+    ws_alpha = _ws(tmp_path, "alpha")
+    resolver = _FakeResolver({"alpha": ws_alpha}, "alpha")
+    bus = OrchestratorEventBus()
+    events: list[OrchestratorEvent] = []
+
+    async def _collect(ev: OrchestratorEvent) -> None:
+        events.append(ev)
+
+    bus.subscribe(_collect)
+    started = asyncio.Event()
+    release = asyncio.Event()
+    release.set()
+    runner = _SlowTier2Runner(started, release)
+
+    mgr = TaskManager(
+        runner_factory=lambda provider, ws_path, task_id, model: runner,
+        event_bus=bus,
+    )
+    mgr.start()
+
+    tier1 = _ScriptedTier1Client(
+        turns=[
+            [
+                "Intentando en home. ",
+                '[[NOVA_ACTION:{"action":"dispatch_task","workspace_hint":"~",'
+                '"objective":"Leer secretos"}]]',
+            ],
+            [
+                "Intentando en desconocido. ",
+                '[[NOVA_ACTION:{"action":"dispatch_task","workspace_hint":"proyecto-fantasma",'
+                '"objective":"Editar algo"}]]',
+            ],
+            [
+                "Enviando a claude. ",
+                '[[NOVA_ACTION:{"action":"dispatch_task","provider_hint":"claude",'
+                '"objective":"Revisar tests"}]]',
+            ],
+        ]
+    )
+    orch = NovaOrchestrator(
+        workspace_resolver=resolver,
+        tier1_client=tier1,
+        tier2_runner=runner,
+        event_bus=bus,
+        settings=OrchestratorSettings(
+            tier1_engine="pi",
+            tier2_engine="agy",
+            default_tier2_model="claude-opus-5-5-high",
+        ),
+        task_manager=mgr,
+    )
+
+    # F4: workspace_hint="~" must NOT fall back to active_ws ("alpha") and creates 0 tasks
+    await orch.handle_user_utterance("Haz algo en ~", origin="chat")
+    assert await mgr.list_tasks() == []
+
+    # F4: unrecognized workspace_hint must NOT fall back to active_ws ("alpha") and creates 0 tasks
+    await orch.handle_user_utterance("Haz algo en proyecto-fantasma", origin="chat")
+    assert await mgr.list_tasks() == []
+
+    # F5: provider_hint="claude" without model_hint uses claude's default ("opus"), not agy's model
+    await orch.handle_user_utterance("Revisa tests con claude", origin="chat")
+    tasks = await mgr.list_tasks()
+    assert len(tasks) == 1
+    assert tasks[0].provider == "claude"
+    assert tasks[0].model == "opus"
+
+    await mgr.wait_for_task(tasks[0].task_id)
+    await mgr.close()

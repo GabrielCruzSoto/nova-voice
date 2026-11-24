@@ -26,6 +26,7 @@ class ActionDirectiveStreamFilter:
         self._extra_secrets = extra_secrets
         self._buf = ""
         self._in_directive = False
+        self._discarding_oversized = False
         self._directive_buf = ""
         self._in_json_string = False
         self._json_escape = False
@@ -57,6 +58,7 @@ class ActionDirectiveStreamFilter:
                         visible_parts.append(self._buf[:open_idx])
                     self._buf = self._buf[open_idx + len(DIRECTIVE_OPEN_PREFIX) :]
                     self._in_directive = True
+                    self._discarding_oversized = False
                     self._directive_buf = ""
                     self._in_json_string = False
                     self._json_escape = False
@@ -82,7 +84,8 @@ class ActionDirectiveStreamFilter:
             while idx < buf_len:
                 ch = self._buf[idx]
                 if self._in_json_string:
-                    self._directive_buf += ch
+                    if not self._discarding_oversized:
+                        self._directive_buf += ch
                     if self._json_escape:
                         self._json_escape = False
                     elif ch == "\\":
@@ -93,7 +96,8 @@ class ActionDirectiveStreamFilter:
                 else:
                     if ch == '"':
                         self._in_json_string = True
-                        self._directive_buf += ch
+                        if not self._discarding_oversized:
+                            self._directive_buf += ch
                         idx += 1
                     elif ch == "]" and idx + 1 < buf_len and self._buf[idx + 1] == "]":
                         consumed = idx + 2
@@ -104,28 +108,31 @@ class ActionDirectiveStreamFilter:
                         consumed = idx
                         break
                     else:
-                        self._directive_buf += ch
+                        if not self._discarding_oversized:
+                            self._directive_buf += ch
                         idx += 1
 
-                if len(self._directive_buf) > MAX_DIRECTIVE_CHARS:
+                if (
+                    not self._discarding_oversized
+                    and len(self._directive_buf) > MAX_DIRECTIVE_CHARS
+                ):
                     self._record_invalid("directive_exceeded_max_chars")
-                    self._in_directive = False
+                    self._discarding_oversized = True
                     self._directive_buf = ""
-                    self._in_json_string = False
-                    self._json_escape = False
-                    consumed = idx
-                    break
             else:
                 consumed = buf_len
 
             self._buf = self._buf[consumed:]
             if closed:
                 raw_json = self._directive_buf.strip()
+                was_oversized = self._discarding_oversized
                 self._in_directive = False
+                self._discarding_oversized = False
                 self._directive_buf = ""
                 self._in_json_string = False
                 self._json_escape = False
-                self._parse_and_store(raw_json)
+                if not was_oversized:
+                    self._parse_and_store(raw_json)
             elif self._in_directive:
                 # Waiting for more deltas (possibly holding lone trailing ']')
                 break
@@ -135,8 +142,10 @@ class ActionDirectiveStreamFilter:
     def flush(self) -> str:
         """Drain remaining safe visible text at end of stream; discard unclosed directives."""
         if self._in_directive:
-            self._record_invalid("unclosed_directive_at_eof")
+            if not self._discarding_oversized:
+                self._record_invalid("unclosed_directive_at_eof")
             self._in_directive = False
+            self._discarding_oversized = False
             self._directive_buf = ""
             self._in_json_string = False
             self._json_escape = False

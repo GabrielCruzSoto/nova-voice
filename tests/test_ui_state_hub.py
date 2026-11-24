@@ -6,6 +6,7 @@ from pathlib import Path
 
 import pytest
 
+from nova.adapters.sqlite_history_store import SqliteHistoryStore
 from nova.application.ui_state_hub import UiHubSettings, UiStateHub
 from nova.domain.errors import DesktopUiError
 from nova.domain.events import (
@@ -16,12 +17,14 @@ from nova.domain.events import (
     CommandBlockedEvent,
     OrchestratorEventBus,
     RunnerFailureEvent,
+    TaskCreatedEvent,
+    TaskStateChangedEvent,
     VoiceMilestoneEvent,
     VoiceSpeechChunkEvent,
     VoiceTranscriptionEvent,
     WorkspaceChangedEvent,
 )
-from nova.domain.models import CallSession, WorkspaceContext
+from nova.domain.models import AgentTaskRecord, CallSession, WorkspaceContext
 
 
 async def test_ui_state_hub_assembles_streams_in_o1_and_caps_200_messages() -> None:
@@ -344,4 +347,95 @@ async def test_nova018_ui_state_hub_broadcasts_voice_speech_chunk_and_closes_on_
     finally:
         hub.unsubscribe_sse(sub)
         hub.close()
+
+
+@pytest.mark.asyncio
+async def test_nova020_f6_f19_ui_state_hub_terminal_ttl_eviction_and_task_only_hydration(
+    tmp_path: Path,
+) -> None:
+    store = SqliteHistoryStore(tmp_path / "tasks_only.db")
+    await store.upsert_task(
+        AgentTaskRecord(
+            task_id="tsk-hyd-1",
+            correlation_id="corr-hyd",
+            workspace_canonical_path="/ws/demo",
+            workspace_name="demo",
+            provider="claude",
+            model="opus",
+            objective="Hydrated completed task",
+            status="completed",
+            result_summary="Finished.",
+            created_at=100.0,
+            updated_at=101.0,
+            completed_at=101.0,
+        )
+    )
+
+    now = [1000.0]
+    bus = OrchestratorEventBus()
+    # F19: history_store=None with task_store populated still hydrates tasks!
+    hub = UiStateHub(
+        event_bus=bus,
+        history_store=None,
+        task_store=store,
+        settings=UiHubSettings(max_tasks=10, terminal_task_ttl_seconds=60.0),
+        clock=lambda: now[0],
+    )
+    hub.start()
+    try:
+        await hub.hydrate_history()
+        snap0 = await hub.build_snapshot(csrf_token="csrf")
+        assert [t.id for t in snap0.tasks] == ["tsk-hyd-1"]
+
+        # Add an active task and 12 completed tasks -> bounded to max_tasks=10 while active stays
+        active_rec = AgentTaskRecord(
+            task_id="tsk-active",
+            correlation_id="corr-a",
+            workspace_canonical_path="/ws/demo",
+            workspace_name="demo",
+            provider="opencode",
+            model="sonnet",
+            objective="Active work",
+            status="running",
+            created_at=1001.0,
+            updated_at=1001.0,
+        )
+        await bus.publish(TaskCreatedEvent(task=active_rec, correlation_id="corr-a"))
+
+        for idx in range(12):
+            done_rec = AgentTaskRecord(
+                task_id=f"tsk-done-{idx}",
+                correlation_id=f"corr-d-{idx}",
+                workspace_canonical_path="/ws/demo",
+                workspace_name="demo",
+                provider="claude",
+                model="opus",
+                objective=f"Completed {idx}",
+                status="completed",
+                created_at=1002.0 + idx,
+                updated_at=1002.0 + idx,
+                completed_at=1002.0 + idx,
+            )
+            await bus.publish(
+                TaskStateChangedEvent(
+                    task_id=done_rec.task_id,
+                    correlation_id=done_rec.correlation_id,
+                    previous_status="running",
+                    status="completed",
+                    task=done_rec,
+                    reason="done",
+                )
+            )
+
+        snap_cap = await hub.build_snapshot(csrf_token="csrf")
+        assert len(snap_cap.tasks) == 10
+        assert any(t.id == "tsk-active" for t in snap_cap.tasks)
+
+        # F6: Advance clock past 60s * 1.05 max jitter -> terminal tasks evicted, active retained
+        now[0] = 1070.0
+        snap_expired = await hub.build_snapshot(csrf_token="csrf")
+        assert [t.id for t in snap_expired.tasks] == ["tsk-active"]
+    finally:
+        hub.close()
+        await store.close()
 

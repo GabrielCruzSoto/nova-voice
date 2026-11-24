@@ -27,7 +27,11 @@ from nova.adapters.workspace_resolver import LocalWorkspaceResolver
 from nova.application.live_diagnostics import LiveDiagnosticsService
 from nova.application.models_provisioning import VoiceModelsProvisioningService
 from nova.application.settings_service import SettingsService
-from nova.application.task_manager import TaskManager
+from nova.application.task_manager import (
+    _SAFE_MODEL_TOKEN_RE,
+    TaskManager,
+    _validate_and_resolve_workspace,
+)
 from nova.application.ui_state_hub import UiStateHub
 from nova.domain.errors import (
     ApprovalNotFoundError,
@@ -46,6 +50,7 @@ from nova.domain.events import (
     RunnerFailureEvent,
 )
 from nova.domain.models import (
+    MAX_TASK_OBJECTIVE_CHARS,
     AgentCatalogSnapshot,
     AgentEngineId,
     AgentTier,
@@ -1585,6 +1590,15 @@ class DesktopUiServer:
                 corr_id,
             )
             return
+        if len(raw_obj.strip()) > MAX_TASK_OBJECTIVE_CHARS:
+            await self._write_error(
+                writer,
+                400,
+                "TASK_INVALID_REQUEST",
+                f"Field 'objective' must not exceed {MAX_TASK_OBJECTIVE_CHARS} characters.",
+                corr_id,
+            )
+            return
 
         raw_provider = payload.get("provider")
         provider: AgentEngineId | None = None
@@ -1612,7 +1626,20 @@ class DesktopUiServer:
                     corr_id,
                 )
                 return
-            model = raw_model.strip() or None
+            cleaned_model = raw_model.strip()
+            if cleaned_model and not _SAFE_MODEL_TOKEN_RE.fullmatch(cleaned_model):
+                await self._write_error(
+                    writer,
+                    400,
+                    "TASK_INVALID_REQUEST",
+                    (
+                        "Field 'model' must be <= 200 characters without whitespace, "
+                        "control characters, or leading '-'."
+                    ),
+                    corr_id,
+                )
+                return
+            model = cleaned_model or None
 
         raw_ws = payload.get("workspace_path")
         ws_path: str | None = None
@@ -1627,8 +1654,28 @@ class DesktopUiServer:
                     corr_id,
                 )
                 return
-            ws_path = raw_ws.strip()
-            ws_name = Path(ws_path).name or ws_path
+            allowed_roots: tuple[str, ...] = ()
+            if self._workspace_resolver is not None:
+                raw_roots = getattr(self._workspace_resolver, "allowed_roots", ())
+                if isinstance(raw_roots, tuple):
+                    allowed_roots = raw_roots
+            resolved_ws, ws_err_code, ws_err_msg = await asyncio.to_thread(
+                _validate_and_resolve_workspace,
+                raw_ws.strip(),
+                allowed_roots,
+            )
+            if ws_err_code is not None:
+                ws_status = 403 if ws_err_code == "WORKSPACE_OUTSIDE_ALLOWED_ROOTS" else 400
+                await self._write_error(
+                    writer,
+                    ws_status,
+                    ws_err_code,
+                    ws_err_msg or "Invalid task workspace path.",
+                    corr_id,
+                )
+                return
+            ws_path = resolved_ws
+            ws_name = Path(resolved_ws).name or resolved_ws
         elif self._workspace_resolver is not None and self._workspace_resolver.active_context:
             active = self._workspace_resolver.active_context
             ws_path = active.canonical_path
@@ -1663,7 +1710,12 @@ class DesktopUiServer:
             await self._write_error(writer, 409, exc.code, exc.sanitized_message, corr_id)
             return
         except TaskManagerError as exc:
-            status = 503 if exc.code == "TASK_MANAGER_UNAVAILABLE" else 400
+            if exc.code == "TASK_MANAGER_UNAVAILABLE":
+                status = 503
+            elif exc.code == "WORKSPACE_OUTSIDE_ALLOWED_ROOTS":
+                status = 403
+            else:
+                status = 400
             await self._write_error(writer, status, exc.code, exc.sanitized_message, corr_id)
             return
 

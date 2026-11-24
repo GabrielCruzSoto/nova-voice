@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import random
 import time
 import uuid
 from collections import OrderedDict, deque
@@ -346,6 +347,7 @@ class UiHubSettings(BaseModel):
     max_messages: int = Field(default=200, ge=1, le=1000)
     max_pending_approvals: int = Field(default=64, ge=1, le=256)
     max_tasks: int = Field(default=100, ge=10, le=500)
+    terminal_task_ttl_seconds: float = Field(default=3600.0, gt=0.0, le=86400.0)
     max_concurrent_tier2_slots: int = Field(default=4, ge=1, le=16)
     max_sse_queue: int = Field(default=128, ge=2, le=512)
     max_sse_subscribers: int = Field(default=8, ge=1, le=64)
@@ -418,6 +420,7 @@ class UiStateHub:
         self._active_streams: dict[tuple[str, str, str], str] = {}
         self._pending_approvals: OrderedDict[str, tuple[UiApprovalItem, float]] = OrderedDict()
         self._tasks: OrderedDict[str, UiTaskItem] = OrderedDict()
+        self._task_expires_at: dict[str, float] = {}
         self._subscribers: dict[str, SseSubscription] = {}
         self._seq = 0
         self._started = False
@@ -448,40 +451,39 @@ class UiStateHub:
             self._event_bus.subscribe(self._on_event)
 
     async def hydrate_history(self) -> None:
-        """Preload bounded historical chat messages from persistent SQLite store (NOVA-015)."""
-        if self._history_store is None:
-            return
-        ws_path = self._active_workspace.canonical_path if self._active_workspace else None
-        persisted = await self._history_store.get_recent_messages(
-            limit=self._settings.max_messages,
-            workspace_path=ws_path,
-        )
-        for p in persisted:
-            if p.message_id not in self._message_index:
-                role: UiMessageRole = "user" if p.source in ("user", "voice") else "assistant"
-                if p.source == "error":
-                    role = "system"
-                modality: UiMessageModality = "text"
-                if p.source == "voice":
-                    modality = "voice"
-                elif p.source in ("tier1_pi", "tier1_agent"):
-                    modality = "tier1_agent" if p.source == "tier1_agent" else "tier1_pi"
-                elif p.source == "tier2_runner":
-                    modality = "tier2_runner"
-                elif p.source == "error":
-                    modality = "error"
-                ts = datetime.fromtimestamp(p.created_at, UTC).isoformat()
-                record = _MutableChatRecord(
-                    message_id=p.message_id,
-                    correlation_id=p.correlation_id,
-                    role=role,
-                    modality=modality,
-                    step_type=p.step_type,
-                    content=p.content,
-                    timestamp=ts,
-                    streaming=False,
-                )
-                self._append_record(record)
+        """Preload bounded historical chat messages and tasks from persistent SQLite store."""
+        if self._history_store is not None:
+            ws_path = self._active_workspace.canonical_path if self._active_workspace else None
+            persisted = await self._history_store.get_recent_messages(
+                limit=self._settings.max_messages,
+                workspace_path=ws_path,
+            )
+            for p in persisted:
+                if p.message_id not in self._message_index:
+                    role: UiMessageRole = "user" if p.source in ("user", "voice") else "assistant"
+                    if p.source == "error":
+                        role = "system"
+                    modality: UiMessageModality = "text"
+                    if p.source == "voice":
+                        modality = "voice"
+                    elif p.source in ("tier1_pi", "tier1_agent"):
+                        modality = "tier1_agent" if p.source == "tier1_agent" else "tier1_pi"
+                    elif p.source == "tier2_runner":
+                        modality = "tier2_runner"
+                    elif p.source == "error":
+                        modality = "error"
+                    ts = datetime.fromtimestamp(p.created_at, UTC).isoformat()
+                    record = _MutableChatRecord(
+                        message_id=p.message_id,
+                        correlation_id=p.correlation_id,
+                        role=role,
+                        modality=modality,
+                        step_type=p.step_type,
+                        content=p.content,
+                        timestamp=ts,
+                        streaming=False,
+                    )
+                    self._append_record(record)
         if self._task_store is not None:
             persisted_tasks = await self._task_store.list_tasks(limit=self._settings.max_tasks)
             for task_rec in reversed(persisted_tasks):
@@ -520,9 +522,33 @@ class UiStateHub:
             completed_at=task.completed_at,
         )
 
+    def prune_expired_tasks(self) -> None:
+        """Evict expired terminal tasks from RAM using finite TTL with jitter (contract.md §6)."""
+        now = self._clock()
+        expired_ids = [
+            tid
+            for tid, exp in self._task_expires_at.items()
+            if (
+                exp <= now
+                and tid in self._tasks
+                and self._tasks[tid].status in ("completed", "failed", "cancelled")
+            )
+        ]
+        for tid in expired_ids:
+            self._tasks.pop(tid, None)
+            self._task_expires_at.pop(tid, None)
+
     def _upsert_task_view(self, item: UiTaskItem) -> None:
         self._tasks[item.id] = item
         self._tasks.move_to_end(item.id)
+        if item.status in ("completed", "failed", "cancelled"):
+            jitter = random.uniform(0.95, 1.05)
+            self._task_expires_at[item.id] = (
+                self._clock() + self._settings.terminal_task_ttl_seconds * jitter
+            )
+        else:
+            self._task_expires_at.pop(item.id, None)
+        self.prune_expired_tasks()
         while len(self._tasks) > self._settings.max_tasks:
             evict_id = next(
                 (
@@ -533,12 +559,15 @@ class UiStateHub:
                 None,
             )
             if evict_id is None:
-                self._tasks.popitem(last=False)
+                evicted_key, _ = self._tasks.popitem(last=False)
+                self._task_expires_at.pop(evicted_key, None)
             else:
                 self._tasks.pop(evict_id, None)
+                self._task_expires_at.pop(evict_id, None)
 
     def build_agents_overview(self) -> UiAgentsOverviewView:
         """Build live UiAgentsOverviewView ordered newest-first for snapshot, REST, and SSE."""
+        self.prune_expired_tasks()
         ordered = sorted(
             self._tasks.values(),
             key=lambda item: (item.created_at, item.updated_at),

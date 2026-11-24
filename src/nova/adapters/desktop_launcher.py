@@ -864,6 +864,11 @@ class NovaDesktopRuntime:
                 else None
             )
 
+            task_manager_settings = TaskManagerSettings(
+                default_provider=eff_t2_engine,
+                default_model=self._config.tier2_model,
+            )
+
             def _build_task_runner(
                 engine: AgentEngineId,
                 ws_path: str,
@@ -875,13 +880,25 @@ class NovaDesktopRuntime:
                     if self._settings_service is not None
                     else initial_persisted.models
                 )
+
+                def _is_waiting_approval() -> bool:
+                    return (
+                        self._task_manager is not None
+                        and self._task_manager.is_task_waiting_approval(task_id)
+                    )
+
                 return self._agent_registry.build_tier2_runner_for_task(
                     engine,
                     models=current_models,
                     workspace_path=ws_path,
                     task_id=task_id,
                     gatekeeper_ipc_env=ipc_env,
+                    stdout_heartbeat_timeout_seconds=(
+                        task_manager_settings.stdout_heartbeat_timeout_seconds
+                    ),
+                    timeout_seconds=task_manager_settings.task_total_timeout_seconds,
                     model_override=model_override or None,
+                    heartbeat_pause_predicate=_is_waiting_approval,
                 )
 
             task_manager = TaskManager(
@@ -890,11 +907,9 @@ class NovaDesktopRuntime:
                 task_store=task_store,
                 history_store=self._history_store,
                 security_gatekeeper=gatekeeper,
+                allowed_roots_provider=lambda: self._config.allowed_roots,
                 extra_secrets_provider=self._combined_extra_secrets,
-                settings=TaskManagerSettings(
-                    default_provider=eff_t2_engine,
-                    default_model=self._config.tier2_model,
-                ),
+                settings=task_manager_settings,
             )
             task_manager.start()
             await task_manager.reconcile_on_startup()

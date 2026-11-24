@@ -6,13 +6,13 @@ import asyncio
 import contextlib
 import json
 import os
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from pathlib import Path
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from nova.adapters._process_group import terminate_process_group
+from nova.adapters._process_group import await_with_heartbeat, terminate_process_group
 from nova.domain.errors import CodingRunnerError
 from nova.domain.models import AgentTier, CodingTaskRequest, RunnerProgressEvent
 
@@ -42,6 +42,7 @@ class OpenCodeConfig(BaseModel):
     provider_env: dict[str, str] | None = None
     enable_gatekeeper_plugin: bool = True
     bundled_plugin_path: str = Field(default=_BUNDLED_OPENCODE_PLUGIN, min_length=1)
+    append_system_prompt: str | None = None
 
 
 def _format_opencode_model(provider: str, model: str) -> str:
@@ -74,8 +75,14 @@ def _extract_opencode_text(record: dict[str, Any]) -> str:
 class OpenCodeAdapter:
     """Implements both Tier1ConversationPort and CodingRunnerPort over OpenCode CLI."""
 
-    def __init__(self, config: OpenCodeConfig | None = None) -> None:
+    def __init__(
+        self,
+        config: OpenCodeConfig | None = None,
+        *,
+        heartbeat_pause_predicate: Callable[[], bool] | None = None,
+    ) -> None:
         self._config = config or OpenCodeConfig()
+        self._heartbeat_pause_predicate = heartbeat_pause_predicate
         self._workspace_path = self._config.workspace_path
         self._active_session_id: str | None = None
         self._active_proc: asyncio.subprocess.Process | None = None
@@ -122,10 +129,21 @@ class OpenCodeAdapter:
 
     async def stream_prompt(self, message: str) -> AsyncIterator[str]:
         """Tier1ConversationPort: stream text deltas for a conversational turn."""
+        effective_prompt = message
+        if (
+            self._active_session_id is None
+            and self._config.append_system_prompt
+            and self._config.append_system_prompt.strip()
+        ):
+            sys_prompt = self._config.append_system_prompt.strip()
+            effective_prompt = (
+                f"[Instrucciones del sistema]\n{sys_prompt}\n[/Instrucciones del sistema]\n\n"
+                f"{message}"
+            )
         req = CodingTaskRequest(
             correlation_id="corr-tier1-opencode",
             workspace_path=self._workspace_path,
-            prompt=message,
+            prompt=effective_prompt,
             model=_format_opencode_model(self._config.provider, self._config.model) or "default",
             conversation_id=self._active_session_id,
         )
@@ -206,23 +224,27 @@ class OpenCodeAdapter:
                         message="Timed out waiting for opencode JSON completion.",
                     )
                 hb = self._config.stdout_heartbeat_timeout_seconds
-                using_heartbeat = hb is not None and hb < remaining
-                read_timeout = hb if using_heartbeat and hb is not None else remaining
-                try:
-                    raw_line = await asyncio.wait_for(proc.stdout.readline(), timeout=read_timeout)
-                except TimeoutError as exc:
-                    if using_heartbeat:
-                        raise CodingRunnerError(
-                            code="RUNNER_STDOUT_HEARTBEAT_TIMEOUT",
-                            message=(
-                                f"opencode CLI produced no stdout activity for {hb:.1f}s "
-                                "(stdout heartbeat timeout)."
-                            ),
-                        ) from exc
+                raw_line, wait_status = await await_with_heartbeat(
+                    proc.stdout.readline(),
+                    deadline=deadline,
+                    heartbeat_seconds=hb,
+                    pause_predicate=self._heartbeat_pause_predicate,
+                )
+                if wait_status == "heartbeat":
+                    hb_val = hb or 0.0
+                    raise CodingRunnerError(
+                        code="RUNNER_STDOUT_HEARTBEAT_TIMEOUT",
+                        message=(
+                            f"opencode CLI produced no stdout activity for {hb_val:.1f}s "
+                            "(stdout heartbeat timeout)."
+                        ),
+                    )
+                if wait_status == "total":
                     raise CodingRunnerError(
                         code="RUNNER_SUBPROCESS_TIMEOUT_OR_CRASH",
                         message="Timed out waiting for opencode JSON output.",
-                    ) from exc
+                    )
+                assert raw_line is not None
 
                 if not raw_line:
                     break
@@ -259,8 +281,19 @@ class OpenCodeAdapter:
                         text_delta=text_chunk,
                     )
 
-            await proc.wait()
-            await stderr_task
+            remaining_wait = max(0.05, deadline - loop.time())
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=remaining_wait)
+            except TimeoutError as exc:
+                raise CodingRunnerError(
+                    code="RUNNER_SUBPROCESS_TIMEOUT_OR_CRASH",
+                    message="Timed out waiting for opencode CLI exit after stdout EOF.",
+                ) from exc
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(
+                    asyncio.shield(stderr_task),
+                    timeout=min(2.0, max(0.05, deadline - loop.time())),
+                )
             if proc.returncode != 0:
                 stderr_excerpt = stderr_buf.decode("utf-8", errors="replace").strip()
                 raise CodingRunnerError(

@@ -8,16 +8,18 @@ import inspect
 import json
 import logging
 import random
+import re
 import time
 import uuid
 from collections import OrderedDict
 from collections.abc import AsyncIterator, Callable
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
 from nova.domain.errors import (
+    ApprovalNotFoundError,
     NovaDomainError,
     TaskManagerError,
     TaskNotFoundError,
@@ -39,6 +41,7 @@ from nova.domain.events import (
 )
 from nova.domain.models import (
     ALLOWED_TASK_TRANSITIONS,
+    DEFAULT_PI_MODEL,
     MAX_TASK_ERROR_CHARS,
     MAX_TASK_LOG_CHARS,
     MAX_TASK_OBJECTIVE_CHARS,
@@ -57,6 +60,14 @@ logger = logging.getLogger("nova.task_manager")
 
 TaskRunnerFactory = Callable[[AgentEngineId, str, str, str], CodingRunnerPort]
 
+_SAFE_MODEL_TOKEN_RE = re.compile(r"^[^\s\x00-\x1f\x7f-][^\s\x00-\x1f\x7f]{0,199}$")
+_PROVIDER_DEFAULT_TIER2_MODELS: dict[AgentEngineId, str] = {
+    "claude": "opus",
+    "opencode": "anthropic/claude-sonnet-4-5",
+    "agy": "claude-opus-5-5-high",
+    "pi": DEFAULT_PI_MODEL,
+}
+
 
 @contextlib.asynccontextmanager
 async def _closing_async_iter[T](stream: AsyncIterator[T]) -> AsyncIterator[AsyncIterator[T]]:
@@ -71,10 +82,48 @@ async def _closing_async_iter[T](stream: AsyncIterator[T]) -> AsyncIterator[Asyn
                 await res
 
 
-def _resolve_workspace_and_home(raw_workspace: str) -> tuple[str, str]:
-    resolved_ws = str(Path(raw_workspace).expanduser().resolve())
-    home_dir = str(Path.home().resolve())
-    return resolved_ws, home_dir
+def _validate_and_resolve_workspace(
+    raw_workspace: str,
+    allowed_roots: tuple[str, ...],
+) -> tuple[str, str | None, str | None]:
+    """Resolve workspace off-loop and enforce non-$HOME, allowed_roots, and existing directory."""
+    cleaned = raw_workspace.strip()
+    home_dir = Path.home().resolve()
+    if cleaned in {"~", "~/", "$HOME", "${HOME}"}:
+        return (
+            str(home_dir),
+            "WORKSPACE_HOME_FORBIDDEN",
+            "Home directory cannot be used as a task workspace.",
+        )
+    candidate = Path(cleaned).expanduser().resolve()
+    resolved_str = str(candidate)
+    if candidate == home_dir:
+        return (
+            resolved_str,
+            "WORKSPACE_HOME_FORBIDDEN",
+            "Home directory cannot be used as a task workspace.",
+        )
+    if allowed_roots:
+        resolved_roots = [
+            Path(root).expanduser().resolve()
+            for root in allowed_roots
+            if root and Path(root).expanduser().resolve() != home_dir
+        ]
+        if resolved_roots and not any(
+            candidate.is_relative_to(root) and candidate != root for root in resolved_roots
+        ):
+            return (
+                resolved_str,
+                "WORKSPACE_OUTSIDE_ALLOWED_ROOTS",
+                "Task workspace path is outside configured allowed_roots.",
+            )
+    if not candidate.exists() or not candidate.is_dir():
+        return (
+            resolved_str,
+            "WORKSPACE_NOT_FOUND",
+            "Task workspace path does not exist or is not a directory.",
+        )
+    return resolved_str, None, None
 
 
 def _safe_milestone_text(raw: str, fallback: str, *, extra_secrets: tuple[str, ...] = ()) -> str:
@@ -112,6 +161,7 @@ class TaskManager:
         task_store: TaskStorePort | None = None,
         history_store: HistoryStorePort | None = None,
         security_gatekeeper: Any | None = None,
+        allowed_roots_provider: Callable[[], tuple[str, ...]] | None = None,
         extra_secrets_provider: Callable[[], tuple[str, ...]] | None = None,
         settings: TaskManagerSettings | None = None,
         clock: Callable[[], float] = time.time,
@@ -121,18 +171,25 @@ class TaskManager:
         self._task_store = task_store
         self._history_store = history_store
         self._security_gatekeeper = security_gatekeeper
+        self._allowed_roots_provider = allowed_roots_provider
         self._extra_secrets_provider = extra_secrets_provider
         self._settings = settings or TaskManagerSettings()
         self._clock = clock
 
         self._semaphore = asyncio.Semaphore(self._settings.max_concurrent_tasks)
         self._workspace_locks: dict[str, asyncio.Lock] = {}
+        self._task_locks: dict[str, asyncio.Lock] = {}
         self._tasks: OrderedDict[str, AgentTaskRecord] = OrderedDict()
         self._ram_expires_at: dict[str, float] = {}
         self._worker_tasks: dict[str, asyncio.Task[None]] = {}
         self._cancel_requested: set[str] = set()
         self._started = False
         self._closed = False
+
+    def is_task_waiting_approval(self, task_id: str) -> bool:
+        """Return True while the given task is blocked awaiting human Gatekeeper approval."""
+        rec = self._tasks.get(task_id)
+        return rec is not None and rec.status == "waiting_approval"
 
     @property
     def settings(self) -> TaskManagerSettings:
@@ -230,6 +287,18 @@ class TaskManager:
         if not has_pending:
             self._workspace_locks.pop(workspace_canonical_path, None)
 
+    def _task_lock(self, task_id: str) -> asyncio.Lock:
+        lock = self._task_locks.get(task_id)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._task_locks[task_id] = lock
+        return lock
+
+    def _cleanup_idle_task_lock(self, task_id: str) -> None:
+        lock = self._task_locks.get(task_id)
+        if lock is not None and not lock.locked() and task_id not in self._tasks:
+            self._task_locks.pop(task_id, None)
+
     def _record_ram_task(self, task: AgentTaskRecord) -> None:
         self._tasks[task.task_id] = task
         self._tasks.move_to_end(task.task_id)
@@ -257,6 +326,7 @@ class TaskManager:
         for tid in expired_ids:
             self._tasks.pop(tid, None)
             self._ram_expires_at.pop(tid, None)
+            self._cleanup_idle_task_lock(tid)
 
         while len(self._tasks) > self._settings.max_tracked_tasks_in_ram:
             evict_id = next(
@@ -271,14 +341,15 @@ class TaskManager:
                 break
             self._tasks.pop(evict_id, None)
             self._ram_expires_at.pop(evict_id, None)
+            self._cleanup_idle_task_lock(evict_id)
 
     async def _persist_task(self, task: AgentTaskRecord) -> None:
         if self._task_store is not None:
             await self._task_store.upsert_task(task)
 
-    async def _transition(
+    async def _apply_transition_locked(
         self,
-        task_id: str,
+        current: AgentTaskRecord,
         target: TaskStatus,
         *,
         reason: str,
@@ -290,10 +361,6 @@ class TaskManager:
         clear_pending_audit: bool = False,
         conversation_id: str | None = None,
     ) -> AgentTaskRecord:
-        current = self._tasks.get(task_id)
-        if current is None:
-            raise TaskNotFoundError(task_id)
-
         self.validate_transition(current.status, target)
         now = self._clock()
         updates: dict[str, Any] = {
@@ -325,7 +392,7 @@ class TaskManager:
         await self._persist_task(updated)
         self._log(
             "task_state_changed",
-            task_id=task_id,
+            task_id=current.task_id,
             correlation_id=updated.correlation_id,
             previous_status=current.status,
             status=target,
@@ -333,7 +400,7 @@ class TaskManager:
         )
         await self._event_bus.publish(
             TaskStateChangedEvent(
-                task_id=task_id,
+                task_id=current.task_id,
                 correlation_id=updated.correlation_id,
                 previous_status=current.status,
                 status=target,
@@ -342,6 +409,66 @@ class TaskManager:
             )
         )
         return updated
+
+    async def _transition(
+        self,
+        task_id: str,
+        target: TaskStatus,
+        *,
+        reason: str,
+        last_log: str | None = None,
+        result_summary: str | None = None,
+        error_code: str | None = None,
+        error_message: str | None = None,
+        pending_audit_id: str | None = None,
+        clear_pending_audit: bool = False,
+        conversation_id: str | None = None,
+    ) -> AgentTaskRecord:
+        async with self._task_lock(task_id):
+            current = self._tasks.get(task_id)
+            if current is None:
+                raise TaskNotFoundError(task_id)
+            return await self._apply_transition_locked(
+                current,
+                target,
+                reason=reason,
+                last_log=last_log,
+                result_summary=result_summary,
+                error_code=error_code,
+                error_message=error_message,
+                pending_audit_id=pending_audit_id,
+                clear_pending_audit=clear_pending_audit,
+                conversation_id=conversation_id,
+            )
+
+    async def _transition_to_terminal(
+        self,
+        task_id: str,
+        target: Literal["cancelled", "failed"],
+        *,
+        reason: str,
+        last_log: str,
+        error_code: str | None = None,
+        error_message: str | None = None,
+    ) -> tuple[AgentTaskRecord, str | None, bool]:
+        """Atomically transition to terminal state; return (record, prev_audit_id, transitioned)."""
+        async with self._task_lock(task_id):
+            current = self._tasks.get(task_id)
+            if current is None:
+                raise TaskNotFoundError(task_id)
+            if current.status in TERMINAL_TASK_STATUSES:
+                return current, None, False
+            prev_audit = current.pending_audit_id
+            updated = await self._apply_transition_locked(
+                current,
+                target,
+                reason=reason,
+                last_log=last_log,
+                error_code=error_code,
+                error_message=error_message,
+                clear_pending_audit=True,
+            )
+            return updated, prev_audit, True
 
     async def dispatch_task(
         self,
@@ -366,26 +493,59 @@ class TaskManager:
                 code="WORKSPACE_REQUIRED",
                 message="An active workspace is required to dispatch a background task.",
             )
-        resolved_ws, home_dir = await asyncio.to_thread(_resolve_workspace_and_home, cleaned_ws)
-        if resolved_ws == home_dir:
+        allowed_roots = (
+            self._allowed_roots_provider() if self._allowed_roots_provider is not None else ()
+        )
+        resolved_ws, ws_err_code, ws_err_msg = await asyncio.to_thread(
+            _validate_and_resolve_workspace,
+            cleaned_ws,
+            allowed_roots,
+        )
+        if ws_err_code is not None:
             raise TaskManagerError(
-                code="WORKSPACE_HOME_FORBIDDEN",
-                message="Home directory cannot be used as a task workspace.",
+                code=ws_err_code,
+                message=ws_err_msg or "Invalid task workspace path.",
             )
 
-        redacted_objective = self._redact(objective.strip())
-        if not redacted_objective:
+        stripped_obj = objective.strip()
+        if not stripped_obj:
             raise TaskManagerError(
                 code="TASK_INVALID_REQUEST",
                 message="Task objective cannot be empty.",
             )
-        bounded_objective = redacted_objective[:MAX_TASK_OBJECTIVE_CHARS]
+        if len(stripped_obj) > MAX_TASK_OBJECTIVE_CHARS:
+            raise TaskManagerError(
+                code="TASK_INVALID_REQUEST",
+                message=(
+                    f"Task objective exceeds maximum length of {MAX_TASK_OBJECTIVE_CHARS} chars."
+                ),
+            )
+        redacted_objective = self._redact(stripped_obj)
+        if len(redacted_objective) > MAX_TASK_OBJECTIVE_CHARS:
+            redacted_objective = redacted_objective[:MAX_TASK_OBJECTIVE_CHARS]
+
+        effective_provider: AgentEngineId = provider or self._settings.default_provider
+        if model is not None and model.strip():
+            cleaned_model = model.strip()
+            if not _SAFE_MODEL_TOKEN_RE.fullmatch(cleaned_model):
+                raise TaskManagerError(
+                    code="TASK_INVALID_REQUEST",
+                    message=(
+                        "Task model must be <= 200 characters with no whitespace, "
+                        "control characters, or leading '-'."
+                    ),
+                )
+            effective_model = cleaned_model
+        elif effective_provider == self._settings.default_provider:
+            effective_model = self._settings.default_model.strip() or (
+                _PROVIDER_DEFAULT_TIER2_MODELS[effective_provider]
+            )
+        else:
+            effective_model = _PROVIDER_DEFAULT_TIER2_MODELS[effective_provider]
 
         if self.queued_count >= self._settings.max_queued_tasks:
             raise TaskQueueFullError(self._settings.max_queued_tasks)
 
-        effective_provider: AgentEngineId = provider or self._settings.default_provider
-        effective_model = (model or self._settings.default_model).strip()
         corr_id = correlation_id or f"corr-{uuid.uuid4()}"
         task_id = f"tsk-{uuid.uuid4().hex[:12]}"
         now = self._clock()
@@ -398,7 +558,7 @@ class TaskManager:
             provider=effective_provider,
             model=effective_model,
             tier="tier2",
-            objective=bounded_objective,
+            objective=redacted_objective,
             status="queued",
             last_log="En cola para ejecución.",
             created_at=now,
@@ -466,6 +626,14 @@ class TaskManager:
         ordered = sorted(merged.values(), key=lambda t: (t.created_at, t.updated_at), reverse=True)
         return ordered[:bounded_limit]
 
+    async def _abort_pending_approval(self, audit_id: str | None, *, resolved_by: str) -> None:
+        if not audit_id or self._security_gatekeeper is None:
+            return
+        resolve_fn = getattr(self._security_gatekeeper, "resolve_command_approval", None)
+        if callable(resolve_fn):
+            with contextlib.suppress(ApprovalNotFoundError, Exception):
+                await resolve_fn(audit_id, approved=False, resolved_by=resolved_by)
+
     async def cancel_task(self, task_id: str) -> AgentTaskRecord:
         """Idempotently cancel a queued, running, or waiting_approval task (OP-2, AC-7)."""
         task = await self.get_task(task_id)
@@ -473,13 +641,16 @@ class TaskManager:
             return task
 
         self._cancel_requested.add(task_id)
-        updated = await self._transition(
+        updated, pending_audit, transitioned = await self._transition_to_terminal(
             task_id,
             "cancelled",
             reason="cancelled_by_user",
             last_log="Cancelada por el usuario.",
-            clear_pending_audit=True,
         )
+        if not transitioned:
+            self._cancel_requested.discard(task_id)
+            return updated
+        await self._abort_pending_approval(pending_audit, resolved_by="task_cancelled")
         worker = self._worker_tasks.get(task_id)
         if worker is not None and not worker.done():
             worker.cancel()
@@ -505,6 +676,14 @@ class TaskManager:
             self._started = False
             self._event_bus.unsubscribe(self._on_event)
 
+        pending_audits = [
+            rec.pending_audit_id
+            for rec in self._tasks.values()
+            if rec.pending_audit_id and rec.status not in TERMINAL_TASK_STATUSES
+        ]
+        for audit_id in pending_audits:
+            await self._abort_pending_approval(audit_id, resolved_by="daemon_shutdown")
+
         pending_workers = [w for w in self._worker_tasks.values() if not w.done()]
         for tid in list(self._worker_tasks.keys()):
             self._cancel_requested.add(tid)
@@ -522,29 +701,31 @@ class TaskManager:
         if isinstance(event, CommandApprovalRequestedEvent) and event.task_id:
             task = self._tasks.get(event.task_id)
             if task is not None and task.status == "running":
-                await self._transition(
-                    event.task_id,
-                    "waiting_approval",
-                    reason="gatekeeper_approval_requested",
-                    last_log=f"Esperando aprobación de comando: {event.sanitized_command}",
-                    pending_audit_id=event.audit_id,
-                )
+                with contextlib.suppress(TaskNotFoundError, TaskStateError):
+                    await self._transition(
+                        event.task_id,
+                        "waiting_approval",
+                        reason="gatekeeper_approval_requested",
+                        last_log=f"Esperando aprobación de comando: {event.sanitized_command}",
+                        pending_audit_id=event.audit_id,
+                    )
             return
 
         if isinstance(event, CommandApprovalResolvedEvent) and event.task_id:
             task = self._tasks.get(event.task_id)
             if task is not None and task.status == "waiting_approval":
-                await self._transition(
-                    event.task_id,
-                    "running",
-                    reason=f"gatekeeper_approval_{event.verdict}",
-                    last_log=(
-                        "Comando aprobado; reanudando ejecución."
-                        if event.approved
-                        else "Comando rechazado por el usuario; continuando."
-                    ),
-                    clear_pending_audit=True,
-                )
+                with contextlib.suppress(TaskNotFoundError, TaskStateError):
+                    await self._transition(
+                        event.task_id,
+                        "running",
+                        reason=f"gatekeeper_approval_{event.verdict}",
+                        last_log=(
+                            "Comando aprobado; reanudando ejecución."
+                            if event.approved
+                            else "Comando rechazado por el usuario; continuando."
+                        ),
+                        clear_pending_audit=True,
+                    )
 
     async def _lookup_prior_conversation(
         self,
@@ -653,42 +834,61 @@ class TaskManager:
                         correlation_id=running.correlation_id,
                         workspace_path=ws_path,
                         prompt=running.objective,
-                        model=running.model or self._settings.default_model,
+                        model=running.model or _PROVIDER_DEFAULT_TIER2_MODELS[running.provider],
                         conversation_id=prior_conv,
                     )
                     collected_deltas: list[str] = []
                     final_response = ""
                     latest_conv = prior_conv
 
-                    async with _closing_async_iter(runner.execute(request)) as stream:
-                        async for progress in stream:
-                            if progress.conversation_id and progress.conversation_id != "unknown":
-                                latest_conv = progress.conversation_id
-                                await self._save_conversation_pointer(
-                                    ws_path,
-                                    running.provider,
-                                    progress.conversation_id,
-                                )
+                    try:
+                        async with asyncio.timeout(self._settings.task_total_timeout_seconds):
+                            async with _closing_async_iter(runner.execute(request)) as stream:
+                                async for progress in stream:
+                                    if (
+                                        progress.conversation_id
+                                        and progress.conversation_id != "unknown"
+                                    ):
+                                        latest_conv = progress.conversation_id
+                                        await self._save_conversation_pointer(
+                                            ws_path,
+                                            running.provider,
+                                            progress.conversation_id,
+                                        )
 
-                            if progress.kind == "delta" and progress.text_delta:
-                                redacted_delta = self._redact(progress.text_delta)
-                                collected_deltas.append(redacted_delta)
-                                snippet = " ".join(redacted_delta.split())[:MAX_TASK_LOG_CHARS]
-                                if snippet:
-                                    await self._record_progress(
-                                        task_id=task_id,
-                                        step_type=progress.step_type or "delta",
-                                        last_log=snippet,
-                                    )
-                            elif progress.kind == "milestone":
-                                snippet = f"Etapa: {progress.step_type}"[:MAX_TASK_LOG_CHARS]
-                                await self._record_progress(
-                                    task_id=task_id,
-                                    step_type=progress.step_type or "milestone",
-                                    last_log=snippet,
-                                )
-                            elif progress.kind == "completed" and progress.final_response:
-                                final_response = self._redact(progress.final_response)
+                                    if progress.kind == "delta" and progress.text_delta:
+                                        redacted_delta = self._redact(progress.text_delta)
+                                        collected_deltas.append(redacted_delta)
+                                        snippet = " ".join(redacted_delta.split())[
+                                            :MAX_TASK_LOG_CHARS
+                                        ]
+                                        if snippet:
+                                            await self._record_progress(
+                                                task_id=task_id,
+                                                step_type=progress.step_type or "delta",
+                                                last_log=snippet,
+                                            )
+                                    elif progress.kind == "milestone":
+                                        snippet = (
+                                            f"Etapa: {progress.step_type}"[:MAX_TASK_LOG_CHARS]
+                                        )
+                                        await self._record_progress(
+                                            task_id=task_id,
+                                            step_type=progress.step_type or "milestone",
+                                            last_log=snippet,
+                                        )
+                                    elif progress.kind == "completed" and progress.final_response:
+                                        final_response = self._redact(progress.final_response)
+                    except TimeoutError:
+                        await self._fail_task(
+                            task_id,
+                            error_code="RUNNER_SUBPROCESS_TIMEOUT_OR_CRASH",
+                            message=(
+                                f"Task exceeded total execution timeout "
+                                f"({self._settings.task_total_timeout_seconds:.0f}s)."
+                            ),
+                        )
+                        return
 
                     summary = final_response or "".join(collected_deltas).strip()
                     if not summary:
@@ -700,14 +900,17 @@ class TaskManager:
                     if current_now is None or current_now.status in TERMINAL_TASK_STATUSES:
                         return
 
-                    done = await self._transition(
-                        task_id,
-                        "completed",
-                        reason="worker_completed",
-                        last_log=summary[:MAX_TASK_LOG_CHARS],
-                        result_summary=summary,
-                        conversation_id=latest_conv,
-                    )
+                    try:
+                        done = await self._transition(
+                            task_id,
+                            "completed",
+                            reason="worker_completed",
+                            last_log=summary[:MAX_TASK_LOG_CHARS],
+                            result_summary=summary,
+                            conversation_id=latest_conv,
+                        )
+                    except (TaskNotFoundError, TaskStateError):
+                        return
                     await self._event_bus.publish(
                         ChatStreamEvent(
                             correlation_id=done.correlation_id,
@@ -778,15 +981,20 @@ class TaskManager:
         if current is None or current.status in TERMINAL_TASK_STATUSES:
             return
         redacted_msg = self._redact(message)[:MAX_TASK_ERROR_CHARS]
-        failed = await self._transition(
-            task_id,
-            "failed",
-            reason=f"worker_failed:{error_code}",
-            last_log=redacted_msg[:MAX_TASK_LOG_CHARS],
-            error_code=error_code,
-            error_message=redacted_msg,
-            clear_pending_audit=True,
-        )
+        try:
+            failed, pending_audit, transitioned = await self._transition_to_terminal(
+                task_id,
+                "failed",
+                reason=f"worker_failed:{error_code}",
+                last_log=redacted_msg[:MAX_TASK_LOG_CHARS],
+                error_code=error_code,
+                error_message=redacted_msg,
+            )
+        except TaskNotFoundError:
+            return
+        if not transitioned:
+            return
+        await self._abort_pending_approval(pending_audit, resolved_by=f"task_failed:{error_code}")
         await self._event_bus.publish(
             RunnerFailureEvent(
                 correlation_id=failed.correlation_id,

@@ -7,14 +7,14 @@ import contextlib
 import json
 import os
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from pathlib import Path
 from types import TracebackType
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from nova.adapters._process_group import terminate_process_group
+from nova.adapters._process_group import await_with_heartbeat, terminate_process_group
 from nova.domain.errors import PiRpcError
 from nova.domain.models import DEFAULT_PI_MODEL
 
@@ -82,8 +82,14 @@ class _PiRpcResponse(BaseModel):
 class PiRpcClient:
     """Manages a persistent `pi --mode rpc` subprocess with strict LF JSONL framing."""
 
-    def __init__(self, config: PiRpcConfig) -> None:
+    def __init__(
+        self,
+        config: PiRpcConfig,
+        *,
+        heartbeat_pause_predicate: Callable[[], bool] | None = None,
+    ) -> None:
         self._config = config
+        self._heartbeat_pause_predicate = heartbeat_pause_predicate
         self._process: asyncio.subprocess.Process | None = None
         self._reader_task: asyncio.Task[None] | None = None
         self._stderr_task: asyncio.Task[None] | None = None
@@ -263,24 +269,27 @@ class PiRpcClient:
                         message="Timed out waiting for Pi RPC agent_settled event.",
                     )
                 hb = self._config.stdout_heartbeat_timeout_seconds
-                using_heartbeat = hb is not None and hb < remaining
-                read_timeout = hb if using_heartbeat and hb is not None else remaining
-                try:
-                    record = await asyncio.wait_for(queue.get(), timeout=read_timeout)
-                except TimeoutError as exc:
+                record, wait_status = await await_with_heartbeat(
+                    queue.get(),
+                    deadline=deadline,
+                    heartbeat_seconds=hb,
+                    pause_predicate=self._heartbeat_pause_predicate,
+                )
+                if wait_status != "ok":
                     await self.close()
-                    if using_heartbeat:
+                    if wait_status == "heartbeat":
+                        hb_val = hb or 0.0
                         raise PiRpcError(
                             code="RUNNER_STDOUT_HEARTBEAT_TIMEOUT",
                             message=(
-                                f"Pi RPC produced no stdout activity for {hb:.1f}s "
+                                f"Pi RPC produced no stdout activity for {hb_val:.1f}s "
                                 "(stdout heartbeat timeout)."
                             ),
-                        ) from exc
+                        )
                     raise PiRpcError(
                         code="PI_RPC_SUBPROCESS_UNAVAILABLE",
                         message="Timed out waiting for Pi RPC agent_settled event.",
-                    ) from exc
+                    )
 
                 if record is None:
                     await self.close()

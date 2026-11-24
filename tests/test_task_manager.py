@@ -9,7 +9,9 @@ from pathlib import Path
 import pytest
 
 from nova.adapters.sqlite_history_store import SqliteHistoryStore
+from nova.application.security_gatekeeper import GatekeeperSettings, SecurityGatekeeper
 from nova.application.task_manager import TaskManager, TaskManagerSettings
+from nova.application.ui_state_hub import UiStateHub
 from nova.domain.errors import (
     CodingRunnerError,
     TaskManagerError,
@@ -30,7 +32,12 @@ from nova.domain.events import (
 from nova.domain.models import (
     AgentEngineId,
     CodingTaskRequest,
+    CommandAuditInput,
+    CommandAuditResult,
+    CommandInterceptRequest,
+    ResolveWorkspaceRequest,
     RunnerProgressEvent,
+    WorkspaceContext,
 )
 
 
@@ -481,3 +488,233 @@ async def test_nova020_nfr2_queue_limit_and_ram_ttl_eviction_falls_back_to_sqlit
 
     await mgr.close()
     await store.close()
+
+
+@pytest.mark.asyncio
+async def test_nova020_f3_f8_cancel_during_waiting_approval_unblocks_gatekeeper_and_ui(
+    tmp_path: Path,
+) -> None:
+    ws = tmp_path / "secure_repo"
+    ws.mkdir()
+    ws_ctx = WorkspaceContext(
+        workspace_id="ws-sec",
+        name="secure_repo",
+        canonical_path=str(ws.resolve()),
+        selected_via="exact_path",
+    )
+
+    class _Resolver:
+        @property
+        def active_context(self) -> WorkspaceContext | None:
+            return ws_ctx
+
+        async def resolve(self, request: ResolveWorkspaceRequest) -> WorkspaceContext:
+            return ws_ctx
+
+    class _Auditor:
+        async def audit(self, request: CommandAuditInput) -> CommandAuditResult:
+            return CommandAuditResult(
+                risk_level="high",
+                spoken_summary="Comando sensible.",
+                technical_explanation="Requires approval.",
+                audited_by="test",
+            )
+
+    store = SqliteHistoryStore(tmp_path / "h.db")
+    bus = OrchestratorEventBus()
+    resolved_events: list[CommandApprovalResolvedEvent] = []
+
+    async def _on_ev(ev: OrchestratorEvent) -> None:
+        if isinstance(ev, CommandApprovalResolvedEvent):
+            resolved_events.append(ev)
+
+    bus.subscribe(_on_ev)
+    gk = SecurityGatekeeper(
+        workspace_resolver=_Resolver(),
+        auditor=_Auditor(),
+        event_bus=bus,
+        settings=GatekeeperSettings(approval_timeout_seconds=30.0),
+    )
+    hub = UiStateHub(event_bus=bus, initial_workspace=ws_ctx)
+    hub.start()
+
+    started = asyncio.Event()
+    started2 = asyncio.Event()
+    never_release = asyncio.Event()
+    spawn_count = [0]
+
+    def _runner_factory(p: AgentEngineId, w: str, tid: str, m: str) -> _ControlledRunner:
+        spawn_count[0] += 1
+        s_ev = started if spawn_count[0] == 1 else started2
+        return _ControlledRunner(started_event=s_ev, release_event=never_release)
+
+    mgr = TaskManager(
+        runner_factory=_runner_factory,
+        event_bus=bus,
+        task_store=store,
+        security_gatekeeper=gk,
+    )
+    mgr.start()
+
+    created = await mgr.dispatch_task(
+        workspace_canonical_path=str(ws.resolve()),
+        workspace_name="secure_repo",
+        objective="Run guarded command",
+        provider="claude",
+    )
+    await asyncio.wait_for(started.wait(), timeout=2.0)
+
+    # Gatekeeper requests human approval for this task
+    eval_task = asyncio.create_task(
+        gk.evaluate_and_authorize(
+            CommandInterceptRequest(
+                correlation_id="corr-f3",
+                source="tier2_claude",
+                tool_name="Bash",
+                command="sudo rm -rf /tmp/x",
+                cwd=str(ws.resolve()),
+                task_id=created.task_id,
+            )
+        )
+    )
+    await asyncio.sleep(0.05)
+    assert (await mgr.get_task(created.task_id)).status == "waiting_approval"
+    assert mgr.is_task_waiting_approval(created.task_id) is True
+    snap_wait = await hub.build_snapshot(csrf_token="t")
+    assert len(snap_wait.pending_approvals) == 1
+
+    # F3: Cancelling task aborts pending approval, unblocks Gatekeeper, clears UI card
+    cancelled = await mgr.cancel_task(created.task_id)
+    assert cancelled.status == "cancelled"
+    decision = await asyncio.wait_for(eval_task, timeout=2.0)
+    assert decision.allowed is False
+    assert any(e.task_id == created.task_id and e.approved is False for e in resolved_events)
+    snap_after = await hub.build_snapshot(csrf_token="t")
+    assert len(snap_after.pending_approvals) == 0
+
+    # F3 (direct IPC disconnect / CancelledError in SecurityGatekeeper): publishes resolved event
+    gk.register_task_workspace("tsk-disc", str(ws.resolve()))
+    eval_disc = asyncio.create_task(
+        gk.evaluate_and_authorize(
+            CommandInterceptRequest(
+                correlation_id="corr-disc",
+                source="tier2_claude",
+                tool_name="Bash",
+                command="sudo id",
+                cwd=str(ws.resolve()),
+                task_id="tsk-disc",
+            )
+        )
+    )
+    await asyncio.sleep(0.05)
+    eval_disc.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await eval_disc
+    assert any(
+        e.task_id == "tsk-disc" and e.resolved_by == "task_cancelled_or_disconnected"
+        for e in resolved_events
+    )
+    gk.unregister_task_workspace("tsk-disc")
+
+    # F8: Concurrent cancel_task + CommandApprovalRequestedEvent keeps cancelled in RAM & SQLite
+    t2 = await mgr.dispatch_task(
+        workspace_canonical_path=str(ws.resolve()),
+        workspace_name="secure_repo",
+        objective="Race test",
+        provider="opencode",
+    )
+    await asyncio.wait_for(started2.wait(), timeout=2.0)
+    await asyncio.gather(
+        mgr.cancel_task(t2.task_id),
+        bus.publish(
+            CommandApprovalRequestedEvent(
+                audit_id="aud-race",
+                correlation_id="corr-race",
+                source="tier2_opencode",
+                sanitized_command="rm -rf build",
+                cwd=str(ws.resolve()),
+                risk_level="medium",
+                spoken_summary="Aprobar",
+                technical_explanation="Race",
+                expires_in_seconds=60.0,
+                task_id=t2.task_id,
+            )
+        ),
+    )
+    assert (await mgr.get_task(t2.task_id)).status == "cancelled"
+    persisted_t2 = await store.get_task(t2.task_id)
+    assert persisted_t2 is not None
+    assert persisted_t2.status == "cancelled"
+
+    hub.close()
+    await mgr.close()
+    await store.close()
+
+
+@pytest.mark.asyncio
+async def test_nova020_f1_f5_f7_f12_task_manager_bounds_and_total_timeout(tmp_path: Path) -> None:
+    allowed_root = tmp_path / "allowed"
+    allowed_root.mkdir()
+    ws = allowed_root / "repo"
+    ws.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+
+    bus = OrchestratorEventBus()
+    never_release = asyncio.Event()
+    mgr = TaskManager(
+        runner_factory=lambda p, w, tid, m: _ControlledRunner(release_event=never_release),
+        event_bus=bus,
+        allowed_roots_provider=lambda: (str(allowed_root),),
+        settings=TaskManagerSettings(
+            default_provider="agy",
+            default_model="claude-opus-5-5-high",
+            task_total_timeout_seconds=0.25,
+        ),
+    )
+    mgr.start()
+
+    # F1: allowed_roots enforcement
+    with pytest.raises(TaskManagerError) as exc_out:
+        await mgr.dispatch_task(
+            workspace_canonical_path=str(outside),
+            workspace_name="outside",
+            objective="Escape",
+            provider="claude",
+        )
+    assert exc_out.value.code == "WORKSPACE_OUTSIDE_ALLOWED_ROOTS"
+
+    # F12: objective > 4000 chars and unsafe model rejected
+    with pytest.raises(TaskManagerError) as exc_len:
+        await mgr.dispatch_task(
+            workspace_canonical_path=str(ws),
+            workspace_name="repo",
+            objective="a" * 4001,
+            provider="claude",
+        )
+    assert exc_len.value.code == "TASK_INVALID_REQUEST"
+
+    with pytest.raises(TaskManagerError) as exc_mod:
+        await mgr.dispatch_task(
+            workspace_canonical_path=str(ws),
+            workspace_name="repo",
+            objective="Valid objective",
+            provider="claude",
+            model="--bad-flag",
+        )
+    assert exc_mod.value.code == "TASK_INVALID_REQUEST"
+
+    # F5 & F7: cross-provider default model uses claude's "opus" and total timeout fires cleanly
+    task = await mgr.dispatch_task(
+        workspace_canonical_path=str(ws),
+        workspace_name="repo",
+        objective="Hang past total timeout",
+        provider="claude",
+    )
+    assert task.model == "opus"
+    await asyncio.wait_for(mgr.wait_for_task(task.task_id), timeout=2.0)
+    final_rec = await mgr.get_task(task.task_id)
+    assert final_rec.status == "failed"
+    assert final_rec.error_code == "RUNNER_SUBPROCESS_TIMEOUT_OR_CRASH"
+
+    await mgr.close()

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import logging
 import uuid
@@ -51,6 +52,7 @@ class _PendingApproval:
     correlation_id: str
     future: asyncio.Future[tuple[bool, str]]
     task_id: str | None = None
+    resolved: bool = False
 
 
 class SecurityGatekeeper:
@@ -319,7 +321,30 @@ class SecurityGatekeeper:
                 pending.future,
                 timeout=self._settings.approval_timeout_seconds,
             )
+        except asyncio.CancelledError:
+            if not pending.resolved:
+                pending.resolved = True
+                self._log(
+                    "command_approval_aborted",
+                    audit_id=pending.audit_id,
+                    correlation_id=pending.correlation_id,
+                )
+                with contextlib.suppress(Exception):
+                    await asyncio.shield(
+                        self._event_bus.publish(
+                            CommandApprovalResolvedEvent(
+                                audit_id=pending.audit_id,
+                                correlation_id=pending.correlation_id,
+                                approved=False,
+                                verdict="invalid_request",
+                                resolved_by="task_cancelled_or_disconnected",
+                                task_id=pending.task_id,
+                            )
+                        )
+                    )
+            raise
         except TimeoutError:
+            pending.resolved = True
             self._log(
                 "command_approval_timed_out",
                 audit_id=pending.audit_id,
@@ -364,10 +389,10 @@ class SecurityGatekeeper:
     ) -> CommandApprovalResolvedEvent:
         """Resolve a pending approval request explicitly."""
         pending = self._pending.get(audit_id)
-        if pending is None or pending.future.done():
+        if pending is None or pending.resolved or pending.future.done():
             raise ApprovalNotFoundError(audit_id)
 
-        pending.future.set_result((approved, resolved_by))
+        pending.resolved = True
         verdict: DecisionVerdict = "approved_by_human" if approved else "rejected_by_human"
         self._log(
             "command_approval_resolved",
@@ -385,4 +410,6 @@ class SecurityGatekeeper:
             task_id=pending.task_id,
         )
         await self._event_bus.publish(event)
+        if not pending.future.done():
+            pending.future.set_result((approved, resolved_by))
         return event

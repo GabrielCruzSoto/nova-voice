@@ -10,11 +10,17 @@ from pathlib import Path
 
 import pytest
 
-from nova.adapters.agent_registry import AgentAdapterRegistry
+from nova.adapters._process_group import terminate_process_group
+from nova.adapters.agent_registry import (
+    AgentAdapterRegistry,
+    AntigravityTier1Adapter,
+    PiCodingRunnerAdapter,
+)
 from nova.adapters.antigravity_adapter import AntigravityCLIAdapter, AntigravityRunnerConfig
 from nova.adapters.claude_adapter import ClaudeCodeAdapter, ClaudeCodeConfig
 from nova.adapters.gatekeeper_ipc import GatekeeperIPCConfig, UnixSocketGatekeeperServer
 from nova.adapters.opencode_adapter import OpenCodeAdapter, OpenCodeConfig
+from nova.adapters.pi_rpc_client import NOVA_VOICE_SYSTEM_PROMPT
 from nova.application.security_gatekeeper import GatekeeperSettings, SecurityGatekeeper
 from nova.domain.errors import CodingRunnerError
 from nova.domain.events import (
@@ -369,3 +375,238 @@ def test_nova020_ac5_registry_builds_isolated_per_task_runners(tmp_path: Path) -
     assert r1._config.gatekeeper_ipc_env["NOVA_TASK_ID"] == "tsk-1"
     assert r1._config.stdout_heartbeat_timeout_seconds == 90.0
     assert r1._config.timeout_seconds == 600.0
+
+
+@pytest.mark.asyncio
+async def test_nova020_f2_stdout_heartbeat_pauses_during_waiting_approval_and_resumes_after(
+    tmp_path: Path,
+) -> None:
+    # Case 1: CLI stays silent for 0.55s (> heartbeat 0.22s) while paused=True, then completes.
+    fake_slow = tmp_path / "fake_claude_approval_wait.py"
+    fake_slow.write_text(
+        """import json, time
+print(json.dumps({"type": "system", "subtype": "init", "session_id": "s-wait"}), flush=True)
+time.sleep(0.55)
+res = {"type": "result", "subtype": "success", "session_id": "s-wait", "result": "Approved."}
+print(json.dumps(res), flush=True)
+""",
+        encoding="utf-8",
+    )
+    paused = [True]
+    adapter_ok = ClaudeCodeAdapter(
+        ClaudeCodeConfig(
+            executable=sys.executable,
+            extra_leading_args=(str(fake_slow),),
+            workspace_path=str(tmp_path),
+            tier="tier2",
+            timeout_seconds=5.0,
+            stdout_heartbeat_timeout_seconds=0.22,
+            enable_gatekeeper_hook=False,
+        ),
+        heartbeat_pause_predicate=lambda: paused[0],
+    )
+    events = []
+    async for ev in adapter_ok.execute(
+        CodingTaskRequest(
+            correlation_id="c-f2-ok",
+            workspace_path=str(tmp_path),
+            prompt="wait approval",
+            model="sonnet",
+        )
+    ):
+        events.append(ev)
+    assert any(e.kind == "completed" and e.final_response == "Approved." for e in events)
+
+    # Case 2: paused flips False after 0.3s while CLI hangs -> heartbeat fires after unpause.
+    fake_hang = tmp_path / "fake_claude_unpause_hang.py"
+    fake_hang.write_text(
+        """import json, time
+print(json.dumps({"type": "system", "subtype": "init", "session_id": "s-hang2"}), flush=True)
+time.sleep(30)
+""",
+        encoding="utf-8",
+    )
+    paused2 = [True]
+
+    async def _unpause_later() -> None:
+        await asyncio.sleep(0.32)
+        paused2[0] = False
+
+    unpause_task = asyncio.create_task(_unpause_later())
+    adapter_hang = ClaudeCodeAdapter(
+        ClaudeCodeConfig(
+            executable=sys.executable,
+            extra_leading_args=(str(fake_hang),),
+            workspace_path=str(tmp_path),
+            tier="tier2",
+            timeout_seconds=5.0,
+            stdout_heartbeat_timeout_seconds=0.22,
+            enable_gatekeeper_hook=False,
+        ),
+        heartbeat_pause_predicate=lambda: paused2[0],
+    )
+    try:
+        with pytest.raises(CodingRunnerError) as exc:
+            async for _ in adapter_hang.execute(
+                CodingTaskRequest(
+                    correlation_id="c-f2-hang",
+                    workspace_path=str(tmp_path),
+                    prompt="hang after approval",
+                    model="sonnet",
+                )
+            ):
+                pass
+        assert exc.value.code == "RUNNER_STDOUT_HEARTBEAT_TIMEOUT"
+        assert paused2[0] is False
+    finally:
+        await unpause_task
+
+
+@pytest.mark.asyncio
+async def test_nova020_f7_bounded_exit_when_stdout_closes_early(tmp_path: Path) -> None:
+    fake_close_stdout = tmp_path / "fake_close_stdout.py"
+    fake_close_stdout.write_text(
+        """import json, os, time
+print(json.dumps({"type": "system", "subtype": "init", "session_id": "s-eof"}), flush=True)
+os.close(1)
+time.sleep(30)
+""",
+        encoding="utf-8",
+    )
+    claude = ClaudeCodeAdapter(
+        ClaudeCodeConfig(
+            executable=sys.executable,
+            extra_leading_args=(str(fake_close_stdout),),
+            workspace_path=str(tmp_path),
+            tier="tier2",
+            timeout_seconds=0.4,
+            stdout_heartbeat_timeout_seconds=None,
+            enable_gatekeeper_hook=False,
+        )
+    )
+    with pytest.raises(CodingRunnerError) as exc_c:
+        async for _ in claude.execute(
+            CodingTaskRequest(
+                correlation_id="c-f7-claude",
+                workspace_path=str(tmp_path),
+                prompt="close stdout",
+                model="sonnet",
+            )
+        ):
+            pass
+    assert exc_c.value.code == "RUNNER_SUBPROCESS_TIMEOUT_OR_CRASH"
+
+    opencode = OpenCodeAdapter(
+        OpenCodeConfig(
+            executable=sys.executable,
+            extra_leading_args=(str(fake_close_stdout),),
+            workspace_path=str(tmp_path),
+            tier="tier2",
+            timeout_seconds=0.4,
+            stdout_heartbeat_timeout_seconds=None,
+            enable_gatekeeper_plugin=False,
+        )
+    )
+    with pytest.raises(CodingRunnerError) as exc_o:
+        async for _ in opencode.execute(
+            CodingTaskRequest(
+                correlation_id="c-f7-opencode",
+                workspace_path=str(tmp_path),
+                prompt="close stdout",
+                model="default",
+            )
+        ):
+            pass
+    assert exc_o.value.code == "RUNNER_SUBPROCESS_TIMEOUT_OR_CRASH"
+
+
+@pytest.mark.asyncio
+async def test_nova020_f9_terminate_process_group_kills_sigterm_ignoring_grandchild(
+    tmp_path: Path,
+) -> None:
+    pid_file = tmp_path / "stubborn.pid"
+    parent_script = tmp_path / "spawn_stubborn.py"
+    child_code = (
+        "import signal, time; signal.signal(signal.SIGTERM, signal.SIG_IGN); time.sleep(60)"
+    )
+    parent_script.write_text(
+        f"""import subprocess, sys
+child = subprocess.Popen([sys.executable, "-c", {child_code!r}])
+with open({str(pid_file)!r}, "w", encoding="utf-8") as fh:
+    fh.write(str(child.pid))
+    fh.flush()
+""",
+        encoding="utf-8",
+    )
+    proc = await asyncio.create_subprocess_exec(
+        sys.executable,
+        str(parent_script),
+        start_new_session=True,
+    )
+    await asyncio.wait_for(proc.wait(), timeout=2.0)
+    grandchild_pid = int(pid_file.read_text(encoding="utf-8").strip())
+    # Give grandchild a moment to register SIG_IGN and verify it is alive
+    await asyncio.sleep(0.1)
+    os.kill(grandchild_pid, 0)
+
+    await terminate_process_group(proc, grace_seconds=0.15)
+    await asyncio.sleep(0.1)
+    with pytest.raises(ProcessLookupError):
+        os.kill(grandchild_pid, 0)
+
+
+def test_nova020_f5_f11_registry_model_defaults_and_tier1_system_prompt(tmp_path: Path) -> None:
+    registry = AgentAdapterRegistry(which_resolver=lambda name: f"/usr/bin/{name}")
+    models = ModelsSettingsSection(
+        tier2_engine="agy",
+        tier2_model="claude-opus-5-5-high",
+    )
+    r_claude = registry.build_tier2_runner_for_task(
+        "claude",
+        models=models,
+        workspace_path=str(tmp_path),
+        task_id="tsk-m1",
+    )
+    r_opencode = registry.build_tier2_runner_for_task(
+        "opencode",
+        models=models,
+        workspace_path=str(tmp_path),
+        task_id="tsk-m2",
+    )
+    r_agy = registry.build_tier2_runner_for_task(
+        "agy",
+        models=models,
+        workspace_path=str(tmp_path),
+        task_id="tsk-m3",
+    )
+    r_pi = registry.build_tier2_runner_for_task(
+        "pi",
+        models=models,
+        workspace_path=str(tmp_path),
+        task_id="tsk-m4",
+    )
+    assert isinstance(r_claude, ClaudeCodeAdapter)
+    assert r_claude._config.model == "opus"
+    assert isinstance(r_opencode, OpenCodeAdapter)
+    assert r_opencode._config.model == "anthropic/claude-sonnet-4-5"
+    assert isinstance(r_agy, AntigravityCLIAdapter)
+    assert isinstance(r_pi, PiCodingRunnerAdapter)
+    assert r_pi._pi_client._config.model == models.pi_model
+
+    # F11: Tier 1 adapters for opencode and agy receive NOVA_VOICE_SYSTEM_PROMPT
+    t1_opencode = registry.build_tier1_adapter(
+        "opencode",
+        models=models,
+        workspace_path=str(tmp_path),
+    )
+    assert isinstance(t1_opencode, OpenCodeAdapter)
+    assert t1_opencode._config.append_system_prompt == NOVA_VOICE_SYSTEM_PROMPT
+    assert "[[NOVA_ACTION:" in (t1_opencode._config.append_system_prompt or "")
+
+    t1_agy = registry.build_tier1_adapter(
+        "agy",
+        models=models,
+        workspace_path=str(tmp_path),
+    )
+    assert isinstance(t1_agy, AntigravityTier1Adapter)
+    assert t1_agy._append_system_prompt == NOVA_VOICE_SYSTEM_PROMPT

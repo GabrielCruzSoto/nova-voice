@@ -8,13 +8,13 @@ import json
 import os
 import sys
 import tempfile
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from pathlib import Path
 from typing import Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from nova.adapters._process_group import terminate_process_group
+from nova.adapters._process_group import await_with_heartbeat, terminate_process_group
 from nova.domain.errors import CodingRunnerError
 from nova.domain.models import AgentTier, CodingTaskRequest, RunnerProgressEvent
 
@@ -73,8 +73,14 @@ def _extract_claude_text_delta(record: dict[str, Any]) -> str:
 class ClaudeCodeAdapter:
     """Implements both Tier1ConversationPort and CodingRunnerPort over Claude Code CLI."""
 
-    def __init__(self, config: ClaudeCodeConfig | None = None) -> None:
+    def __init__(
+        self,
+        config: ClaudeCodeConfig | None = None,
+        *,
+        heartbeat_pause_predicate: Callable[[], bool] | None = None,
+    ) -> None:
         self._config = config or ClaudeCodeConfig()
+        self._heartbeat_pause_predicate = heartbeat_pause_predicate
         self._workspace_path = self._config.workspace_path
         self._active_session_id: str | None = None
         self._active_proc: asyncio.subprocess.Process | None = None
@@ -224,23 +230,27 @@ class ClaudeCodeAdapter:
                         message="Timed out waiting for claude stream-json completion.",
                     )
                 hb = self._config.stdout_heartbeat_timeout_seconds
-                using_heartbeat = hb is not None and hb < remaining
-                read_timeout = hb if using_heartbeat and hb is not None else remaining
-                try:
-                    raw_line = await asyncio.wait_for(proc.stdout.readline(), timeout=read_timeout)
-                except TimeoutError as exc:
-                    if using_heartbeat:
-                        raise CodingRunnerError(
-                            code="RUNNER_STDOUT_HEARTBEAT_TIMEOUT",
-                            message=(
-                                f"claude CLI produced no stdout activity for {hb:.1f}s "
-                                "(stdout heartbeat timeout)."
-                            ),
-                        ) from exc
+                raw_line, wait_status = await await_with_heartbeat(
+                    proc.stdout.readline(),
+                    deadline=deadline,
+                    heartbeat_seconds=hb,
+                    pause_predicate=self._heartbeat_pause_predicate,
+                )
+                if wait_status == "heartbeat":
+                    hb_val = hb or 0.0
+                    raise CodingRunnerError(
+                        code="RUNNER_STDOUT_HEARTBEAT_TIMEOUT",
+                        message=(
+                            f"claude CLI produced no stdout activity for {hb_val:.1f}s "
+                            "(stdout heartbeat timeout)."
+                        ),
+                    )
+                if wait_status == "total":
                     raise CodingRunnerError(
                         code="RUNNER_SUBPROCESS_TIMEOUT_OR_CRASH",
                         message="Timed out waiting for claude stream-json output.",
-                    ) from exc
+                    )
+                assert raw_line is not None
 
                 if not raw_line:
                     break
@@ -294,8 +304,19 @@ class ClaudeCodeAdapter:
                             final_response=final_resp,
                         )
 
-            await proc.wait()
-            await stderr_task
+            remaining_wait = max(0.05, deadline - loop.time())
+            try:
+                await asyncio.wait_for(proc.wait(), timeout=remaining_wait)
+            except TimeoutError as exc:
+                raise CodingRunnerError(
+                    code="RUNNER_SUBPROCESS_TIMEOUT_OR_CRASH",
+                    message="Timed out waiting for claude CLI exit after stdout EOF.",
+                ) from exc
+            with contextlib.suppress(TimeoutError):
+                await asyncio.wait_for(
+                    asyncio.shield(stderr_task),
+                    timeout=min(2.0, max(0.05, deadline - loop.time())),
+                )
             if proc.returncode != 0:
                 stderr_excerpt = stderr_buf.decode("utf-8", errors="replace").strip()
                 raise CodingRunnerError(

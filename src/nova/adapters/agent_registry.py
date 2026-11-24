@@ -157,10 +157,12 @@ class AntigravityTier1Adapter:
         *,
         model: str = "gemini-4-argon-high",
         workspace_path: str | None = None,
+        append_system_prompt: str | None = None,
     ) -> None:
         self._runner = runner
         self._model = model
         self._workspace_path = workspace_path or os.getcwd()
+        self._append_system_prompt = append_system_prompt
         self._active_session_id: str | None = None
 
     @property
@@ -183,10 +185,21 @@ class AntigravityTier1Adapter:
         return None
 
     async def stream_prompt(self, message: str) -> AsyncIterator[str]:
+        effective_prompt = message
+        if (
+            self._active_session_id is None
+            and self._append_system_prompt
+            and self._append_system_prompt.strip()
+        ):
+            sys_prompt = self._append_system_prompt.strip()
+            effective_prompt = (
+                f"[Instrucciones del sistema]\n{sys_prompt}\n[/Instrucciones del sistema]\n\n"
+                f"{message}"
+            )
         req = CodingTaskRequest(
             correlation_id="corr-tier1-agy",
             workspace_path=self._workspace_path,
-            prompt=message,
+            prompt=effective_prompt,
             model=self._model,
             conversation_id=self._active_session_id,
         )
@@ -397,6 +410,7 @@ class AgentAdapterRegistry:
                     tier="tier1",
                     gatekeeper_ipc_env=gatekeeper_ipc_env,
                     provider_env=provider_env or None,
+                    append_system_prompt=NOVA_VOICE_SYSTEM_PROMPT,
                 )
             )
         if engine == "agy":
@@ -408,7 +422,12 @@ class AgentAdapterRegistry:
                     gatekeeper_ipc_env=gatekeeper_ipc_env,
                 )
             )
-            return AntigravityTier1Adapter(agy, model=model_name, workspace_path=workspace_path)
+            return AntigravityTier1Adapter(
+                agy,
+                model=model_name,
+                workspace_path=workspace_path,
+                append_system_prompt=NOVA_VOICE_SYSTEM_PROMPT,
+            )
 
         # Default: Pi RPC
         merged_ipc = {**(gatekeeper_ipc_env or {}), **provider_env} or None
@@ -496,6 +515,7 @@ class AgentAdapterRegistry:
         stdout_heartbeat_timeout_seconds: float = 90.0,
         timeout_seconds: float = 600.0,
         model_override: str | None = None,
+        heartbeat_pause_predicate: Callable[[], bool] | None = None,
     ) -> CodingRunnerPort:
         """Instantiate an isolated per-task Tier 2 CodingRunnerPort bound to NOVA_TASK_ID."""
         installed_map = self.detect_engines()
@@ -510,6 +530,8 @@ class AgentAdapterRegistry:
             if gatekeeper_ipc_env is not None
             else None
         )
+        _, default_t2_engine = resolve_tier_engines(models, installed_map)
+        configured_t2_model = models.tier2_model if default_t2_engine == engine else ""
         effective_model = (model_override or "").strip()
 
         if engine == "claude":
@@ -518,7 +540,7 @@ class AgentAdapterRegistry:
                     executable=exe,
                     model=(
                         effective_model
-                        or models.tier2_model
+                        or configured_t2_model
                         or ENGINE_DEFAULT_MODELS["claude"][1]
                     ),
                     workspace_path=workspace_path,
@@ -527,7 +549,8 @@ class AgentAdapterRegistry:
                     stdout_heartbeat_timeout_seconds=stdout_heartbeat_timeout_seconds,
                     gatekeeper_ipc_env=task_gk_env,
                     provider_env=provider_env or None,
-                )
+                ),
+                heartbeat_pause_predicate=heartbeat_pause_predicate,
             )
         if engine == "opencode":
             return OpenCodeAdapter(
@@ -536,7 +559,7 @@ class AgentAdapterRegistry:
                     provider=models.tier2_provider,
                     model=(
                         effective_model
-                        or models.tier2_model
+                        or configured_t2_model
                         or ENGINE_DEFAULT_MODELS["opencode"][1]
                     ),
                     workspace_path=workspace_path,
@@ -545,7 +568,8 @@ class AgentAdapterRegistry:
                     stdout_heartbeat_timeout_seconds=stdout_heartbeat_timeout_seconds,
                     gatekeeper_ipc_env=task_gk_env,
                     provider_env=provider_env or None,
-                )
+                ),
+                heartbeat_pause_predicate=heartbeat_pause_predicate,
             )
         if engine == "pi":
             merged_ipc = {**(task_gk_env or {}), **provider_env} or None
@@ -553,17 +577,25 @@ class AgentAdapterRegistry:
                 PiRpcConfig(
                     executable=exe,
                     provider=models.tier2_provider or models.pi_provider,
-                    model=effective_model or models.tier2_model or models.pi_model,
+                    model=(
+                        effective_model
+                        or configured_t2_model
+                        or models.pi_model
+                        or ENGINE_DEFAULT_MODELS["pi"][1]
+                    ),
                     workspace_path=workspace_path,
                     workspace_active=True,
                     run_timeout_seconds=timeout_seconds,
                     stdout_heartbeat_timeout_seconds=stdout_heartbeat_timeout_seconds,
                     gatekeeper_ipc_env=merged_ipc,
-                )
+                ),
+                heartbeat_pause_predicate=heartbeat_pause_predicate,
             )
             return PiCodingRunnerAdapter(pi_client, close_on_exit=True)
 
-        model_name = effective_model or models.tier2_model or ENGINE_DEFAULT_MODELS["agy"][1]
+        model_name = (
+            effective_model or configured_t2_model or ENGINE_DEFAULT_MODELS["agy"][1]
+        )
         return AntigravityCLIAdapter(
             AntigravityRunnerConfig(
                 executable=exe,
@@ -571,5 +603,6 @@ class AgentAdapterRegistry:
                 timeout_seconds=timeout_seconds,
                 stdout_heartbeat_timeout_seconds=stdout_heartbeat_timeout_seconds,
                 gatekeeper_ipc_env=task_gk_env,
-            )
+            ),
+            heartbeat_pause_predicate=heartbeat_pause_predicate,
         )

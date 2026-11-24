@@ -1360,6 +1360,20 @@ class NovaOrchestrator:
             )
         )
 
+    @staticmethod
+    def _is_home_workspace_hint(hint: str) -> bool:
+        cleaned = hint.strip()
+        if cleaned in ("~", "~/", "$HOME", "${HOME}"):
+            return True
+        try:
+            home_dir = Path.home().resolve()
+            expanded = Path(cleaned).expanduser()
+            if expanded.is_absolute() and expanded.resolve() == home_dir:
+                return True
+        except OSError:
+            return False
+        return False
+
     async def _resolve_directive_workspace(
         self,
         workspace_hint: str | None,
@@ -1367,6 +1381,11 @@ class NovaOrchestrator:
     ) -> tuple[str, str] | None:
         hint = (workspace_hint or "").strip()
         if hint:
+            if await asyncio.to_thread(self._is_home_workspace_hint, hint):
+                raise TaskManagerError(
+                    code="WORKSPACE_HOME_FORBIDDEN",
+                    message="Home directory cannot be used as a task workspace.",
+                )
             hint_lower = hint.lower()
             list_entries = getattr(self._workspace_resolver, "list_workspace_entries", None)
             if callable(list_entries):
@@ -1385,6 +1404,10 @@ class NovaOrchestrator:
                 active_ws.canonical_path.lower(),
             ):
                 return active_ws.canonical_path, active_ws.name
+            raise TaskManagerError(
+                code="WORKSPACE_NOT_FOUND",
+                message=f"Workspace '{self._redact(hint)}' was not found in allowed workspaces.",
+            )
         if active_ws is not None:
             return active_ws.canonical_path, active_ws.name
         return None
@@ -1417,12 +1440,22 @@ class NovaOrchestrator:
                         )
                         continue
                     ws_path, ws_name = target_ws
+                    target_provider = directive.provider_hint or self._settings.tier2_engine
+                    target_model = (
+                        directive.model_hint
+                        if directive.model_hint
+                        else (
+                            self._settings.default_tier2_model
+                            if target_provider == self._settings.tier2_engine
+                            else None
+                        )
+                    )
                     task = await self._task_manager.dispatch_task(
                         workspace_canonical_path=ws_path,
                         workspace_name=ws_name,
                         objective=directive.objective or "",
-                        provider=directive.provider_hint or self._settings.tier2_engine,
-                        model=directive.model_hint or self._settings.default_tier2_model,
+                        provider=target_provider,
+                        model=target_model,
                         correlation_id=correlation_id,
                     )
                     summaries.append(

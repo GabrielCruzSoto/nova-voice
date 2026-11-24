@@ -3474,6 +3474,10 @@ test("NOVA-020 AC-10: hydrates tasks from snapshot, applies task_* SSE events, a
     );
     assert.equal(ctrl.model.agentsOverview.tasks[0].lastLog, "Aplicando cambios <script>bad</script>");
 
+    await ctrl.handleAgentTaskAction("tsk-live-2", "inspect");
+    assert.ok(ctrl.model.lastMilestone?.includes("#tsk-live-2"), "F18: inspect toast shows #tsk-live-2");
+    assert.ok(!ctrl.model.lastMilestone?.includes("#tsk-tsk-"), "F18: no duplicate #tsk-tsk- prefix");
+
     await ctrl.handleAgentTaskAction("tsk-live-2", "cancel");
     assert.equal(cancelCalls.length, 1);
     assert.equal(cancelCalls[0].csrf, "csrf-nova020");
@@ -3482,6 +3486,10 @@ test("NOVA-020 AC-10: hydrates tasks from snapshot, applies task_* SSE events, a
     const rendered = renderAgentsMatrixView(ctrl.model);
     assert.ok(rendered.includes("Cancelada"));
     assert.ok(!rendered.includes("<script>bad</script>"));
+
+    const css = fs.readFileSync(path.join(STATIC_DIR, "styles.css"), "utf8");
+    assert.match(css, /\.nova-task-card\.status--cancelled\b/, "F17: cancelled task card CSS");
+    assert.match(css, /\.nova-task-status-pill\.status--cancelled\b/, "F17: cancelled status pill CSS");
 
     ctrl.dispose();
   } finally {
