@@ -6,6 +6,7 @@ import asyncio
 import json
 import os
 import sys
+from collections.abc import AsyncGenerator
 from pathlib import Path
 
 import pytest
@@ -246,6 +247,7 @@ time.sleep(60)
     # Verify grandchild is alive before cancellation
     os.kill(grandchild_pid, 0)
 
+    assert isinstance(stream, AsyncGenerator)
     await stream.aclose()
     await asyncio.sleep(0.15)
 
