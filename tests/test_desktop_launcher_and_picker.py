@@ -857,11 +857,8 @@ async def test_nova018_ac10_desktop_runtime_wires_half_duplex_confirmation_and_h
             pass
 
         def update_settings(self, **kwargs: object) -> None:
-            self.updated_half_duplex.append(
-                kwargs.get("half_duplex_turn_mode")
-                if isinstance(kwargs.get("half_duplex_turn_mode"), bool)
-                else None
-            )
+            raw_hd = kwargs.get("half_duplex_turn_mode")
+            self.updated_half_duplex.append(raw_hd if isinstance(raw_hd, bool) else None)
 
     voice_stub = _HotVoiceStub()
     runtime_cfg = NovaDesktopConfig(
