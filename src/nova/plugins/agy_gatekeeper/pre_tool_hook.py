@@ -86,7 +86,8 @@ def main() -> int:
         _emit("deny", cwd_err or "GATEKEEPER_MISSING_CWD: Missing working directory.")
         return 0
 
-    ipc_request = {
+    task_id = os.environ.get("NOVA_TASK_ID", "").strip() or None
+    ipc_request: dict[str, Any] = {
         "protocol_version": "1.0",
         "token": os.environ.get("NOVA_GATEKEEPER_TOKEN", ""),
         "correlation_id": f"corr-{uuid.uuid4()}",
@@ -95,6 +96,8 @@ def main() -> int:
         "command": str(command_line),
         "cwd": effective_cwd,
     }
+    if task_id:
+        ipc_request["task_id"] = task_id
 
     try:
         with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:

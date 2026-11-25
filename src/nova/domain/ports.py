@@ -10,6 +10,7 @@ from nova.domain.events import CommandApprovalResolvedEvent
 from nova.domain.models import (
     AgentEngineId,
     AgentSessionPointer,
+    AgentTaskRecord,
     AgentTier,
     AudioDeviceCatalog,
     AudioFrame,
@@ -24,6 +25,7 @@ from nova.domain.models import (
     RunnerProgressEvent,
     ShortcutRegistrationResult,
     SynthesizedAudio,
+    TaskStatus,
     TranscriptionResult,
     WakeWordDetection,
     WorkspaceContext,
@@ -267,6 +269,37 @@ class HistoryStorePort(Protocol):
 
     async def close(self) -> None:
         """Flush and release SQLite database connection."""
+        ...
+
+
+class TaskStorePort(Protocol):
+    """Abstract port for persistent asynchronous agent task lifecycle records (NOVA-020)."""
+
+    async def upsert_task(self, task: AgentTaskRecord) -> None:
+        """Insert or update a managed agent task record."""
+        ...
+
+    async def get_task(self, task_id: str) -> AgentTaskRecord | None:
+        """Fetch a single task record by its unique identifier, or None if missing."""
+        ...
+
+    async def list_tasks(
+        self,
+        *,
+        limit: int = 50,
+        status: TaskStatus | None = None,
+        workspace_path: str | None = None,
+    ) -> list[AgentTaskRecord]:
+        """Return bounded recent tasks ordered newest-first with optional filters."""
+        ...
+
+    async def reconcile_interrupted_tasks(
+        self,
+        *,
+        updated_at: float,
+        reason: str = "DAEMON_RESTARTED",
+    ) -> int:
+        """Mark leftover non-terminal tasks as failed on daemon startup; return affected count."""
         ...
 
 

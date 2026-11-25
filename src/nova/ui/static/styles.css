@@ -1623,6 +1623,11 @@ html[data-shell-frameless="true"] .nova-layout[data-ui-mode="panel"] {
   border-left: 3px solid var(--accent-danger);
 }
 
+.nova-task-card.status--cancelled {
+  border-left: 3px solid rgba(148, 163, 184, 0.55);
+  opacity: 0.85;
+}
+
 .nova-task-card-header {
   display: flex;
   align-items: flex-start;
@@ -1685,6 +1690,12 @@ html[data-shell-frameless="true"] .nova-layout[data-ui-mode="panel"] {
   background: rgba(52, 211, 153, 0.18);
   color: #34d399;
   border: 1px solid rgba(52, 211, 153, 0.35);
+}
+
+.nova-task-status-pill.status--cancelled {
+  background: rgba(148, 163, 184, 0.16);
+  color: var(--muted-text-primary);
+  border: 1px solid rgba(148, 163, 184, 0.32);
 }
 
 .nova-task-desc {

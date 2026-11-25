@@ -51,6 +51,7 @@ from nova.application.models_provisioning import VoiceModelsProvisioningService
 from nova.application.orchestrator import NovaOrchestrator, OrchestratorSettings
 from nova.application.security_gatekeeper import SecurityGatekeeper
 from nova.application.settings_service import SettingsService
+from nova.application.task_manager import TaskManager, TaskManagerSettings
 from nova.application.ui_state_hub import UiStateHub
 from nova.application.voice_coordinator import VoiceCallCoordinator, VoiceCoordinatorSettings
 from nova.domain.errors import (
@@ -66,6 +67,7 @@ from nova.domain.events import (
 )
 from nova.domain.models import (
     DEFAULT_PI_MODEL,
+    AgentEngineId,
     CallSession,
     InferenceDevice,
     NovaPersistedSettings,
@@ -75,7 +77,7 @@ from nova.domain.models import (
     TtsEngineChoice,
     WorkspaceContext,
 )
-from nova.domain.ports import FolderPickerPort, HistoryStorePort
+from nova.domain.ports import CodingRunnerPort, FolderPickerPort, HistoryStorePort
 
 logger = logging.getLogger("nova.desktop_launcher")
 
@@ -528,6 +530,7 @@ class NovaDesktopRuntime:
         self._ipc_server: UnixSocketGatekeeperServer | None = None
         self._control_ipc: UnixControlIpcServer | None = None
         self._pi_client: PiRpcClient | None = None
+        self._task_manager: TaskManager | None = None
         self._orchestrator: NovaOrchestrator | None = None
         self._voice_coordinator: VoiceRuntimePort | None = None
         self._settings_service: SettingsService | None = None
@@ -857,6 +860,63 @@ class NovaDesktopRuntime:
                 workspace_path=initial_pi_cwd,
                 gatekeeper_ipc_env=ipc_env,
             )
+            task_store = (
+                self._history_store
+                if isinstance(self._history_store, SqliteHistoryStore)
+                else None
+            )
+
+            task_manager_settings = TaskManagerSettings(
+                default_provider=eff_t2_engine,
+                default_model=self._config.tier2_model,
+            )
+
+            def _build_task_runner(
+                engine: AgentEngineId,
+                ws_path: str,
+                task_id: str,
+                model_override: str,
+            ) -> CodingRunnerPort:
+                current_models = (
+                    self._settings_service.current_settings.models
+                    if self._settings_service is not None
+                    else initial_persisted.models
+                )
+
+                def _is_waiting_approval() -> bool:
+                    return (
+                        self._task_manager is not None
+                        and self._task_manager.is_task_waiting_approval(task_id)
+                    )
+
+                return self._agent_registry.build_tier2_runner_for_task(
+                    engine,
+                    models=current_models,
+                    workspace_path=ws_path,
+                    task_id=task_id,
+                    gatekeeper_ipc_env=ipc_env,
+                    stdout_heartbeat_timeout_seconds=(
+                        task_manager_settings.stdout_heartbeat_timeout_seconds
+                    ),
+                    timeout_seconds=task_manager_settings.task_total_timeout_seconds,
+                    model_override=model_override or None,
+                    heartbeat_pause_predicate=_is_waiting_approval,
+                )
+
+            task_manager = TaskManager(
+                runner_factory=_build_task_runner,
+                event_bus=self._event_bus,
+                task_store=task_store,
+                history_store=self._history_store,
+                security_gatekeeper=gatekeeper,
+                allowed_roots_provider=lambda: self._config.allowed_roots,
+                extra_secrets_provider=self._combined_extra_secrets,
+                settings=task_manager_settings,
+            )
+            task_manager.start()
+            await task_manager.reconcile_on_startup()
+            self._task_manager = task_manager
+
             orchestrator = NovaOrchestrator(
                 workspace_resolver=workspace_resolver,
                 tier1_client=tier1_client,
@@ -870,6 +930,7 @@ class NovaDesktopRuntime:
                 ),
                 security_gatekeeper=gatekeeper,
                 history_store=self._history_store,
+                task_manager=task_manager,
             )
             self._orchestrator = orchestrator
 
@@ -951,6 +1012,7 @@ class NovaDesktopRuntime:
                     voice_coord.session if voice_coord is not None else None
                 ),
                 history_store=self._history_store,
+                task_store=task_store,
                 voice_enabled=self._voice_enabled,
             )
             self._state_hub = state_hub
@@ -997,6 +1059,7 @@ class NovaDesktopRuntime:
                 credential_store=self._credential_store,
                 health_recheck_callback=self.recheck_health_and_reload_voice,
                 models_provisioning_service=models_provisioning,
+                task_manager=task_manager,
                 shutdown_callback=self.request_shutdown,
                 browser_opener=self._open_whiteboard_in_browser,
                 settings=DesktopUiServerSettings(host="127.0.0.1", port=self._config.port),
@@ -1108,6 +1171,11 @@ class NovaDesktopRuntime:
             with contextlib.suppress(Exception):
                 await self._voice_coordinator.shutdown()
             self._voice_coordinator = None
+
+        if self._task_manager is not None:
+            with contextlib.suppress(Exception):
+                await self._task_manager.close()
+            self._task_manager = None
 
         if self._pi_client is not None:
             with contextlib.suppress(Exception):

@@ -227,6 +227,7 @@ class CommandInterceptRequest(BaseModel):
     tool_name: ToolInterceptName
     command: str
     cwd: str = Field(min_length=1)
+    task_id: str | None = None
 
 
 class CommandExecutionDecision(BaseModel):
@@ -912,4 +913,89 @@ class WhiteboardDeckSummary(BaseModel):
     active_slide_index: int = Field(ge=0, le=MAX_WHITEBOARD_SLIDES - 1)
     created_at: str = Field(min_length=1)
     source: WhiteboardDeckSource = "llm_structured"
+
+
+TaskStatus = Literal[
+    "queued",
+    "running",
+    "waiting_approval",
+    "completed",
+    "failed",
+    "cancelled",
+]
+
+TERMINAL_TASK_STATUSES: frozenset[TaskStatus] = frozenset({"completed", "failed", "cancelled"})
+
+ALLOWED_TASK_TRANSITIONS: dict[TaskStatus, frozenset[TaskStatus]] = {
+    "queued": frozenset({"running", "cancelled", "failed"}),
+    "running": frozenset({"waiting_approval", "completed", "failed", "cancelled"}),
+    "waiting_approval": frozenset({"running", "failed", "cancelled"}),
+    "completed": frozenset(),
+    "failed": frozenset(),
+    "cancelled": frozenset(),
+}
+
+MAX_TASK_OBJECTIVE_CHARS = 4_000
+MAX_TASK_SUMMARY_CHARS = 8_000
+MAX_TASK_LOG_CHARS = 512
+MAX_TASK_ERROR_CHARS = 1_024
+
+
+class AgentTaskRecord(BaseModel):
+    """Immutable state snapshot of an asynchronous background agent task (NOVA-020)."""
+
+    model_config = ConfigDict(frozen=True, extra="ignore")
+
+    task_id: str = Field(min_length=1, max_length=80)
+    correlation_id: str = Field(min_length=1, max_length=120)
+    workspace_canonical_path: str = Field(min_length=1)
+    workspace_name: str = Field(min_length=1, max_length=200)
+    provider: AgentEngineId
+    model: str = Field(default="", max_length=200)
+    tier: AgentTier = "tier2"
+    objective: str = Field(min_length=1, max_length=MAX_TASK_OBJECTIVE_CHARS)
+    status: TaskStatus = "queued"
+    result_summary: str | None = Field(default=None, max_length=MAX_TASK_SUMMARY_CHARS)
+    last_log: str | None = Field(default=None, max_length=MAX_TASK_LOG_CHARS)
+    error_code: str | None = Field(default=None, max_length=120)
+    error_message: str | None = Field(default=None, max_length=MAX_TASK_ERROR_CHARS)
+    pending_audit_id: str | None = Field(default=None, max_length=120)
+    conversation_id: str | None = Field(default=None, max_length=200)
+    created_at: float = Field(ge=0.0)
+    started_at: float | None = Field(default=None, ge=0.0)
+    updated_at: float = Field(ge=0.0)
+    completed_at: float | None = Field(default=None, ge=0.0)
+
+
+Tier1ActionKind = Literal[
+    "dispatch_task",
+    "list_tasks",
+    "get_task_status",
+    "cancel_task",
+]
+
+TaskListFilter = Literal[
+    "active",
+    "all",
+    "queued",
+    "running",
+    "waiting_approval",
+    "completed",
+    "failed",
+    "cancelled",
+]
+
+
+class Tier1ActionDirective(BaseModel):
+    """Structured delegation/control directive emitted by Tier 1 (NOVA-020 OP-1, Option A)."""
+
+    model_config = ConfigDict(frozen=True, extra="ignore")
+
+    action: Tier1ActionKind
+    objective: str | None = Field(default=None, max_length=MAX_TASK_OBJECTIVE_CHARS)
+    workspace_hint: str | None = Field(default=None, max_length=300)
+    provider_hint: AgentEngineId | None = None
+    model_hint: str | None = Field(default=None, max_length=200)
+    task_id: str | None = Field(default=None, max_length=80)
+    status_filter: TaskListFilter = "active"
 

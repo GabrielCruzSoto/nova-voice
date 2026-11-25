@@ -352,6 +352,7 @@ function queryGatekeeperSocket(
     });
 
     client.on("connect", () => {
+      const taskId = (process.env.NOVA_TASK_ID ?? "").trim();
       const payload = JSON.stringify({
         protocol_version: "1.0",
         token: authSecret,
@@ -360,6 +361,7 @@ function queryGatekeeperSocket(
         tool_name: "bash",
         command,
         cwd,
+        ...(taskId ? { task_id: taskId } : {}),
       });
       client.write(`${payload}\n`, "utf8");
     });

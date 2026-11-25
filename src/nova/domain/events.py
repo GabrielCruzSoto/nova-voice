@@ -13,12 +13,16 @@ from nova.domain.errors import redact_sensitive_text
 from nova.domain.models import (
     MAX_SPEECH_CHUNK_CHARS,
     MAX_SPOKEN_WORDS,
+    MAX_TASK_LOG_CHARS,
     MAX_WHITEBOARD_SLIDES,
+    AgentEngineId,
+    AgentTaskRecord,
     AuditRiskLevel,
     CallSessionState,
     CommandSource,
     DecisionVerdict,
     InferenceDevice,
+    TaskStatus,
     WhiteboardDeck,
     WhiteboardSlideChangeReason,
     WorkspaceProject,
@@ -152,6 +156,7 @@ class CommandApprovalRequestedEvent(BaseModel):
     spoken_summary: str = Field(min_length=1)
     technical_explanation: str = Field(min_length=1)
     expires_in_seconds: float = Field(gt=0.0)
+    task_id: str | None = None
     timestamp: str = Field(default_factory=utc_now_iso)
 
     @field_validator("spoken_summary")
@@ -170,6 +175,7 @@ class CommandApprovalResolvedEvent(BaseModel):
     approved: bool
     verdict: DecisionVerdict
     resolved_by: str = Field(min_length=1)
+    task_id: str | None = None
     timestamp: str = Field(default_factory=utc_now_iso)
 
 
@@ -243,6 +249,44 @@ class WhiteboardSlideChangedEvent(BaseModel):
     timestamp: str = Field(default_factory=utc_now_iso)
 
 
+class TaskCreatedEvent(BaseModel):
+    """Published when TaskManager enqueues a new asynchronous agent task (NOVA-020 OP-3)."""
+
+    model_config = ConfigDict(frozen=True, extra="ignore")
+
+    correlation_id: str = Field(min_length=1)
+    task: AgentTaskRecord
+    timestamp: str = Field(default_factory=utc_now_iso)
+
+
+class TaskStateChangedEvent(BaseModel):
+    """Published whenever a managed agent task changes lifecycle state (NOVA-020 OP-3)."""
+
+    model_config = ConfigDict(frozen=True, extra="ignore")
+
+    task_id: str = Field(min_length=1)
+    correlation_id: str = Field(min_length=1)
+    previous_status: TaskStatus
+    status: TaskStatus
+    task: AgentTaskRecord
+    reason: str = Field(min_length=1)
+    timestamp: str = Field(default_factory=utc_now_iso)
+
+
+class TaskProgressEvent(BaseModel):
+    """Published when a running agent task emits a sanitized progress update (NOVA-020 OP-3)."""
+
+    model_config = ConfigDict(frozen=True, extra="ignore")
+
+    task_id: str = Field(min_length=1)
+    correlation_id: str = Field(min_length=1)
+    step_type: str = Field(min_length=1)
+    last_log: str = Field(min_length=1, max_length=MAX_TASK_LOG_CHARS)
+    provider: AgentEngineId
+    workspace_canonical_path: str = Field(min_length=1)
+    timestamp: str = Field(default_factory=utc_now_iso)
+
+
 OrchestratorEvent = (
     WorkspaceChangedEvent
     | WorkspaceClearedEvent
@@ -259,6 +303,9 @@ OrchestratorEvent = (
     | UiPanelToggleRequestedEvent
     | WhiteboardDeckCreatedEvent
     | WhiteboardSlideChangedEvent
+    | TaskCreatedEvent
+    | TaskStateChangedEvent
+    | TaskProgressEvent
 )
 EventSubscriber = Callable[[OrchestratorEvent], Awaitable[None]]
 
