@@ -7,6 +7,7 @@ import json
 import time
 from collections.abc import AsyncIterator
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -17,12 +18,14 @@ from nova.application.orchestrator import (
     VoiceSentenceStreamSplitter,
     sanitize_spoken_chunk,
 )
+from nova.application.task_manager import TaskManager
 from nova.domain.errors import CodingRunnerError
 from nova.domain.events import (
     ChatStreamEvent,
     OrchestratorEvent,
     OrchestratorEventBus,
     RunnerFailureEvent,
+    TaskCreatedEvent,
     VoiceMilestoneEvent,
     VoiceSpeechChunkEvent,
     WhiteboardDeckCreatedEvent,
@@ -1185,6 +1188,84 @@ async def test_nova019_f1_coding_and_tier2_prompts_in_workspace_are_never_hijack
     )
     assert tier1.prompts == ["Edit whiteboard.ts to fix the layout"]
     assert [e for e in events if isinstance(e, WhiteboardDeckCreatedEvent)] == []
+
+
+async def test_nova019_whiteboard_routing_coexists_with_active_task_manager(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    root = tmp_path / "Proyectos"
+    repo = root / "nova-app"
+    repo.mkdir(parents=True)
+    bus = OrchestratorEventBus()
+    events: list[OrchestratorEvent] = []
+
+    async def collect(ev: OrchestratorEvent) -> None:
+        events.append(ev)
+
+    bus.subscribe(collect)
+    resolver = LocalWorkspaceResolver(allowed_roots=[root], event_bus=bus)
+    tier1 = _FakeTier1Client(
+        chunks=[
+            '```nova-whiteboard\n{"topic":"OAuth2","summary":"Flujo OAuth2",'
+            '"slides":[{"slide_index":0,"title":"Authorization Code",'
+            '"visual_kind":"flowchart","nodes":[{"id":"c","label":"Cliente"}],'
+            '"edges":[],"callouts":["PKCE obligatorio"],'
+            '"narration":"El cliente inicia el flujo OAuth2."}]}\n```'
+        ]
+    )
+    tier2 = _FakeTier2Runner()
+    mgr = TaskManager(
+        runner_factory=lambda _provider, _ws_path, _task_id, _model: tier2,
+        event_bus=bus,
+    )
+    dispatch_calls: list[str] = []
+    orig_dispatch = mgr.dispatch_task
+
+    async def _spy_dispatch(*args: Any, **kwargs: Any) -> Any:
+        dispatch_calls.append(str(kwargs.get("objective", "")))
+        return await orig_dispatch(*args, **kwargs)
+
+    monkeypatch.setattr(mgr, "dispatch_task", _spy_dispatch)
+    mgr.start()
+    try:
+        orchestrator = NovaOrchestrator(
+            workspace_resolver=resolver,
+            tier1_client=tier1,
+            tier2_runner=tier2,
+            event_bus=bus,
+            task_manager=mgr,
+        )
+        await orchestrator.select_workspace(str(repo), mode="exact_path")
+        events.clear()
+
+        # 1. Visual explanation with active workspace + TaskManager routes to whiteboard
+        await orchestrator.handle_user_utterance(
+            "explícame con un diagrama cómo funciona OAuth2",
+            correlation_id="c-seam-wb",
+            origin="chat",
+        )
+        wb_events = [e for e in events if isinstance(e, WhiteboardDeckCreatedEvent)]
+        assert len(wb_events) == 1
+        assert wb_events[0].deck.topic == "OAuth2"
+        assert dispatch_calls == []
+        assert [e for e in events if isinstance(e, TaskCreatedEvent)] == []
+        assert len(tier2.requests) == 0
+
+        # 2. [delegate_tier2] dispatches via TaskManager and never routes to whiteboard
+        events.clear()
+        await orchestrator.handle_user_utterance(
+            "[delegate_tier2] Refactoriza el cliente OAuth2",
+            correlation_id="c-seam-t2",
+            origin="chat",
+        )
+        assert len(dispatch_calls) == 1
+        assert "Refactoriza" in dispatch_calls[0]
+        task_events = [e for e in events if isinstance(e, TaskCreatedEvent)]
+        assert len(task_events) == 1
+        assert [e for e in events if isinstance(e, WhiteboardDeckCreatedEvent)] == []
+    finally:
+        await mgr.close()
 
 
 
